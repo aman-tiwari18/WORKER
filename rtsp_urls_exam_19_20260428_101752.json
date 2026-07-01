@@ -1,0 +1,76 @@
+[
+  {
+    "server": "d15.camview.io",
+    "device_id": "1000028",
+    "camera_no": null,
+    "camera_name": "BIOMETRIC AREA",
+    "centre_name": "AADARSH PARIKSHA KENDRA BHAGALPUR",
+    "classification": "Failed to Classify",
+    "status": "FAILED",
+    "error": "No data in API response"
+  },
+  {
+    "server": "d15.camview.io",
+    "device_id": "1000028",
+    "camera_no": "1",
+    "camera_name": "CORRIDOR AREA",
+    "centre_name": "AADARSH PARIKSHA KENDRA BHAGALPUR",
+    "classification": "Failed to Classify",
+    "status": "SUCCESS",
+    "url_count": 2,
+    "urls": [
+      "rtsp://172.16.2.100:9100/dss/monitor/param/cameraid=1000028$1&substream=1",
+      "rtsp://3.111.216.39:9100/dss/monitor/param/cameraid=1000028$1&substream=1"
+    ]
+  },
+  {
+    "server": "d14.camview.io",
+    "device_id": "1000727",
+    "camera_no": null,
+    "camera_name": "MAIN GATE",
+    "centre_name": "K P DIGITAL ZONE",
+    "classification": "Failed to Classify",
+    "status": "FAILED",
+    "error": "No data in API response"
+  },
+  {
+    "server": "d14.camview.io",
+    "device_id": "1000727",
+    "camera_no": "1",
+    "camera_name": "MAIN GATE",
+    "centre_name": "K P DIGITAL ZONE",
+    "classification": "Failed to Classify",
+    "status": "SUCCESS",
+    "url_count": 4,
+    "urls": [
+      "rtsp://172.16.3.243:9100/dss/monitor/param/cameraid=1000727$1&substream=1",
+      "rtsp://13.205.138.218:9100/dss/monitor/param/cameraid=1000727$1&substream=1",
+      "rtsp://172.16.2.14:9090/dss/monitor/params?cameraid=1000727$1&substream=1",
+      "rtsp://13.234.181.239:9090/dss/monitor/params?cameraid=1000727$1&substream=1"
+    ]
+  },
+  {
+    "server": "d16.camview.io",
+    "device_id": "1000019",
+    "camera_no": null,
+    "camera_name": "LAB1 CAM1",
+    "centre_name": "UNIQUE TECHNOLOGIES & CONSULTANCY PVT. LTD. (UTC PVT LTD)",
+    "classification": "Failed to Classify",
+    "status": "FAILED",
+    "error": "No data in API response"
+  },
+  {
+    "server": "d16.camview.io",
+    "device_id": "1000019",
+    "camera_no": "1",
+    "camera_name": "LAB1 CAM2",
+    "centre_name": "UNIQUE TECHNOLOGIES & CONSULTANCY PVT. LTD. (UTC PVT LTD)",
+    "classification": "Failed to Classify",
+    "status": "SUCCESS",
+    "url_count": 2,
+    "urls": [
+      "rtsp://172.16.2.109:9100/dss/monitor/param/cameraid=1000019$1&substream=1",
+      "rtsp://13.205.28.26:9100/dss/monitor/param/cameraid=1000019$1&substream=1"
+    ]
+  }
+]

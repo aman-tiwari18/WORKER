@@ -1,0 +1,30 @@
+# python
+venv/
+__pycache__/
+*.pyc
+
+# models / caches (never commit — pulled at build/deploy)
+models/
+hf_cache/
+data/hf_cache/
+
+# runtime output
+logs/
+scripts/logs/
+results/
+scripts/detection/results/
+frames/
+scripts/detection/frames/
+
+# secrets / env
+.env
+.env.*
+!.env.example
+
+# stray reports / dumps (cruft copied from prod tree)
+*.xlsx
+*.log
+*.json.lock
+server_tokens.json
+*.bak
+*.bak.*

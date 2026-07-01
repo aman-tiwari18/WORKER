@@ -1,0 +1,124 @@
+                        ┌────────────────────────┐
+                        │      Video Source      │
+                        │   (.dav / RTSP Feed)   │
+                        └───────────┬────────────┘
+                                    │
+                                                     ▼
+                        ┌────────────────────────┐
+                        │     Frame Producer     │
+                        │   (OpenCV Video Read)  │
+                        └───────────┬────────────┘
+                                    │ Shared Frames
+        ────────────────────────────┼────────────────────────────────────
+                                    │
+   ▼           ▼            ▼            ▼            ▼            ▼            ▼
+┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
+│ Crowd  │ │Intruder│ │ Entry  │ │ Phone  │ │ Proximity  │ │ Invigilator│ │ ServerRoom │
+│ Worker │ │ Worker │ │ Exit   │ │ Worker │ │  Worker    │ │  Worker    │ │  Worker    │
+└────┬───┘ └────┬───┘ └────┬───┘ └────┬───┘ └─────┬──────┘ └─────┬──────┘ └─────┬──────┘
+     │           │           │           │           │              │              │
+     ▼           ▼           ▼           ▼           ▼              ▼              ▼
+                    ┌────────────────────────────────────────────┐
+                    │        YOLO Detection Engine                │
+                    │ (person / phone / object detection)         │
+                    └────────────────────┬───────────────────────┘
+                                         │
+                                         		▼
+                    ┌────────────────────────────────────────────┐
+                    │   Rule Engine & Post Processing Layer       │
+                    │ (threshold, distance, tracking, cooldown)   │
+                    └────────────────────┬───────────────────────┘
+                                         │
+                                                             ▼
+                    ┌────────────────────────────────────────────┐
+                    │        Results & Image Storage              │
+                    │   (annotated / alerts / logging / folders)  │
+                    └────────────────────────────────────────────┘
+
+                                                     ▲
+                                    │ Control APIs
+                        ┌────────────────────────┐
+                        │     FastAPI Backend    │
+                        │ (Start / Stop / Status)│
+                        └───────────┬────────────┘
+                                    │
+                              Apache Reverse Proxy
+                                    │
+                                                      ▼
+                                 Client
+                           (Swagger / UI)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                ┌──────────────────────┐
+                │   Video Source       │
+                │ (.dav / RTSP Stream) │
+                └──────────┬───────────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │   Frame Producer     │
+                │ (OpenCV Video Read)  │
+                └──────────┬───────────┘
+                           │ shared frames
+        ───────────────────┼────────────────────
+                           │
+        ▼          ▼          ▼          ▼
+ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+ │ Crowd    │ │ Intruder │ │ EntryExit│ │ Phone    │
+ │ Worker   │ │ Worker   │ │ Worker   │ │ Worker   │
+ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+      │              │              │              │
+      ▼              ▼              ▼              ▼
+        ┌──────────────────────────────────────┐
+        │     Detection Results & Images       │
+        │   (annotated + alerts + logging)     │
+        └──────────────────────────────────────┘
+
+                           ▲
+                           │
+                ┌──────────────────────┐
+                │   FastAPI Backend    │
+                │  (Control APIs)      │
+                └──────────┬───────────┘
+                           │
+                    Apache Reverse Proxy
+                           │
+                           ▼
+                        Client
+                   (Swagger / API)
+

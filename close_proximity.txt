@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/root/cctv_dev/cctv/script-server/./scripts/tcs/close_proximity_tcs.py", line 249, in <module>
+    import cv2
+ModuleNotFoundError: No module named 'cv2'

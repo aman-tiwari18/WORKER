@@ -1,0 +1,28 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: cctv_prometheus
+    restart: unless-stopped
+    ports:
+      # Keep Prometheus private to the host. The frontend reads it through
+      # FastAPI's /prometheus-api proxy, not by calling port 9090 directly.
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # TSDB lives on the large /data disk (743 GB), NOT the 48 GB root LV which
+      # fills from IDE-server/pm2 cruft and previously broke Prometheus writes
+      # (WAL: "no space left on device"). See reference_gpu_avg_exporter memory.
+      - /data/prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    extra_hosts:
+      # Lets Prometheus scrape the host machine on Linux (host.docker.internal -> host gateway)
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

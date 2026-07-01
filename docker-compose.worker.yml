@@ -1,0 +1,160 @@
+# ============================================================
+# Worker Node Docker Compose - GPU Systems Only
+# ============================================================
+# This compose file is for GPU worker nodes that only run
+# script-server for distributed camera processing.
+#
+# Prerequisites:
+# 1. NFS mount configured: /mnt/nfs/cctv_images
+# 2. Network access to main server MySQL (port 3306 on the PM2 main VM)
+# 3. NVIDIA Docker runtime installed
+# 4. Environment variables configured (see .env.worker.example)
+#
+# Usage:
+#   docker-compose -f docker-compose.worker.yml up -d
+# ============================================================
+
+version: '3.8'
+
+services:
+  # Script Server (Detection & Classification) - Worker Node
+  script-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cctv_script_server_worker_${WORKER_ID:-1}
+    restart: unless-stopped
+    shm_size: '8gb'  # H200 optimization: Large shared memory for GPU operations
+    ports:
+      - "${WORKER_HTTP_PORT:-8000}:8000"
+    environment:
+      # Database connection to main server
+      DB_HOST: ${DB_HOST:-192.168.19.30}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-rootpassword123}
+      DB_NAME: ${DB_NAME:-cctv_monitoring}
+      
+      # Worker identification
+      WORKER_ID: ${WORKER_ID:-worker-1}
+      WORKER_NAME: ${WORKER_NAME:-GPU Worker 1}
+      DISTRIBUTION_MODE: ${DISTRIBUTION_MODE:-auto}
+      TOTAL_WORKERS: ${TOTAL_WORKERS:-4}
+      
+      # Camera assignment range (only used when DISTRIBUTION_MODE=static/range)
+      CAMERA_START_ID: ${CAMERA_START_ID:-1}
+      CAMERA_END_ID: ${CAMERA_END_ID:-5000}
+      
+      # Exam configuration
+      EXAM_ID: ${EXAM_ID:-19}
+      SHIFT_ID: ${SHIFT_ID}
+      
+      # Python configuration
+      PYTHONUNBUFFERED: 1
+      HTTP_PORT: 8000
+      TZ: Asia/Kolkata
+      
+      # H200 GPU Optimization
+      CUDA_VISIBLE_DEVICES: 0
+      PYTORCH_CUDA_ALLOC_CONF: max_split_size_mb:512
+      TORCH_CUDNN_V8_API_ENABLED: 1
+      NVIDIA_TF32_OVERRIDE: 1
+      
+      # Backend API connection
+      MAIN_BACKEND_URL: ${MAIN_BACKEND_URL:-http://192.168.19.30:3000/cctv_analytics/api}
+      API_KEY: ${API_KEY:-your_script_server_api_key}
+      
+      # Polling configuration
+      POLL_INTERVAL_MS: ${POLL_INTERVAL_MS:-30000}
+      LOOKAHEAD_MINUTES: ${LOOKAHEAD_MINUTES:-3}
+      GRACE_MINUTES: ${GRACE_MINUTES:-30}
+      
+      # NFS image storage path
+      NFS_MOUNT_PATH: /mnt/nfs/cctv_images
+      DETECTION_IMAGE_BASE_URL: ${DETECTION_IMAGE_BASE_URL:-http://192.168.19.30:3000/cctv_dev/serve-detection-images}
+      DETECTION_RTSP_IMAGE_BASE_URL: ${DETECTION_RTSP_IMAGE_BASE_URL:-http://192.168.19.30:3000/cctv_dev/serve-rtsp-detection-images}
+      
+    volumes:
+      # NFS mount for shared image storage (detection scripts save to scripts/detection/results/)
+      - /mnt/nfs/cctv_images:/app/scripts/detection/results
+      
+      # Local volumes for models and logs
+      - ./models:/app/models
+      - ./logs:/app/logs
+      - ./data:/app/data
+      
+    networks:
+      - cctv_worker_network
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 32g  # RAM limit (H200 has 141GB VRAM, but limit system RAM)
+          
+    healthcheck:
+      test: ["CMD", "nvidia-smi"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Ollama (for VLM classification) - Worker Node
+  ollama:
+    image: ollama/ollama:latest
+    container_name: cctv_ollama_worker_${WORKER_ID:-1}
+    restart: unless-stopped
+    shm_size: '4gb'  # H200 optimization: Shared memory for model loading
+    environment:
+      # H200 optimization: Allow multiple models and parallel requests
+      OLLAMA_MAX_LOADED_MODELS: 4
+      OLLAMA_NUM_PARALLEL: 4
+      OLLAMA_KEEP_ALIVE: 5m
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_worker_data:/root/.ollama
+    networks:
+      - cctv_worker_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 16g  # RAM limit for Ollama
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # GPU Monitor (Optional - for H200 monitoring)
+  gpu-monitor:
+    image: nvidia/cuda:12.2.0-base-ubuntu22.04
+    container_name: cctv_gpu_monitor_worker_${WORKER_ID:-1}
+    restart: unless-stopped
+    command: sh -c "while true; do clear; nvidia-smi; sleep 2; done"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - cctv_worker_network
+    profiles:
+      - monitoring  # Only starts with: docker-compose --profile monitoring up
+
+networks:
+  cctv_worker_network:
+    driver: bridge
+
+volumes:
+  ollama_worker_data:

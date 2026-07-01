@@ -1,0 +1,101 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    cluster: cctv
+
+scrape_configs:
+  - job_name: gpu-workers
+    metrics_path: /metrics
+    # 30s interval + 20s timeout tolerates occasional slow nvidia-smi
+    # collections under fleet-wide concurrent scraping. The worker-side
+    # 10s cache (GPU_STATS_CACHE_TTL) keeps most scrapes cheap.
+    scrape_interval: 30s
+    scrape_timeout: 20s
+    static_configs:
+      # ──────── worker-0: main server (this host) ────────
+      - targets: ['host.docker.internal:8000']
+        labels:
+          server_id: worker-0
+
+      # ──────── worker-1..3: single-GPU H200 boxes on private LAN ────────
+      # All three use the standalone aggregated exporter (:8030) instead of the cctv
+      # FastAPI /metrics, which can hang for >20s under load and flap the scrape.
+      # The exporter sets its own server_id (worker-N-gpu0).
+      - targets: ['192.168.19.43:8030']
+      - targets: ['192.168.19.42:8030']
+      - targets: ['192.168.19.41:8030']
+
+      # ──────── worker-4: 8-GPU box via SSH tunnel ────────
+      # Reached via local-forward ports on main host (cctv-worker-4-tunnel.service
+      # forwards main:9000..9007 -> worker-4:8005..8012).
+      - targets: ['host.docker.internal:9000']
+        labels:
+          server_id: worker-4-gpu0
+      - targets: ['host.docker.internal:9001']
+        labels:
+          server_id: worker-4-gpu1
+      - targets: ['host.docker.internal:9002']
+        labels:
+          server_id: worker-4-gpu2
+      - targets: ['host.docker.internal:9003']
+        labels:
+          server_id: worker-4-gpu3
+      - targets: ['host.docker.internal:9004']
+        labels:
+          server_id: worker-4-gpu4
+      - targets: ['host.docker.internal:9005']
+        labels:
+          server_id: worker-4-gpu5
+      - targets: ['host.docker.internal:9006']
+        labels:
+          server_id: worker-4-gpu6
+      - targets: ['host.docker.internal:9007']
+        labels:
+          server_id: worker-4-gpu7
+
+      # ──────── worker-5: 8-GPU box — AGGREGATED GPU metrics ────────
+      # cctv-gpu-agg-w5.service forwards main:9110 -> worker-5:8030 (one exporter, all 8 GPUs;
+      # server_id/gpu_id labels are emitted by the exporter). Single tunnel = no SSH multiplexing
+      # congestion that previously flapped the 8 per-GPU scrapes.
+      - targets: ['host.docker.internal:9110']
+
+      # ──────── worker-6: 8-GPU box — AGGREGATED GPU metrics ────────
+      # cctv-gpu-agg-w6.service forwards main:9210 -> worker-6:8030 (one exporter, all 8 GPUs).
+      - targets: ['host.docker.internal:9210']
+
+    # The w5/w6 aggregated exporters label gpu_id by HOST index (0..7), but each
+    # 8-GPU container is one logical worker the UI queries as a single GPU with
+    # gpu_id="0" (CUDA_VISIBLE_DEVICES maps its GPU to device 0). server_id
+    # (worker-5-gpuN) already distinguishes them, so force gpu_id="0" here to make
+    # the per-GPU util/memory charts match (previously only gpu0 had data).
+    metric_relabel_configs:
+      - source_labels: [instance]
+        regex: 'host\.docker\.internal:(9110|9210)'
+        target_label: gpu_id
+        replacement: '0'
+
+  # ── Host system metrics (node_exporter) — CPU / RAM / disk / network ──
+  # LAN workers expose node_exporter directly on :9100; the 8-GPU VMs (5/6)
+  # reuse the host's existing node_exporter (127.0.0.1:9100), tunneled to
+  # main:9108 (w5) and main:9208 (w6) by the cctv-worker-{5,6}-tunnel services.
+  - job_name: node-exporter
+    metrics_path: /metrics
+    scrape_interval: 30s
+    scrape_timeout: 15s
+    static_configs:
+      - targets: ['192.168.19.43:9100']
+        labels:
+          server_id: worker-1
+      - targets: ['192.168.19.42:9100']
+        labels:
+          server_id: worker-2
+      - targets: ['192.168.19.41:9100']
+        labels:
+          server_id: worker-3
+      - targets: ['host.docker.internal:9108']
+        labels:
+          server_id: worker-5
+      - targets: ['host.docker.internal:9208']
+        labels:
+          server_id: worker-6

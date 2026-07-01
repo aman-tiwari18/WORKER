@@ -1,0 +1,11 @@
+[Unit]
+Description=CCTV frame sync pull timer for worker-%i
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=120
+AccuracySec=10s
+Unit=cctv-frame-sync@%i.service
+
+[Install]
+WantedBy=timers.target

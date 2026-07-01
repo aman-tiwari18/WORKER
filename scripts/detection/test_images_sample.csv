@@ -1,0 +1,4 @@
+Image Path,Expected ID
+./test_frames/camera1.jpg,11394_REG-D_C01
+./test_frames/camera2.jpg,11395_LAB-A_C02
+./test_frames/camera3.jpg,10001_ROOM-B_C03

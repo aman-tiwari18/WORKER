@@ -1,0 +1,29 @@
+[
+  {
+    "image": "scripts/detection/test_images/frame_b3f70ca697354ade88139f81383e57e9.jpg",
+    "expected": "07908/FRISK/S040",
+    "extracted": "07908/FRISK/S040",
+    "match": "YES",
+    "confidence": 67.9,
+    "ocr_stage": "easyocr",
+    "roi_side": "left"
+  },
+  {
+    "image": "scripts/detection/test_images/frame_d02f7c2f103b4a4fb12e2f11bafd6fa2.jpg",
+    "expected": "07908/FRISK/S040",
+    "extracted": "07908/FRISK/S04Q",
+    "match": "NO",
+    "confidence": 54.3,
+    "ocr_stage": "easyocr",
+    "roi_side": "left"
+  },
+  {
+    "image": "scripts/detection/test_images/frame_75bbb04d89404700a44eafd57621f342.jpg",
+    "expected": "07908/FRISK/S040",
+    "extracted": "07908/FRISK/S040",
+    "match": "YES",
+    "confidence": 73.8,
+    "ocr_stage": "easyocr",
+    "roi_side": "left"
+  }
+]

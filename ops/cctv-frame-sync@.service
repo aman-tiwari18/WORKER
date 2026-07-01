@@ -1,0 +1,10 @@
+[Unit]
+Description=CCTV frame sync pull from worker-%i (local staging -> main NFS)
+After=network-online.target cctv-worker-%i-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/data/cctv_dev/cctv/script-server/ops/frame_sync_pull.sh %i
+# Bound runtime so a stalled pull can never overlap the next timer firing.
+TimeoutStartSec=110

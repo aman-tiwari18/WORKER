@@ -1,0 +1,283 @@
+#!/bin/bash
+
+# ============================================================
+# Worker Node Setup Script
+# ============================================================
+# Automates the setup of a GPU worker node for horizontal scaling
+#
+# Usage:
+#   ./setup_worker.sh <worker_id> <main_server_ip> <camera_start> <camera_end>
+#
+# Example:
+#   ./setup_worker.sh 2 192.168.1.100 5001 10000
+# ============================================================
+
+set -e  # Exit on error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored output
+print_info() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Check arguments
+if [ "$#" -ne 4 ]; then
+    print_error "Usage: $0 <worker_id> <main_server_ip> <camera_start> <camera_end>"
+    print_error "Example: $0 2 192.168.1.100 5001 10000"
+    exit 1
+fi
+
+WORKER_ID=$1
+MAIN_SERVER_IP=$2
+CAMERA_START=$3
+CAMERA_END=$4
+
+print_info "Setting up Worker Node $WORKER_ID"
+print_info "Main Server: $MAIN_SERVER_IP"
+print_info "Camera Range: $CAMERA_START - $CAMERA_END"
+
+# ============================================================
+# Step 1: Check Prerequisites
+# ============================================================
+print_info "Checking prerequisites..."
+
+# Check if running as root or with sudo
+if [ "$EUID" -ne 0 ]; then 
+    print_error "Please run as root or with sudo"
+    exit 1
+fi
+
+# Check Docker
+if ! command -v docker &> /dev/null; then
+    print_error "Docker is not installed. Please install Docker first."
+    exit 1
+fi
+print_info "✓ Docker found"
+
+# Check Docker Compose
+if ! command -v docker-compose &> /dev/null; then
+    print_error "Docker Compose is not installed. Please install Docker Compose first."
+    exit 1
+fi
+print_info "✓ Docker Compose found"
+
+# Check NVIDIA Docker
+if ! docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi &> /dev/null; then
+    print_error "NVIDIA Docker runtime not working. Please install nvidia-container-toolkit."
+    exit 1
+fi
+print_info "✓ NVIDIA Docker runtime working"
+
+# ============================================================
+# Step 2: Install NFS Client
+# ============================================================
+print_info "Installing NFS client..."
+
+apt-get update -qq
+apt-get install -y nfs-common > /dev/null 2>&1
+
+print_info "✓ NFS client installed"
+
+# ============================================================
+# Step 3: Configure NFS Mount
+# ============================================================
+print_info "Configuring NFS mount..."
+
+# Create mount point
+mkdir -p /mnt/nfs/cctv_images
+
+# Test NFS connectivity
+print_info "Testing NFS connection to $MAIN_SERVER_IP..."
+if ! showmount -e $MAIN_SERVER_IP &> /dev/null; then
+    print_error "Cannot connect to NFS server at $MAIN_SERVER_IP"
+    print_error "Please ensure NFS server is running and accessible"
+    exit 1
+fi
+print_info "✓ NFS server accessible"
+
+# Mount NFS
+print_info "Mounting NFS share..."
+if mount | grep -q "/mnt/nfs/cctv_images"; then
+    print_warn "NFS already mounted, unmounting first..."
+    umount /mnt/nfs/cctv_images
+fi
+
+mount -t nfs $MAIN_SERVER_IP:/data/nfs/cctv_images /mnt/nfs/cctv_images
+
+if [ $? -eq 0 ]; then
+    print_info "✓ NFS mounted successfully"
+else
+    print_error "Failed to mount NFS"
+    exit 1
+fi
+
+# Test write access
+TEST_FILE="/mnt/nfs/cctv_images/test_worker_${WORKER_ID}.txt"
+echo "Test from worker-${WORKER_ID} at $(date)" > $TEST_FILE
+if [ -f "$TEST_FILE" ]; then
+    print_info "✓ NFS write test successful"
+    rm $TEST_FILE
+else
+    print_error "NFS write test failed"
+    exit 1
+fi
+
+# Add to fstab if not already present
+if ! grep -q "/mnt/nfs/cctv_images" /etc/fstab; then
+    print_info "Adding NFS mount to /etc/fstab..."
+    echo "$MAIN_SERVER_IP:/data/nfs/cctv_images /mnt/nfs/cctv_images nfs defaults,_netdev 0 0" >> /etc/fstab
+    print_info "✓ Added to /etc/fstab"
+else
+    print_warn "NFS mount already in /etc/fstab"
+fi
+
+# ============================================================
+# Step 4: Test Database Connectivity
+# ============================================================
+print_info "Testing database connectivity..."
+
+# Check if MySQL port is accessible
+if ! nc -z -w5 $MAIN_SERVER_IP 3306 2>/dev/null; then
+    print_error "Cannot connect to MySQL at $MAIN_SERVER_IP:3306"
+    print_error "Please ensure MySQL is accessible from this worker"
+    exit 1
+fi
+print_info "✓ MySQL port accessible"
+
+# ============================================================
+# Step 5: Create Worker Environment File
+# ============================================================
+print_info "Creating worker environment file..."
+
+cat > .env.worker << EOF
+# Worker Node Configuration - Generated by setup_worker.sh
+# Generated: $(date)
+
+# Main Server Connection
+MAIN_SERVER_IP=$MAIN_SERVER_IP
+API_KEY=your_script_server_api_key
+
+# Worker Identification
+WORKER_ID=worker-$WORKER_ID
+WORKER_NAME=GPU Worker $WORKER_ID
+
+# Camera Distribution
+DISTRIBUTION_MODE=auto
+TOTAL_WORKERS=4
+
+# Camera Assignment Range (used only if DISTRIBUTION_MODE=static/range)
+CAMERA_START_ID=$CAMERA_START
+CAMERA_END_ID=$CAMERA_END
+
+# Exam Configuration
+EXAM_ID=19
+SHIFT_ID=
+
+# Port Configuration
+WORKER_HTTP_PORT=8000
+OLLAMA_PORT=11434
+
+# NFS Configuration
+NFS_MOUNT_PATH=/mnt/nfs/cctv_images
+
+# Performance Tuning
+POLL_INTERVAL_MS=30000
+MAX_CONCURRENT_SCRIPTS=5
+LOOKAHEAD_MINUTES=3
+GRACE_MINUTES=30
+EOF
+
+print_info "✓ Environment file created: .env.worker"
+
+# ============================================================
+# Step 6: Deploy Worker Services
+# ============================================================
+print_info "Deploying worker services..."
+
+# Load environment variables
+export $(cat .env.worker | xargs)
+
+# Pull images
+print_info "Pulling Docker images..."
+docker-compose -f docker-compose.worker.yml pull
+
+# Start services
+print_info "Starting worker services..."
+docker-compose -f docker-compose.worker.yml up -d
+
+# Wait for services to start
+print_info "Waiting for services to start..."
+sleep 10
+
+# ============================================================
+# Step 7: Verify Deployment
+# ============================================================
+print_info "Verifying deployment..."
+
+# Check containers
+if docker-compose -f docker-compose.worker.yml ps | grep -q "Up"; then
+    print_info "✓ Containers running"
+else
+    print_error "Containers not running properly"
+    docker-compose -f docker-compose.worker.yml ps
+    exit 1
+fi
+
+# Check GPU access
+if docker exec cctv_script_server_worker_${WORKER_ID} nvidia-smi &> /dev/null; then
+    print_info "✓ GPU accessible in container"
+else
+    print_error "GPU not accessible in container"
+    exit 1
+fi
+
+# Check health endpoint
+sleep 5
+if curl -s http://localhost:8000/health | grep -q "success"; then
+    print_info "✓ Health endpoint responding"
+else
+    print_warn "Health endpoint not responding yet (may need more time)"
+fi
+
+# ============================================================
+# Summary
+# ============================================================
+echo ""
+echo "============================================================"
+echo -e "${GREEN}Worker Node Setup Complete!${NC}"
+echo "============================================================"
+echo "Worker ID:        worker-$WORKER_ID"
+echo "Main Server:      $MAIN_SERVER_IP"
+echo "Camera Range:     $CAMERA_START - $CAMERA_END"
+echo "NFS Mount:        /mnt/nfs/cctv_images"
+echo "HTTP Port:        8000"
+echo "Ollama Port:      11434"
+echo "============================================================"
+echo ""
+echo "Next Steps:"
+echo "1. Verify worker status:"
+echo "   curl http://localhost:8000/status"
+echo ""
+echo "2. Check worker logs:"
+echo "   docker logs cctv_script_server_worker_${WORKER_ID}"
+echo ""
+echo "3. Monitor GPU usage:"
+echo "   docker exec cctv_script_server_worker_${WORKER_ID} nvidia-smi"
+echo ""
+echo "4. View running containers:"
+echo "   docker-compose -f docker-compose.worker.yml ps"
+echo ""
+echo "============================================================"
