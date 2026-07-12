@@ -13,8 +13,8 @@ numpy>=1.24.0,<2.0.0
 #   Ubuntu: sudo apt install ffmpeg
 #   Required by subprocess-based capture (_sync_ffmpeg_capture) in vision_classification_rtsp.py
 #   and capture_frame_with_ffmpeg_hls() in tcs_hls_utils.py
-opencv-python==4.13.0
-opencv-contrib-python==4.13.0
+opencv-python>=4.8.0,<5.0
+opencv-contrib-python>=4.8.0,<5.0
 Pillow>=10.0.0
 
 # Deep Learning
