@@ -53,7 +53,8 @@ easyocr>=1.7.0
 
 # AI APIs (optional - for Claude Vision fallback)
 anthropic>=0.25.0
-vllm>=0.20.0
+# vllm installed pinned in Dockerfile (uv pip install vllm==0.20.2); do not unpin here
+# vllm>=0.20.0
 openai>=1.0.0
 huggingface_hub>=0.19.0
 

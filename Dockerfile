@@ -35,8 +35,20 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Pin vLLM to the version proven stable on the big 224-core hosts (w5/6).
+# requirements.txt intentionally does NOT pin vllm; install it here via uv so a
+# newer (broken) release can't sneak in. openai + huggingface_hub are needed by
+# the vLLM OpenAI-compatible server + weight download.
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system "vllm==0.20.2" openai huggingface_hub
+
 # Copy application code
 COPY . .
+
+# Apply the vLLM stability patch (deep_gemm / flashinfer guard). WITHOUT this,
+# vLLM crashes on the 224-core / runtime-image hosts (no nvcc). Makes the SAME
+# image usable on worker-0..3 AND the big vLLM hosts w5/6.
+RUN python3 patch_vllm.py && chmod +x /app/start_vllm.sh
 
 # Create necessary directories
 RUN mkdir -p results frames models data logs \
@@ -57,5 +69,6 @@ ENV PYTHONUNBUFFERED=1
 # Use entrypoint script
 ENTRYPOINT ["docker-entrypoint.sh"]
 
-# Start FastAPI server
+# Headless agent by default (WORKER_MODE=agent); no HTTP API / socket. Same image
+# on every host — per-host differences are env only.
 CMD ["python", "run.py"]
