@@ -1,0 +1,51 @@
+name: UAT · worker
+
+# GPU image → must build on a self-hosted runner on a fleet GPU host
+# (label: cctv-uat + gpu). That host also needs Docker's data-root on /data
+# (root is space-constrained). Same image runs on w0-3 and w5/6 (vLLM patched).
+on:
+  push:
+    branches: [uat]
+  workflow_dispatch: {}
+
+concurrency:
+  group: worker-uat
+  cancel-in-progress: true
+
+env:
+  # Override with repo variable WORKER_IMAGE (e.g. ghcr.io/<owner>/cctv-worker,
+  # or a local registry host:5000/cctv-worker).
+  IMAGE: ${{ vars.WORKER_IMAGE || format('ghcr.io/{0}/cctv-worker', github.repository_owner) }}
+
+jobs:
+  build:
+    runs-on: [self-hosted, cctv-uat, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Registry login
+        run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
+      - name: Build image (~15-25GB: CUDA+torch+vllm; needs docker data-root on /data)
+        run: |
+          docker build -t "$IMAGE:uat-${{ github.sha }}" -t "$IMAGE:uat" .
+      - name: Push
+        run: |
+          docker push "$IMAGE:uat-${{ github.sha }}"
+          docker push "$IMAGE:uat"
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, cctv-uat, gpu]
+    environment: uat
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy worker container(s) with the new image
+        run: |
+          DEPLOY_DIR="${{ vars.WORKER_DEPLOY_DIR || '/data/new_dev/worker' }}"
+          rsync -a --delete --exclude '.git/' --exclude '.env' \
+            --exclude 'models/' --exclude 'hf_cache/' --exclude 'logs/' --exclude 'results/' \
+            ./ "$DEPLOY_DIR/"
+          cd "$DEPLOY_DIR"
+          export IMAGE_TAG="uat-${{ github.sha }}"
+          docker compose -f deploy/docker-compose.uat.yml pull || true
+          IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" docker compose -f deploy/docker-compose.uat.yml up -d
+          docker compose -f deploy/docker-compose.uat.yml ps

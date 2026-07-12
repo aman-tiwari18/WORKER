@@ -1,0 +1,34 @@
+# UAT worker deploy (headless agent). One service per GPU; this file shows GPU 0.
+# Copy the gpu0 block per GPU on the big hosts (w5/6), bumping WORKER_INDEX +
+# device_ids. Same image everywhere — differences are ENV only.
+#
+# Env (per host, NOT committed): put DB creds, MAIN_BACKEND_URL, API_KEY,
+# TOTAL_WORKERS, ENABLE_VLLM, etc. in ./.env
+services:
+  worker-gpu0:
+    image: ${IMAGE:-ghcr.io/OWNER/cctv-worker}:${IMAGE_TAG:-uat}
+    container_name: cctv_uat_worker_gpu0
+    restart: unless-stopped
+    shm_size: '16gb'
+    env_file: .env
+    environment:
+      WORKER_MODE: agent            # headless: poller only, no HTTP API / socket
+      WORKER_ID: ${WORKER_ID:-worker-uat-gpu0}
+      WORKER_INDEX: ${WORKER_INDEX:-0}
+      TOTAL_WORKERS: ${TOTAL_WORKERS:-1}
+      CUDA_VISIBLE_DEVICES: '0'
+      ENABLE_VLLM: ${ENABLE_VLLM:-1}
+      MAIN_BACKEND_URL: ${MAIN_BACKEND_URL:-http://host.docker.internal:4000/cctv_analytics/api}
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+      - ${HF_CACHE_HOST_PATH:-./hf_cache}:/app/data/hf_cache
+      - ./scripts/logs/worker-uat-gpu0:/app/scripts/logs
+      - ${FRAMES_HOST_PATH:-./results}:/app/scripts/detection/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
