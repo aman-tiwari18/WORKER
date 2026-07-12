@@ -18,7 +18,30 @@ env:
   IMAGE: ${{ vars.WORKER_IMAGE || format('ghcr.io/{0}/cctv-worker', github.repository_owner) }}
 
 jobs:
+  # Lightweight CI on a GitHub-hosted runner — always runs (keeps the pipeline
+  # green without needing the GPU self-hosted runner).
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Compile-check agent + detection code
+        run: |
+          python -m py_compile run.py app/poller.py app/script_runner.py \
+            app/camera_distributor.py app/config.py \
+            scripts/detection/pipeline/master_pipeline.py \
+            scripts/detection/unified_detector.py \
+            scripts/detection/utils/camera_loader.py \
+            patch_vllm.py patch_vllm_deep_gemm.py
+          echo "compile OK"
+
   build:
+    needs: ci
+    # GPU image build — gated behind a self-hosted GPU runner + repo variable
+    # ENABLE_DEPLOY=true. Until then only the ci job runs (green, not stuck).
+    if: ${{ vars.ENABLE_DEPLOY == 'true' }}
     runs-on: [self-hosted, cctv-uat, gpu]
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +57,7 @@ jobs:
 
   deploy:
     needs: build
+    if: ${{ vars.ENABLE_DEPLOY == 'true' }}
     runs-on: [self-hosted, cctv-uat, gpu]
     environment: uat
     steps:
