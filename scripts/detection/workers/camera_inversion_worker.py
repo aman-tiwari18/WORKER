@@ -164,6 +164,7 @@ def _detect_orientation_batch(frames):
 
 # ================= GPU WORKER =================
 def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
+    cooldown_time = int(os.environ.get("COOLDOWN_TIME", cooldown_time))
     """
     GPU batch worker — TRUE batch inference.
     """

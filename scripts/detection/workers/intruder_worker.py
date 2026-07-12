@@ -69,6 +69,7 @@ _gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
 # 🚀 GPU BATCH WORKER
 # =====================================================
 def _gpu_batch_worker(stop_event, save_folder, cooldown_time=60):
+    cooldown_time = int(os.environ.get("COOLDOWN_TIME", cooldown_time))
     """
     GPU batch worker — TRUE batch inference.
     """

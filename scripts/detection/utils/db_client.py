@@ -625,21 +625,28 @@ def get_hls_cameras_accessible(exam_id: int, shift_id: int, exam_date: str) -> l
         return []
 
 
-def update_hls_classification(exam_id: int, shift_id: int, exam_date: str, ch_code: str, classification: str, status: str = None) -> int:
-    """Update classification and status in camera_links_hls for one camera.
+def update_hls_classification(exam_id: int, shift_id: int, exam_date: str, ch_code: str, classification: str, status: str = None, frame_path: str = None) -> int:
+    """Update classification, status, and frame_path in camera_links_hls for one camera.
     Reclassification clears any prior manual verification: a fresh VLM result
     invalidates the operator's prior override, so the camera goes back to the
     untouched/VLM-only state until a human re-verifies it.
     """
-    sql = """
+    frame_path = _canonicalize_frame_path(frame_path)
+    # Only overwrite frame_path when a fresh one is supplied — a frame_path-less
+    # update (e.g. the checkpoint-resume path) must not wipe an existing capture.
+    frame_set = "frame_path = %s," if frame_path is not None else ""
+    sql = f"""
         UPDATE camera_links_hls
-        SET classification = %s, status = %s,
+        SET classification = %s, status = %s, {frame_set}
             manually_verified = 0, verified_by = NULL
         WHERE exam_id = %s
           AND ch_code = %s
           AND is_active = 1
     """
-    params = [classification, status, exam_id, ch_code]
+    params = [classification, status]
+    if frame_path is not None:
+        params.append(frame_path)
+    params += [exam_id, ch_code]
     if shift_id is not None:
         sql += " AND (shift_id = %s OR shift_id IS NULL)"
         params.append(shift_id)

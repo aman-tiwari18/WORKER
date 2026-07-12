@@ -2089,6 +2089,7 @@ def list_client_detections(
     exam_id: Optional[int] = None,
     shift_id: Optional[int] = None,
     user_role: Optional[str] = None,
+    user_id: Optional[int] = None,
     user_company: Optional[str] = None,
 ):
     all_counts = {k: 0 for k in DETECTION_FOLDERS}
@@ -2100,15 +2101,15 @@ def list_client_detections(
     conn = _get_connection()
     try:
         with conn.cursor() as cur:
-            # Resolve user exam IDs for non-admin role filtering.
+            # Resolve user exam IDs for non-admin role filtering via user_exam_assignments.
             user_exam_ids = []
-            if user_role and user_role != 'ADMIN':
-                if user_company:
-                    if user_company == 'EY':
-                        cur.execute("SELECT id FROM exams WHERE exam_body IN ('SSC', 'TCS', 'NTA') AND is_active = 1")
-                    else:
-                        cur.execute("SELECT id FROM exams WHERE exam_body = %s AND is_active = 1", (user_company,))
-                    user_exam_ids = [row['id'] for row in cur.fetchall()]
+            if user_role and user_role not in ('ADMIN', 'OPERATOR', 'service'):
+                if user_id:
+                    cur.execute(
+                        "SELECT exam_id FROM user_exam_assignments WHERE user_id = %s",
+                        (user_id,)
+                    )
+                    user_exam_ids = [row['exam_id'] for row in cur.fetchall()]
                     if not user_exam_ids:
                         return {
                             "success": True, "total": 0, "page": page, "limit": limit,

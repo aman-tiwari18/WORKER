@@ -51,7 +51,7 @@ HLS_SAVE_FOLDER  = os.path.join(DETECTION_ROOT, "results/tcs_detections/camera_t
 os.makedirs(RTSP_SAVE_FOLDER, exist_ok=True)
 os.makedirs(HLS_SAVE_FOLDER,  exist_ok=True)
 
-COOLDOWN_TIME = 60
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 60))
 THREAD_DELAY  = 0.1
 HLS_SAMPLE_EVERY = 10
 

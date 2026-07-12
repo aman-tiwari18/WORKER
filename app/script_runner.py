@@ -241,6 +241,11 @@ class ScriptRunner:
         env["CAMERA_NAME"] = str(meta.get("camera_name") or execution.get("camera_name") or "")
         env["CAMERA_CLASSIFICATION"] = str(meta.get("classification") or execution.get("classification") or "")
 
+        # Pass custom frequency as COOLDOWN_TIME (seconds) so workers override their default.
+        freq_secs = meta.get("custom_frequency_minutes") or execution.get("custom_frequency_minutes")
+        if freq_secs:
+            env["COOLDOWN_TIME"] = str(int(freq_secs))
+
         # Both the regular vision classification (vision → rtsp/hls script) and the
         # NEET classification (vision_neet) consume the assignment via this payload.
         # vision_neet was previously excluded, so the NEET script launched with no

@@ -39,6 +39,7 @@ try:
         update_rtsp_classification,
         update_hls_status,
         update_rtsp_status,
+        insert_hls_classification_history,
     )
 except ImportError:
     sys.path.append(os.path.join(os.path.dirname(__file__), "utils"))
@@ -49,6 +50,7 @@ except ImportError:
         update_rtsp_classification,
         update_hls_status,
         update_rtsp_status,
+        insert_hls_classification_history,
     )
 
 # ===========================================================================
@@ -101,7 +103,14 @@ CHECKPOINT_INTERVAL = 500
 RESUME_FROM_CHECKPOINT = True
 SCENE_COLUMN_TARGET = "Scene Classification"
 
+# Captured classification frames are saved here and referenced by camera_links_hls.frame_path
+# / camera_classification_hls.frame_path. The backend serves them from paths containing
+# `/classification_frames/` — keep this dir name in sync with the RTSP path.
+_SCRIPT_DIR         = os.path.dirname(os.path.abspath(__file__))
+FRAMES_FOLDER       = os.path.join(_SCRIPT_DIR, "results", "classification_frames")
+
 os.makedirs(SAVE_FOLDER, exist_ok=True)
+os.makedirs(FRAMES_FOLDER, exist_ok=True)
 
 # One shared thread-pool for all blocking I/O (OpenCV, FFmpeg, HLS extract)
 _THREAD_POOL = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
@@ -625,10 +634,13 @@ async def _process_camera(
     session: aiohttp.ClientSession,
     sem: asyncio.Semaphore,
     is_rtsp: bool = False,
+    frames_dir: str = FRAMES_FOLDER,
 ) -> dict:
     """
     Semaphore limits concurrent Ollama requests to MAX_WORKERS_VLM.
-    All frame bytes stay in RAM — never written to disk.
+    The captured frame is saved under frames_dir (an assignment_<id> subdir of
+    FRAMES_FOLDER) so its path can be persisted to camera_links_hls.frame_path /
+    camera_classification_hls (mirrors RTSP).
     """
     cam_id = access_result["camera_id"]
     cam    = access_result["cam"]
@@ -640,30 +652,61 @@ async def _process_camera(
             if not jpeg:
                 return {
                     "camera_id":      cam_id,
+                    "camera_pk":      cam.get("id"),
                     "camera_name":    cam.get("camera_name"),
                     "classification": "Uncertain",
                     "status":         "Not Accessible",
                     "detail":         "frame_capture_failed",
+                    "frame_path":     None,
                 }
+
+            frame_path = await _save_frame_to_disk(jpeg, cam_id, frames_dir)
 
             label, reason = await _classify_with_vlm(jpeg, session)
             return {
                 "camera_id":      cam_id,
+                "camera_pk":      cam.get("id"),
                 "camera_name":    cam.get("camera_name"),
                 "classification": label,
                 "status":         "Accessible",
                 "detail":         reason or "classified",
+                "frame_path":     frame_path,
             }
 
         except Exception as e:
             logger.error(f"Processing error for {cam_id}: {e}")
             return {
                 "camera_id":      cam_id,
+                "camera_pk":      cam.get("id"),
                 "camera_name":    cam.get("camera_name"),
                 "classification": "Uncertain",
                 "status":         "Accessible",
                 "detail":         str(e),
+                "frame_path":     None,
             }
+
+
+def _frames_dir_for_assignment(assignment_id=None) -> str:
+    """Per-assignment subdir of FRAMES_FOLDER (mirrors RTSP), so frames from
+    different runs don't collide and the NFS layout matches the RTSP path."""
+    subdir = f"assignment_{assignment_id}" if assignment_id else "default"
+    path = os.path.join(FRAMES_FOLDER, subdir)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+async def _save_frame_to_disk(jpeg: bytes, cam_id: str, frames_dir: str = FRAMES_FOLDER) -> Optional[str]:
+    """Persist a captured JPEG to frames_dir; return the path (None on failure)."""
+    loop     = asyncio.get_event_loop()
+    safe_id  = re.sub(r'[^\w\-]', '_', str(cam_id))[:60]
+    fname    = f"{safe_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+    fpath    = os.path.join(frames_dir, fname)
+    try:
+        await loop.run_in_executor(_THREAD_POOL, lambda: open(fpath, "wb").write(jpeg))
+        return fpath
+    except Exception as e:
+        logger.debug(f"Frame save failed for {cam_id}: {e}")
+        return None
 
 
 # ===========================================================================
@@ -672,23 +715,33 @@ async def _process_camera(
 
 def _bulk_persist(runtime: dict, classifications: List[dict]) -> int:
     updated = 0
+    history_inserted = 0
     for item in classifications:
-        cam_id = str(item.get("camera_id") or "").strip()
-        label  = str(item.get("classification") or "").strip()
-        status = str(item.get("status") or "").strip() or None
+        cam_id     = str(item.get("camera_id") or "").strip()
+        label      = str(item.get("classification") or "").strip()
+        status     = str(item.get("status") or "").strip() or None
+        frame_path = str(item.get("frame_path") or "").strip() or None
+        camera_pk  = item.get("camera_pk")
         if not cam_id or not label:
             continue
         try:
             if runtime["link_type"] == "HLS":
                 updated += update_hls_classification(
                     runtime["exam_id"], runtime["shift_id"],
-                    runtime["assignment_date"], cam_id, label, status
+                    runtime["assignment_date"], cam_id, label, status, frame_path
+                )
+                history_inserted += insert_hls_classification_history(
+                    camera_pk, runtime.get("shift_id"),
+                    runtime.get("assignment_date"), frame_path, label,
                 )
             else:
                 updated += update_rtsp_classification(runtime["exam_id"], cam_id, label, status)
         except Exception as e:
             logger.error(f"DB persist failed for {cam_id}: {e}")
-    logger.info(f"Bulk DB persist complete: {updated} rows updated")
+    logger.info(
+        f"Bulk DB persist complete: {updated} rows updated, "
+        f"{history_inserted} history rows inserted"
+    )
     return updated
 
 
@@ -888,12 +941,13 @@ async def run_assignment_mode() -> dict:
             }
 
         # ── Pass-2 ────────────────────────────────────────────────────────
+        frames_dir = _frames_dir_for_assignment(runtime.get("assignment_id"))
         logger.info(
             f"Pass-2 | {len(accessible)} cameras | "
             f"{MAX_WORKERS_VLM} concurrent VLM | model={VLLM_MODEL}"
         )
         p2_coros = [
-            _process_camera(r, session, sem_vlm, is_rtsp=is_rtsp)
+            _process_camera(r, session, sem_vlm, is_rtsp=is_rtsp, frames_dir=frames_dir)
             for r in accessible
         ]
         classifications: List[dict] = []
@@ -907,9 +961,11 @@ async def run_assignment_mode() -> dict:
             res = await fut
             classifications.append({
                 "camera_id":      res["camera_id"],
+                "camera_pk":      res.get("camera_pk"),
                 "camera_name":    res.get("camera_name"),
                 "classification": res["classification"],
-                "status":         res.get("status")
+                "status":         res.get("status"),
+                "frame_path":     res.get("frame_path"),
             })
             if res.get("status") != "Accessible":
                 failed.append({"camera_id": res["camera_id"], "reason": res.get("detail")})
@@ -978,12 +1034,13 @@ async def _default_pipeline(cameras: List[dict], runtime: dict) -> None:
             return
 
         # Pass-2
+        frames_dir = _frames_dir_for_assignment(runtime.get("assignment_id"))
         logger.info(
             f"Pass-2 | {len(accessible)} cameras | "
             f"{MAX_WORKERS_VLM} VLM workers | model={VLLM_MODEL}"
         )
         p2_coros = [
-            _process_camera(r, session, sem_vlm, is_rtsp=is_rtsp)
+            _process_camera(r, session, sem_vlm, is_rtsp=is_rtsp, frames_dir=frames_dir)
             for r in accessible
         ]
         p2_start = time.time()

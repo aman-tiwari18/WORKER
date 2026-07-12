@@ -80,17 +80,27 @@ SCRIPT_CLASSIFICATION_MAP = {
     "qp_box":          ["strong room", "server room"],
 }
 
-def _camera_matches_script(classification, script_code):
-    """Check if a camera's classification matches the requested script_code"""
+def _camera_matches_script(classification, script_code, custom_classifications=None):
+    """Check if a camera's classification matches the requested script_code.
+
+    If custom_classifications is provided (from DB assignment), use that instead
+    of the hardcoded SCRIPT_CLASSIFICATION_MAP.
+    """
     if not classification:
-        return True # Default to including if unknown
-    
-    allowed = SCRIPT_CLASSIFICATION_MAP.get(script_code, [])
-    if "all" in allowed:
+        return True  # Default to including if unknown
+
+    # Use user-defined classifications if set
+    allowed = custom_classifications if custom_classifications else SCRIPT_CLASSIFICATION_MAP.get(script_code, [])
+
+    if not allowed:
         return True
-        
+
+    allowed_lower = [a.lower() for a in allowed]
+    if "all" in allowed_lower or "all cameras" in allowed_lower:
+        return True
+
     cls_lower = classification.lower()
-    return any(scene in cls_lower for scene in allowed)
+    return any(scene in cls_lower for scene in allowed_lower)
 
 def load_cameras_for_execution(execution: dict) -> list:
     """
@@ -113,6 +123,7 @@ def load_cameras_for_execution(execution: dict) -> list:
     link_type   = execution.get("link_type", "").upper()
     exam_id     = execution.get("exam_id")
     shift_id    = execution.get("shift_id")
+    custom_cls  = execution.get("camera_classifications") or (execution.get("execution_metadata") or {}).get("camera_classifications")
 
     today = date.today().isoformat()
 
@@ -127,7 +138,7 @@ def load_cameras_for_execution(execution: dict) -> list:
             if not ch_code or not row.get("cctv_url"):
                 continue
             
-            if not _camera_matches_script(classification, script_code):
+            if not _camera_matches_script(classification, script_code, custom_cls):
                 continue
 
             cameras.append({
@@ -154,7 +165,7 @@ def load_cameras_for_execution(execution: dict) -> list:
             if not device_id or not row.get("cctv_url"):
                 continue
 
-            if not _camera_matches_script(classification, script_code):
+            if not _camera_matches_script(classification, script_code, custom_cls):
                 continue
 
             # id is PRIMARY KEY — guaranteed unique per row
