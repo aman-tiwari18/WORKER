@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Registry login
         run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
-      - name: Build image (~15-25GB: CUDA+torch+vllm; needs docker data-root on /data)
+      - name: "Build image (~15-25GB CUDA+torch+vllm; needs docker data-root on /data)"
         run: |
           docker build -t "$IMAGE:uat-${{ github.sha }}" -t "$IMAGE:uat" .
       - name: Push
