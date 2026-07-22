@@ -17,20 +17,24 @@ import asyncio
 def _run_agent():
     from app.poller import poller_service
     from app.fleet_agent import fleet_agent
+    from app.lifecycle import lifecycle_reconciler
     from app.logger import logger
 
     async def _main():
-        logger.info("Headless worker agent starting (poller + fleet registry; no HTTP API / socket.io)")
+        logger.info("Headless worker agent starting (poller + fleet registry + lifecycle; no HTTP API / socket.io)")
         # Register/heartbeat first so the backend sees the worker even if it has
         # no assignments to poll (plan §4.1 — the fleet is self-describing).
         await fleet_agent.start()
         await poller_service.start()
+        # Backend is the stop authority; this converges local processes to it.
+        await lifecycle_reconciler.start()
         try:
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
             pass
         finally:
+            await lifecycle_reconciler.stop()
             await poller_service.stop()
             await fleet_agent.stop()
 
