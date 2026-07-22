@@ -2,8 +2,9 @@
 # On the big hosts, copy the gpu0 block per GPU, bumping WORKER_INDEX + device_ids.
 # Same image everywhere — differences are ENV only.
 #
-# Run from the repo root:  docker-compose -f deploy/docker-compose.uat.yml up -d
-# (run with: docker-compose --project-directory <repo-root> -f deploy/docker-compose.uat.yml up -d)
+# Deploy with Compose v2 (v1 cannot recreate: KeyError 'ContainerConfig'):
+#   docker compose --project-directory /data/new_dev/worker -f deploy/docker-compose.uat.yml up -d
+# --project-directory is required: compose resolves env_file/./paths from the project dir.
 services:
   worker-gpu0:
     image: ${IMAGE:-cctv-worker}:${IMAGE_TAG:-uat}
