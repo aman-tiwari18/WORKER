@@ -26,6 +26,11 @@ class CameraDistributor:
     
     def __init__(self):
         self.worker_id = os.environ.get("WORKER_ID", "main")
+        # Lease mode (plan §4.2): ownership comes from shards CLAIMED from the
+        # backend rather than from TOTAL_WORKERS/WORKER_INDEX. crc32 is still
+        # the bucketing function -- it just no longer decides ownership.
+        # Default stays "hash" until lease coverage is validated against it.
+        self.coordination_mode = os.environ.get("COORDINATION_MODE", "hash").lower()
         self.camera_start = self._parse_int_env("CAMERA_START_ID")
         self.camera_end = self._parse_int_env("CAMERA_END_ID")
         self.distribution_mode = os.environ.get("DISTRIBUTION_MODE", "auto")
@@ -266,12 +271,75 @@ class CameraDistributor:
 
         return None
     
-    def filter_cameras(self, cameras: List[Dict]) -> List[Dict]:
+    @staticmethod
+    def lease_from_env():
+        """
+        Read shard ownership from the environment.
+
+        The camera filter runs inside master_pipeline, a SUBPROCESS that has no
+        access to the agent's lease client. script_runner exports the claimed
+        shards (LEASE_SHARDS / LEASE_SHARD_COUNT) when it launches the pipeline,
+        so ownership crosses the process boundary without having to thread a
+        lease object through every db_client call site.
+        """
+        raw = os.environ.get("LEASE_SHARDS", "").strip()
+        count = os.environ.get("LEASE_SHARD_COUNT", "").strip()
+        if not raw or not count:
+            return None
+        try:
+            shards = {int(x) for x in raw.split(",") if x.strip() != ""}
+            return {"shards": shards, "shard_count": int(count)} if shards else None
+        except ValueError:
+            logger.warning(f"Invalid LEASE_SHARDS/LEASE_SHARD_COUNT: {raw!r}/{count!r}")
+            return None
+
+    def filter_by_lease(self, cameras: List[Dict], shards: set, shard_count: int) -> List[Dict]:
+        """
+        Keep only cameras whose shard this worker currently holds a lease on.
+
+        Same crc32 key as auto mode, so a camera lands in a stable bucket; the
+        difference is that the bucket is OWNED (claimed and renewed) instead of
+        inferred from an env var that nothing validates.
+
+        A camera with no usable partition key is processed rather than dropped:
+        losing a camera silently is the failure this whole mechanism exists to
+        prevent, so the safe default is to over-process, not under-process.
+        """
+        if not shard_count:
+            return list(cameras)
+
+        assigned = []
+        for cam in cameras:
+            key = self._camera_partition_key(cam)
+            if key is None:
+                assigned.append(cam)
+                continue
+            if (key % shard_count) in shards:
+                assigned.append(cam)
+
+        logger.info(
+            f"Worker {self.worker_id}: lease mode assigned {len(assigned)}/{len(cameras)} "
+            f"cameras from {len(shards)}/{shard_count} shards"
+        )
+        return assigned
+
+    def filter_cameras(self, cameras: List[Dict], lease=None) -> List[Dict]:
         """
         Filter camera list to only include cameras assigned to this worker.
         Uses stable camera IDs instead of list indexes, so assignment does not
         change when the database returns the same rows in a different order.
+
+        When COORDINATION_MODE=lease and a lease record is supplied, ownership
+        comes from the claimed shards instead of the hash of the worker index.
         """
+        if self.coordination_mode == "lease":
+            lease = lease or self.lease_from_env()
+            if lease:
+                return self.filter_by_lease(cameras, lease.get("shards") or set(), lease.get("shard_count") or 0)
+            # Lease mode on but no shards known: fall through to hash rather than
+            # process every camera on every worker (which would duplicate work).
+            logger.warning("COORDINATION_MODE=lease but no shards are held; falling back to hash distribution")
+
         if self.distribution_mode == "single":
             assigned = list(cameras)
         elif self.distribution_mode == "auto":
@@ -349,17 +417,18 @@ def should_process_camera(camera: Dict) -> bool:
     return distributor.should_process_camera(camera)
 
 
-def filter_cameras(cameras: List[Dict]) -> List[Dict]:
+def filter_cameras(cameras: List[Dict], lease=None) -> List[Dict]:
     """
     Convenience function to filter camera list.
-    
+
     Args:
         cameras: List of camera dicts
-    
+        lease: optional {"shards": set, "shard_count": int} from the lease client
+
     Returns:
         Filtered list for this worker
     """
-    return distributor.filter_cameras(cameras)
+    return distributor.filter_cameras(cameras, lease=lease)
 
 
 # ============================================================

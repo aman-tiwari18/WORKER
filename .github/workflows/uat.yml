@@ -33,7 +33,8 @@ jobs:
       - name: Compile-check agent + detection code
         run: |
           python -m py_compile run.py app/poller.py app/script_runner.py \
-            app/fleet_agent.py app/camera_distributor.py app/config.py \
+            app/fleet_agent.py app/lifecycle.py app/leases.py \
+            app/camera_distributor.py app/config.py \
             scripts/detection/pipeline/master_pipeline.py \
             scripts/detection/unified_detector.py \
             scripts/detection/utils/camera_loader.py \

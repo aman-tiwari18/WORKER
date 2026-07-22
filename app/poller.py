@@ -392,7 +392,11 @@ class Poller:
             if IS_MAIN_WORKER:
                 await self._update_status_all(assignment, "RUNNING")
 
-            result = await script_runner.execute_script(assignment)
+            # Claim the camera shards this worker will own (plan §4.2). No-op
+            # unless COORDINATION_MODE=lease, so hash mode is unaffected.
+            lease = await self._claim_lease(assignment, assignment_id)
+
+            result = await script_runner.execute_script(assignment, lease=lease)
 
             logger.info(f"✔ Assignment {assignment_id} completed")
 
@@ -456,10 +460,52 @@ class Poller:
                         )
 
         finally:
+            # Hand the shards back so another worker can take them straight away
+            # instead of waiting for the lease to time out.
+            await self._release_lease(assignment_id)
             self.running_scripts.discard(assignment_id)
             self.group_members.pop(assignment_id, None)
             self.group_analytics.pop(assignment_id, None)
             self.group_relaunching.discard(assignment_id)
+
+    async def _claim_lease(self, assignment, assignment_id):
+        """Claim shard ownership for this assignment; None in hash mode."""
+        from app.leases import lease_client
+        if not lease_client.is_enabled():
+            return None
+        meta = assignment.get("execution_metadata", {}) or {}
+        real_ids = self.group_members.get(assignment_id, [assignment_id])
+        try:
+            # A grouped job covers several assignments; lease against the first
+            # real backend id, since the synthetic "grp-..." key does not exist
+            # server-side.
+            target = int(real_ids[0])
+        except (TypeError, ValueError, IndexError):
+            logger.warning(f"leases: cannot resolve a backend id for {assignment_id}; running unleased")
+            return None
+        try:
+            return await lease_client.claim(
+                target,
+                exam_id=meta.get("exam_id"),
+                shift_id=meta.get("shift_id"),
+                script_code=self._normalized_code(assignment),
+            )
+        except Exception as exc:
+            # Never let a lease failure block detection.
+            logger.warning(f"leases: claim failed for {assignment_id}: {exc}; running unleased")
+            return None
+
+    async def _release_lease(self, assignment_id):
+        from app.leases import lease_client
+        if not lease_client.is_enabled():
+            return
+        for real_id in self.group_members.get(assignment_id, [assignment_id]):
+            try:
+                await lease_client.release(int(real_id))
+            except (TypeError, ValueError):
+                continue
+            except Exception as exc:
+                logger.warning(f"leases: release failed for {real_id}: {exc}")
 
     async def update_assignment_status(self, assignment_id, status, data=None):
         if data is None:

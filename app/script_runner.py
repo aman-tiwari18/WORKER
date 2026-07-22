@@ -144,7 +144,7 @@ class ScriptRunner:
     def _normalize_script_code(self, raw_script_code) -> str:
         script_code = str(raw_script_code or "").strip().lower()
         return self.SCRIPT_CODE_ALIASES.get(script_code, script_code)
-    async def execute_script(self, execution):
+    async def execute_script(self, execution, lease=None):
         execution_metadata = execution.get("execution_metadata", {})
         raw_script_code = execution_metadata.get("script_code") or execution.get("script_code")
         script_code = self._normalize_script_code(raw_script_code)
@@ -240,6 +240,14 @@ class ScriptRunner:
         env["LINK_TYPE"] = str(meta.get("link_type") or execution.get("link_type") or "")
         env["CAMERA_NAME"] = str(meta.get("camera_name") or execution.get("camera_name") or "")
         env["CAMERA_CLASSIFICATION"] = str(meta.get("classification") or execution.get("classification") or "")
+
+        # Hand claimed shard ownership to the pipeline subprocess (plan §4.2).
+        # camera_distributor.lease_from_env() picks these up inside master_pipeline,
+        # so ownership survives the process boundary without threading a lease
+        # object through every db_client call site.
+        if lease and lease.get("shards"):
+            env["LEASE_SHARDS"] = ",".join(str(s) for s in sorted(lease["shards"]))
+            env["LEASE_SHARD_COUNT"] = str(lease.get("shard_count") or "")
 
         # Pass custom frequency as COOLDOWN_TIME (seconds) so workers override their default.
         freq_secs = meta.get("custom_frequency_minutes") or execution.get("custom_frequency_minutes")
