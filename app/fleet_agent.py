@@ -1,0 +1,185 @@
+"""
+fleet_agent.py — worker half of the fleet registry (plan §4.1).
+
+The worker is outbound-only: it POSTs /fleet/register once on boot, then
+/fleet/heartbeat on a fixed interval carrying its GPU/process snapshot. The
+backend is the single source of truth for "who is alive"; nothing here listens
+on a port, which is what lets the identical image run on every host.
+
+Two properties that matter operationally:
+  - Registration is idempotent (keyed on WORKER_ID), so a restart re-registers
+    rather than creating a duplicate row.
+  - A 404 from /heartbeat means the backend no longer knows this worker (its DB
+    was wiped, or the reaper removed it), so the agent re-registers on the spot.
+
+The loop never raises into the caller: a backend outage must not take down
+detection. It just logs, backs off, and keeps trying.
+"""
+import asyncio
+import os
+import socket
+import time
+
+import httpx
+
+from app.config import MAIN_BACKEND_URL, API_KEY, WORKER_ID, WORKER_NAME, TOTAL_WORKERS
+from app.logger import logger
+
+HEARTBEAT_INTERVAL_S = int(os.getenv("FLEET_HEARTBEAT_INTERVAL_S", "10"))
+FLEET_ENABLED = os.getenv("FLEET_ENABLED", "1") == "1"
+REQUEST_TIMEOUT_S = float(os.getenv("FLEET_REQUEST_TIMEOUT_S", "10"))
+_MAX_BACKOFF_S = 120
+
+
+def _worker_index() -> int:
+    try:
+        return int(os.getenv("WORKER_INDEX", "0"))
+    except ValueError:
+        return 0
+
+
+def _capabilities() -> dict:
+    """What this worker can do — config, never code (plan §4.0 bucket 3)."""
+    return {
+        "detector": os.getenv("ENABLE_DETECTION", "1") == "1",
+        "vllm": os.getenv("ENABLE_VLLM", "0") == "1",
+        "nvdec": os.getenv("USE_NVDEC", "0") == "1",
+        "unified_detector": os.getenv("UNIFIED_DETECTOR", "0") == "1",
+        "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
+        "max_concurrent": os.getenv("MAX_CONCURRENT", ""),
+    }
+
+
+def _gpu_snapshot() -> dict:
+    """
+    The worker's own nvidia-smi view — the same payload the old worker FastAPI
+    served at /gpu-monitor/local. The backend stores it verbatim and the GPU page
+    reassembles the cluster from it, so no fan-out or SSH is needed.
+
+    Cached/refreshed in a background thread by gpu_monitor, so this is cheap.
+    """
+    try:
+        from app.gpu_monitor import get_local_gpu_stats_data
+        return get_local_gpu_stats_data()
+    except Exception as exc:  # nvidia-smi missing, no GPU, etc.
+        logger.debug(f"fleet: GPU snapshot unavailable: {exc}")
+        return {}
+
+
+class FleetAgent:
+    def __init__(self):
+        self.base_url = MAIN_BACKEND_URL.rstrip("/")
+        self.headers = {"X-API-Key": API_KEY}
+        self.worker_id = WORKER_ID
+        self._task = None
+        self._registered = False
+        self._stopping = False
+        self._started_at = time.time()
+
+    # ── payloads ────────────────────────────────────────────────────────────
+    def _register_payload(self) -> dict:
+        gpu = _gpu_snapshot()
+        gpus = gpu.get("gpus") or []
+        first = gpus[0] if gpus else {}
+        return {
+            "worker_id": self.worker_id,
+            "name": WORKER_NAME,
+            "hostname": os.getenv("WORKER_HOSTNAME") or socket.gethostname(),
+            "gpu_index": first.get("gpu_id"),
+            "gpu_name": first.get("name"),
+            "gpu_uuid": first.get("uuid"),
+            "capabilities": _capabilities(),
+            "version": os.getenv("WORKER_VERSION") or os.getenv("IMAGE_TAG") or "dev",
+            "worker_index": _worker_index(),
+            "total_workers": TOTAL_WORKERS,
+            "heartbeat_interval_s": HEARTBEAT_INTERVAL_S,
+        }
+
+    def _heartbeat_payload(self) -> dict:
+        from app.poller import poller_service
+        running = getattr(poller_service, "running_scripts", set())
+        return {
+            "worker_id": self.worker_id,
+            "metrics": {
+                "gpu": _gpu_snapshot(),
+                "running_scripts": len(running),
+                "running_assignment_ids": sorted(str(x) for x in running),
+                "uptime_s": int(time.time() - self._started_at),
+            },
+        }
+
+    # ── HTTP ────────────────────────────────────────────────────────────────
+    async def register(self, client: httpx.AsyncClient) -> bool:
+        resp = await client.post(
+            f"{self.base_url}/fleet/register",
+            json=self._register_payload(),
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        self._registered = True
+        logger.info(f"fleet: registered {self.worker_id} with backend (heartbeat every {HEARTBEAT_INTERVAL_S}s)")
+        return True
+
+    async def _beat(self, client: httpx.AsyncClient) -> None:
+        resp = await client.post(
+            f"{self.base_url}/fleet/heartbeat",
+            json=self._heartbeat_payload(),
+            headers=self.headers,
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        if resp.status_code == 404:
+            # Backend forgot us — re-register rather than heartbeat into a void.
+            logger.warning("fleet: backend does not know this worker; re-registering")
+            self._registered = False
+            await self.register(client)
+            return
+        resp.raise_for_status()
+
+    # ── loop ────────────────────────────────────────────────────────────────
+    async def _loop(self) -> None:
+        backoff = HEARTBEAT_INTERVAL_S
+        async with httpx.AsyncClient() as client:
+            while not self._stopping:
+                try:
+                    if not self._registered:
+                        await self.register(client)
+                    else:
+                        await self._beat(client)
+                    backoff = HEARTBEAT_INTERVAL_S
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A backend outage must never stop detection — log and retry.
+                    logger.warning(f"fleet: heartbeat/register failed ({exc}); retrying in {backoff}s")
+                    backoff = min(backoff * 2, _MAX_BACKOFF_S)
+
+                try:
+                    await asyncio.sleep(backoff)
+                except asyncio.CancelledError:
+                    raise
+
+    async def start(self) -> None:
+        if not FLEET_ENABLED:
+            logger.info("fleet: agent disabled (FLEET_ENABLED=0)")
+            return
+        if self._task:
+            return
+        self._stopping = False
+        self._task = asyncio.create_task(self._loop())
+        logger.info(f"fleet: agent started for {self.worker_id} → {self.base_url}")
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if not self._task:
+            return
+        self._task.cancel()
+        try:
+            await self._task
+        except (asyncio.CancelledError, Exception):
+            pass
+        self._task = None
+        logger.info("fleet: agent stopped")
+
+
+fleet_agent = FleetAgent()

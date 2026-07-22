@@ -14,6 +14,11 @@ services:
     env_file: .env
     environment:
       WORKER_MODE: agent            # headless: poller only, no HTTP API / socket
+      # Report the PHYSICAL host to the fleet registry. Without this the agent
+      # falls back to socket.gethostname(), which inside a container is the
+      # container ID — it changes on every recreate and hides which box a GPU
+      # is actually on. Defaults to the deploying shell's hostname.
+      WORKER_HOSTNAME: ${WORKER_HOSTNAME:-${HOSTNAME:-unknown-host}}
     # backend runs on the HOST under PM2 → reach it via the docker host gateway
     extra_hosts:
       - "host.docker.internal:host-gateway"
