@@ -75,8 +75,9 @@ jobs:
             ./ "$DEPLOY_DIR/"
           cd "$DEPLOY_DIR"
           export IMAGE_TAG="uat-${{ github.sha }}"
-          # this host has docker-compose v1; it resolves compose paths from the
-          # PROJECT directory, so --project-directory is required.
+          # Use Compose v2. compose v1 (1.29.2) crashes on RECREATE against modern
+          # Docker Engine: KeyError 'ContainerConfig' — it can create a container but
+          # not redeploy over an existing one, which is exactly what CI does.
           IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" \
-            docker-compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml up -d
-          docker-compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml ps
+            docker compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml up -d
+          docker compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml ps
