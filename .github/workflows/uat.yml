@@ -15,7 +15,10 @@ concurrency:
 env:
   # Override with repo variable WORKER_IMAGE (e.g. ghcr.io/<owner>/cctv-worker,
   # or a local registry host:5000/cctv-worker).
-  IMAGE: ${{ vars.WORKER_IMAGE || format('ghcr.io/{0}/cctv-worker', github.repository_owner) }}
+  # Local tag by default: build+deploy run on the SAME host, so no registry round-trip
+  # for a ~17GB image. Set repo var WORKER_IMAGE=<registry>/cctv-worker (and
+  # WORKER_REGISTRY_PUSH=true) only when deploying to OTHER hosts.
+  IMAGE: ${{ vars.WORKER_IMAGE || 'cctv-worker' }}
 
 jobs:
   # Lightweight CI on a GitHub-hosted runner — always runs (keeps the pipeline
@@ -45,12 +48,14 @@ jobs:
     runs-on: [self-hosted, cctv-uat, gpu]
     steps:
       - uses: actions/checkout@v4
-      - name: Registry login
+      - name: Registry login (only when pushing to a registry)
+        if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
         run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
       - name: "Build image (~15-25GB CUDA+torch+vllm; needs docker data-root on /data)"
         run: |
           docker build -t "$IMAGE:uat-${{ github.sha }}" -t "$IMAGE:uat" .
-      - name: Push
+      - name: Push (opt-in; only for multi-host deploys)
+        if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
         run: |
           docker push "$IMAGE:uat-${{ github.sha }}"
           docker push "$IMAGE:uat"
@@ -70,6 +75,8 @@ jobs:
             ./ "$DEPLOY_DIR/"
           cd "$DEPLOY_DIR"
           export IMAGE_TAG="uat-${{ github.sha }}"
-          docker compose -f deploy/docker-compose.uat.yml pull || true
-          IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" docker compose -f deploy/docker-compose.uat.yml up -d
-          docker compose -f deploy/docker-compose.uat.yml ps
+          # this host has docker-compose v1; it resolves compose paths from the
+          # PROJECT directory, so --project-directory is required.
+          IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" \
+            docker-compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml up -d
+          docker-compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml ps
