@@ -50,6 +50,13 @@ COPY . .
 # image usable on worker-0..3 AND the big vLLM hosts w5/6.
 RUN python3 patch_vllm.py && chmod +x /app/start_vllm.sh
 
+# The detection results/ dir is a BIND-MOUNT POINT for frames. Prod had it as a
+# symlink to the NFS mount, which makes `docker run -v ...` fail ("not a directory").
+# Force a real directory here so the same image mounts cleanly on every host.
+RUN rm -rf "/app/scripts/detection/results" "/app/scripts/detection/results copy" \
+ && mkdir -p /app/scripts/detection/results
+
+
 # Create necessary directories
 RUN mkdir -p results frames models data logs \
     results/tcs_detections/crowd_detection_threshold \
