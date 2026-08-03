@@ -1342,6 +1342,41 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
 
 
 # ============================================================
+# 🌐  DB ACCESS MODE — direct (pymysql) vs backend (HTTP gateway)
+# ============================================================
+# Plan §4.0/§4.5B: when DB_ACCESS_MODE=backend the worker holds NO MySQL
+# connection — every read/write above is rebound to db_gateway, which talks to
+# the backend over HTTP. This is what lets the identical image run on any host
+# that can reach the backend, without exposing MySQL on the network.
+#
+# Default is "direct" so behaviour is unchanged until deliberately flipped
+# (mirrors the COORDINATION_MODE rollout pattern). The detection scripts import
+# these names, so rebinding here transparently switches all 17 functions.
+if os.environ.get("DB_ACCESS_MODE", "direct").lower() == "backend":
+    try:
+        try:
+            from utils import db_gateway as _gw
+        except ImportError:
+            import db_gateway as _gw  # when utils/ is on sys.path directly
+        _GATEWAY_FUNCS = [
+            "get_hls_cameras", "get_hls_cameras_accessible",
+            "get_rtsp_cameras", "get_rtsp_cameras_accessible",
+            "get_rtsp_camera_by_id", "get_hls_camera_by_ch_code",
+            "get_rtsp_camera_by_device_and_ch",
+            "update_hls_classification", "update_hls_status",
+            "update_rtsp_classification", "update_rtsp_status",
+            "update_rtsp_status_and_frame_path",
+            "insert_hls_classification_history", "insert_rtsp_classification_history",
+            "report_to_db_hls", "report_to_db_rtsp",
+        ]
+        for _name in _GATEWAY_FUNCS:
+            globals()[_name] = getattr(_gw, _name)
+        logger.info(f"[db_client] DB_ACCESS_MODE=backend — {len(_GATEWAY_FUNCS)} DB functions routed through the backend gateway")
+    except Exception as _e:
+        logger.error(f"[db_client] failed to enable backend gateway, staying on direct DB: {_e}")
+
+
+# ============================================================
 # 🧪  STANDALONE TEST
 # ============================================================
 if __name__ == "__main__":

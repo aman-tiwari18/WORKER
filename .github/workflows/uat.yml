@@ -38,6 +38,7 @@ jobs:
             scripts/detection/pipeline/master_pipeline.py \
             scripts/detection/unified_detector.py \
             scripts/detection/utils/camera_loader.py \
+            scripts/detection/utils/db_gateway.py \
             patch_vllm.py patch_vllm_deep_gemm.py
           echo "compile OK"
 
