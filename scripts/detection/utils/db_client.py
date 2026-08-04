@@ -1055,13 +1055,13 @@ def get_rtsp_camera_by_device_and_ch(device_id: str, camera_no: str) -> dict:
 # Base URL for detection images served by the backend
 _IMAGE_BASE_URL = os.environ.get(
     "DETECTION_IMAGE_BASE_URL",
-    "http://www.examscctvmonitoring.com/cctv_dev/serve-detection-images"
+    "https://examscctvmonitoring.com/current_dev_mode/api/serve-detection-images"
 )
 
 # Base URL for RTSP detection images
 _RTSP_IMAGE_BASE_URL = os.environ.get(
     "DETECTION_RTSP_IMAGE_BASE_URL",
-    "http://examscctvmonitoring.com/cctv_dev/serve-rtsp-detection-images"
+    "https://examscctvmonitoring.com/current_dev_mode/api/serve-rtsp-detection-images"
 )
 
 # Path to the shared DB report log (script-server/scripts/logs/db_reports.log)

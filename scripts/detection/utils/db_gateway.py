@@ -28,7 +28,7 @@ import requests
 
 from app.logger import logger  # worker logger; falls back below if unavailable
 
-_BACKEND = os.environ.get("MAIN_BACKEND_URL", "http://localhost:3000/cctv_analytics/api").rstrip("/")
+_BACKEND = os.environ.get("MAIN_BACKEND_URL", "http://host.docker.internal:4000/current_dev_mode/api").rstrip("/")
 _HEADERS = {"X-API-Key": os.environ.get("API_KEY", "")}
 _TIMEOUT = float(os.environ.get("DB_GATEWAY_TIMEOUT_S", "15"))
 _GPU_ID = None  # resolved lazily from db_client to avoid an import cycle
