@@ -48,19 +48,28 @@ jobs:
     # ENABLE_DEPLOY=true. Until then only the ci job runs (green, not stuck).
     if: ${{ vars.ENABLE_DEPLOY == 'true' }}
     runs-on: [self-hosted, cctv-uat, gpu]
+    # packages:write lets the built-in GITHUB_TOKEN push to ghcr.io with no extra
+    # secret — the image publishes to ghcr.io/<owner>/cctv-worker on every build,
+    # which is what lets any new GPU host pull-and-run it (continuous scaling).
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Normalise image name (ghcr requires a lowercase path)
+        run: echo "IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - name: Registry login (only when pushing to a registry)
         if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
         run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
       - name: "Build image (~15-25GB CUDA+torch+vllm; needs docker data-root on /data)"
         run: |
           docker build -t "$IMAGE:uat-${{ github.sha }}" -t "$IMAGE:uat" .
-      - name: Push (opt-in; only for multi-host deploys)
+      - name: Push to registry (opt-in; required for multi-host scaling)
         if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
         run: |
           docker push "$IMAGE:uat-${{ github.sha }}"
           docker push "$IMAGE:uat"
+          echo "published $IMAGE:uat (and :uat-${{ github.sha }}) — new hosts: deploy/scale-worker.sh"
 
   deploy:
     needs: build

@@ -28,3 +28,4 @@ scripts/detection/frames/
 server_tokens.json
 *.bak
 *.bak.*
+deploy/docker-compose.generated.yml
