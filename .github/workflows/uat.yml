@@ -1,28 +1,22 @@
-name: UAT · worker
+name: Deploy · worker
 
-# GPU image → must build on a self-hosted runner on a fleet GPU host
-# (label: cctv-uat + gpu). That host also needs Docker's data-root on /data
-# (root is space-constrained). Same image runs on w0-3 and w5/6 (vLLM patched).
+# Two environments from two branches:
+#   uat     -> prod2 (main VM, H200): BUILD the image on the GPU runner, push to
+#              ghcr, deploy with deploy/docker-compose.uat.yml in /data/new_dev/worker.
+#   develop -> dev   (H200-dev, L4) : PULL the ghcr image (the L4's disk can't hold
+#              a second 17GB build), deploy with deploy/docker-compose.dev.yml in
+#              /data/dev/worker. Worker code is identical across envs; the env
+#              differences (ENABLE_VLLM=0, backend URL) live in the dev .env.
 on:
   push:
-    branches: [uat]
+    branches: [uat, develop]
   workflow_dispatch: {}
 
 concurrency:
-  group: worker-uat
+  group: worker-${{ github.ref_name }}
   cancel-in-progress: true
 
-env:
-  # Override with repo variable WORKER_IMAGE (e.g. ghcr.io/<owner>/cctv-worker,
-  # or a local registry host:5000/cctv-worker).
-  # Local tag by default: build+deploy run on the SAME host, so no registry round-trip
-  # for a ~17GB image. Set repo var WORKER_IMAGE=<registry>/cctv-worker (and
-  # WORKER_REGISTRY_PUSH=true) only when deploying to OTHER hosts.
-  IMAGE: ${{ vars.WORKER_IMAGE || 'cctv-worker' }}
-
 jobs:
-  # Lightweight CI on a GitHub-hosted runner — always runs (keeps the pipeline
-  # green without needing the GPU self-hosted runner).
   ci:
     runs-on: ubuntu-latest
     steps:
@@ -42,53 +36,62 @@ jobs:
             patch_vllm.py patch_vllm_deep_gemm.py
           echo "compile OK"
 
-  build:
+  deploy:
     needs: ci
-    # GPU image build — gated behind a self-hosted GPU runner + repo variable
-    # ENABLE_DEPLOY=true. Until then only the ci job runs (green, not stuck).
     if: ${{ vars.ENABLE_DEPLOY == 'true' }}
-    runs-on: [self-hosted, cctv-uat, gpu]
-    # packages:write lets the built-in GITHUB_TOKEN push to ghcr.io with no extra
-    # secret — the image publishes to ghcr.io/<owner>/cctv-worker on every build,
-    # which is what lets any new GPU host pull-and-run it (continuous scaling).
+    runs-on:
+      - self-hosted
+      - ${{ github.ref_name == 'develop' && 'cctv-dev' || 'cctv-uat' }}
+      - gpu
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Normalise image name (ghcr requires a lowercase path)
-        run: echo "IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-      - name: Registry login (only when pushing to a registry)
-        if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
-        run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
-      - name: "Build image (~15-25GB CUDA+torch+vllm; needs docker data-root on /data)"
+      - name: Resolve environment (by branch)
         run: |
-          docker build -t "$IMAGE:uat-${{ github.sha }}" -t "$IMAGE:uat" .
-      - name: Push to registry (opt-in; required for multi-host scaling)
-        if: ${{ vars.WORKER_REGISTRY_PUSH == 'true' }}
-        run: |
-          docker push "$IMAGE:uat-${{ github.sha }}"
-          docker push "$IMAGE:uat"
-          echo "published $IMAGE:uat (and :uat-${{ github.sha }}) — new hosts: deploy/scale-worker.sh"
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            echo "IS_UAT=false"                                     >> "$GITHUB_ENV"
+            echo "DEPLOY_DIR=/data/dev/worker"                      >> "$GITHUB_ENV"
+            echo "COMPOSE_FILE=deploy/docker-compose.dev.yml"       >> "$GITHUB_ENV"
+            echo "IMAGE=ghcr.io/aman-tiwari18/cctv-worker"          >> "$GITHUB_ENV"
+            echo "IMAGE_TAG=uat"                                    >> "$GITHUB_ENV"
+          else
+            echo "IS_UAT=true"                                      >> "$GITHUB_ENV"
+            echo "DEPLOY_DIR=/data/new_dev/worker"                  >> "$GITHUB_ENV"
+            echo "COMPOSE_FILE=deploy/docker-compose.uat.yml"       >> "$GITHUB_ENV"
+            echo "IMAGE=$(echo "${{ vars.WORKER_IMAGE || 'cctv-worker' }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+            echo "IMAGE_TAG=uat-${{ github.sha }}"                  >> "$GITHUB_ENV"
+          fi
 
-  deploy:
-    needs: build
-    if: ${{ vars.ENABLE_DEPLOY == 'true' }}
-    runs-on: [self-hosted, cctv-uat, gpu]
-    environment: uat
-    steps:
-      - uses: actions/checkout@v4
-      - name: Deploy worker container(s) with the new image
+      # ── uat: build + push the image on the prod2 GPU runner ──────────────────
+      - name: Registry login (uat push)
+        if: ${{ env.IS_UAT == 'true' && vars.WORKER_REGISTRY_PUSH == 'true' }}
+        run: echo "${{ secrets.REGISTRY_TOKEN || secrets.GITHUB_TOKEN }}" | docker login "${IMAGE%%/*}" -u "${{ github.actor }}" --password-stdin
+      - name: Build image (uat)
+        if: ${{ env.IS_UAT == 'true' }}
+        run: docker build -t "$IMAGE:$IMAGE_TAG" -t "$IMAGE:uat" .
+      - name: Push to ghcr (uat)
+        if: ${{ env.IS_UAT == 'true' && vars.WORKER_REGISTRY_PUSH == 'true' }}
         run: |
-          DEPLOY_DIR="${{ vars.WORKER_DEPLOY_DIR || '/data/new_dev/worker' }}"
-          rsync -a --delete --exclude '.git/' --exclude '.env' \
+          docker push "$IMAGE:$IMAGE_TAG"
+          docker push "$IMAGE:uat"
+
+      # ── develop: pull the prebuilt ghcr image on the dev GPU runner ──────────
+      - name: Pull image (develop)
+        if: ${{ env.IS_UAT == 'false' }}
+        run: docker pull "$IMAGE:$IMAGE_TAG"
+
+      # ── both: sync code + (re)deploy the container ───────────────────────────
+      - name: Sync code to deploy dir (keep .env, models, caches, results)
+        run: |
+          rsync -a --delete \
+            --exclude '.git/' --exclude '.env' \
             --exclude 'models/' --exclude 'hf_cache/' --exclude 'logs/' --exclude 'results/' \
             ./ "$DEPLOY_DIR/"
+      - name: Deploy container (Compose v2)
+        run: |
           cd "$DEPLOY_DIR"
-          export IMAGE_TAG="uat-${{ github.sha }}"
-          # Use Compose v2. compose v1 (1.29.2) crashes on RECREATE against modern
-          # Docker Engine: KeyError 'ContainerConfig' — it can create a container but
-          # not redeploy over an existing one, which is exactly what CI does.
           IMAGE="$IMAGE" IMAGE_TAG="$IMAGE_TAG" \
-            docker compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml up -d
-          docker compose --project-directory "$DEPLOY_DIR" -f deploy/docker-compose.uat.yml ps
+            docker compose --project-directory "$DEPLOY_DIR" -f "$COMPOSE_FILE" up -d
+          docker compose --project-directory "$DEPLOY_DIR" -f "$COMPOSE_FILE" ps

@@ -1,0 +1,30 @@
+# DEV worker (H200-dev / GPUInfer02, NVIDIA L4, detection-only).
+# Pulls the ghcr image built by the uat pipeline (the L4's disk can't hold a
+# second 17GB build). Backend mode -> no DB network; the worker reaches the dev
+# backend via the MAIN VM's Apache reverse proxy (MAIN_BACKEND_URL in .env),
+# because on this host a container cannot reach its own host directly.
+# Run with: docker compose --project-directory /data/dev/worker -f deploy/docker-compose.dev.yml up -d
+services:
+  worker-gpu0:
+    image: ${IMAGE:-ghcr.io/aman-tiwari18/cctv-worker}:${IMAGE_TAG:-uat}
+    container_name: cctv_dev_worker_gpu0
+    restart: unless-stopped
+    shm_size: '8gb'
+    env_file: .env
+    # The published ghcr image's entrypoint gated on MySQL; backend mode needs no
+    # DB, so run the agent directly. (Newer images skip the gate when
+    # DB_ACCESS_MODE=backend, so this override is just belt-and-suspenders.)
+    entrypoint: ["python", "run.py"]
+    command: []
+    volumes:
+      - ./models:/app/models
+      - ./hf_cache:/app/data/hf_cache
+      - ./scripts/logs:/app/scripts/logs
+      - /data/dev/frames:/app/scripts/detection/results
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
