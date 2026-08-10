@@ -3,14 +3,19 @@ set -e
 
 echo "🚀 Starting Script Server..."
 
-# Wait for MySQL to be ready
-echo "⏳ Waiting for MySQL to be ready..."
-until mysql -h"$DB_HOST" -u"$DB_USER" -p"$DB_PASSWORD" -e "SELECT 1" > /dev/null 2>&1; do
-  echo "MySQL is unavailable - sleeping"
-  sleep 2
-done
-
-echo "✅ MySQL is ready!"
+# In backend mode the worker uses the backend as its DB gateway (plan §4.0/§4.5B)
+# and needs NO MySQL of its own — that is what lets it run on any host. Skip the
+# DB gates entirely in that mode.
+if [ "${DB_ACCESS_MODE:-direct}" = "backend" ]; then
+  echo "🌐 DB_ACCESS_MODE=backend — skipping MySQL checks (DB via backend gateway)"
+else
+  echo "⏳ Waiting for MySQL to be ready..."
+  until mysql -h"$DB_HOST" -u"$DB_USER" -p"$DB_PASSWORD" -e "SELECT 1" > /dev/null 2>&1; do
+    echo "MySQL is unavailable - sleeping"
+    sleep 2
+  done
+  echo "✅ MySQL is ready!"
+fi
 
 # Download YOLO models if not present
 echo "📦 Checking YOLO models..."
@@ -28,7 +33,8 @@ if [ ! -f "models/yolov10x.pt" ]; then
     echo "⚠️  Please manually place yolov10x.pt in the models directory"
 fi
 
-# Test database connection
+# Test database connection (skipped in backend mode — no direct DB there)
+if [ "${DB_ACCESS_MODE:-direct}" != "backend" ]; then
 echo "🔍 Testing database connection..."
 python3 -c "
 import pymysql
@@ -46,6 +52,7 @@ except Exception as e:
     print(f'❌ Database connection failed: {e}')
     exit(1)
 "
+fi
 
 echo "✅ Script Server initialization complete!"
 echo "📝 Available scripts:"
