@@ -314,6 +314,7 @@ def _hls_camera_thread(cfg, stop_event):
 
     camera_id   = cfg['camera_id']
     ch_no       = cfg.get('ch_no') or cfg.get('camera_no') or camera_id
+    exam_id     = cfg.get('exam_id', '0')
     initial_url = cfg.get('cctv_url') or cfg.get('stream_url') or cfg.get('url', '')
 
     hls = extract_hls_streaming_url(initial_url)
@@ -339,6 +340,7 @@ def _hls_camera_thread(cfg, stop_event):
                 "frame":       frame.copy(),
                 "camera_id":   camera_id,
                 "ch_no":       ch_no,
+                "exam_id":     exam_id,
                 "source_type": "HLS",
             })
         except queue.Full:

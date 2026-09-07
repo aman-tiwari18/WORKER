@@ -114,6 +114,7 @@ def get_worker(analytic_name, mode="rtsp"):
         "blind_spot":       ("blind_spot_worker",          "blind_spot_worker",          "blind_spot_worker_hls"),
         "strongroom":       ("strongroom_worker",          "strongroom_worker",          "strongroom_worker_hls"),
         "qp_box":           ("qp_box_det_worker",          "qp_box_det_worker",          "qp_box_det_worker_hls"),
+        "furniture":        ("improper_furniture_worker",  "improper_furniture_worker",  "improper_furniture_worker_hls"),
     }
     
     if analytic_name not in mapping:
@@ -155,6 +156,7 @@ def get_worker_info(analytic_name, mode="rtsp"):
         "blind_spot":       ("blind_spot_worker",          "blind_spot_worker",          "blind_spot_worker_hls"),
         "strongroom":       ("strongroom_worker",          "strongroom_worker",          "strongroom_worker_hls"),
         "qp_box":           ("qp_box_det_worker",          "qp_box_det_worker",          "qp_box_det_worker_hls"),
+        "furniture":        ("improper_furniture_worker",  "improper_furniture_worker",  "improper_furniture_worker_hls"),
     }
 
     if analytic_name not in mapping:
@@ -341,6 +343,7 @@ def handle_sigterm(sig, frame):
         "workers.camera_inversion_worker",
         "workers.strongroom_worker",
         "workers.qp_box_det_worker",
+        "workers.improper_furniture_worker",
     ]:
         try:
             mod = sys.modules.get(mod_name)

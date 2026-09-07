@@ -98,6 +98,7 @@ COOLDOWNS = {
     "strongroom": 180,
     "qp_box":     240,
     "blind_spot": 180,
+    "furniture":  300,
 }
 
 RESULTS_ROOT = os.path.join(BASE_DIR, "results")
@@ -192,6 +193,7 @@ ANALYTIC_SPEC = {
     "invigilator":    ("invigilator_tracking","detect_invigilator_batch",     "invigilator_detection"),
     "blind_spot":     ("blind_spot_det",      "detect_blind_spot_batch",      "blind_spot_detection"),
     "crowd_biometric":("Crowd_det_biometric", "detect_crowd_biometric_batch", "crowd_detection_biometric"),
+    "furniture":      ("improper_furniture_det", "detect_improper_furniture_batch", "improper_furniture_detection"),
     # NOTE: 'tamper' and 'inversion' are classical-CV checks (no YOLO boxes) and stay
     # as their own workers — they don't consume the shared detector output.
 }

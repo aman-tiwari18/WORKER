@@ -78,7 +78,38 @@ SCRIPT_CLASSIFICATION_MAP = {
     # Strong room / QP-box not visible -> Strong Room / Server Room
     "strongroom":      ["strong room", "server room"],
     "qp_box":          ["strong room", "server room"],
+
+    # Broken / overturned / missing furniture -> Inside Lab
+    "furniture":       ["computer lab", "inside classroom"],
 }
+
+# The "Camera Type" dropdown on the Add Script dialog offers the SOP group names
+# above, which are NOT themselves DB classification values — "Inside Lab" is
+# never written to camera_links_*, the cameras are labelled "Computer Lab" or
+# "Inside Classroom". Expand a chosen group into the tokens it stands for so the
+# substring match below can work; anything not listed here (e.g. "Biometric",
+# "Strong Room", or a value typed by hand) is used as-is.
+# Keep in sync with DEFAULT_CLASSIFICATIONS in
+# cctv_frontend/src/components/ShiftScriptManager.jsx.
+CLASSIFICATION_ALIASES = {
+    "inside lab":    ["computer lab", "inside classroom"],
+    "server room":   ["server room", "strong room"],
+    "entry/exit":    ["entry"],          # matches "Entry" and "Entry/Exit"
+    "entry exit":    ["entry"],
+    "outside":       ["outside area", "outdoor scene", "parking lot"],
+}
+
+
+def _expand_classifications(values):
+    """Lower-case the selected camera types and expand SOP group names."""
+    expanded = []
+    for value in values or []:
+        token = str(value).strip().lower()
+        if not token:
+            continue
+        expanded.extend(CLASSIFICATION_ALIASES.get(token, [token]))
+    return expanded
+
 
 def _camera_matches_script(classification, script_code, custom_classifications=None):
     """Check if a camera's classification matches the requested script_code.
@@ -95,7 +126,9 @@ def _camera_matches_script(classification, script_code, custom_classifications=N
     if not allowed:
         return True
 
-    allowed_lower = [a.lower() for a in allowed]
+    allowed_lower = _expand_classifications(allowed)
+    if not allowed_lower:
+        return True
     if "all" in allowed_lower or "all cameras" in allowed_lower:
         return True
 
