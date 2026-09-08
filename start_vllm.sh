@@ -7,7 +7,13 @@
 #   ~1600 HTTP-400 "Input length exceeds 2048" rejections.
 # - Bumped --gpu-memory-utilization 0.25 → 0.55 to give the bigger model and
 #   the wider KV cache enough headroom. On a 144 GB H200 this is ~79 GB.
-export HF_HOME=/data/hf_cache
+# HF_HOME MUST point at the bind-mounted cache (/app/data/hf_cache per
+# docker-compose.uat.yml), NOT at a container-local path. When it pointed at
+# /data/hf_cache — which is not a mount — the 62GB of weights landed on the
+# container's writable overlay layer and were thrown away on every recreate,
+# so each cold start re-downloaded the whole model (~25 min at 40 MB/s) and
+# blew past the pipeline's run timeout. Compose can override.
+export HF_HOME=${HF_HOME:-/app/data/hf_cache}
 export VLLM_USE_V1=0
 # Give the APIServer extra time to complete multi-modal warmup before
 # EngineCore times out waiting for the initial IPC connection.
@@ -15,12 +21,13 @@ export VLLM_USE_V1=0
 # is still doing 20+ seconds of vision-encoder warmup. The 30B-A3B model
 # needs longer to warm up than the 7B, so bumping the timeout further.
 export VLLM_RPC_TIMEOUT=120
-mkdir -p /data/hf_cache
+mkdir -p "$HF_HOME"
 source /data/cctv_dev/cctv/script-server/venv/bin/activate
 
 echo "Starting vLLM server on port 8001..."
 echo "Model: Qwen/Qwen3-VL-30B-A3B-Instruct"
-echo "This will download ~62GB of weights the first time it runs."
+echo "HF_HOME=$HF_HOME (must be the mounted cache, else weights re-download every recreate)"
+echo "First run downloads ~62GB; warm start loads from cache."
 
 # Kill orphaned vLLM GPU subprocesses left by previous crashed/killed vLLM instances.
 # These spawn_main processes hold CUDA contexts and block GPU initialization.

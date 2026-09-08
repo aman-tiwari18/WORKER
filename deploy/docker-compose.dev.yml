@@ -16,10 +16,27 @@ services:
     # DB_ACCESS_MODE=backend, so this override is just belt-and-suspenders.)
     entrypoint: ["python", "run.py"]
     command: []
+    environment:
+      # Base CUDA image has no tzdata and defaults to UTC, so log lines read
+      # 5h30m behind the IST wall clock; zoneinfo is bind-mounted below.
+      TZ: ${TZ:-Asia/Kolkata}
+      # Pin the HF cache to the bind mount. start_vllm.sh used to hardcode
+      # /data/hf_cache, which is not a mount, so the 62GB model went to the
+      # container overlay and re-downloaded on every recreate.
+      HF_HOME: /app/data/hf_cache
     volumes:
       - ./models:/app/models
       - ./hf_cache:/app/data/hf_cache
+      # Same host dir mounted a second time at the legacy container path.
+      # Images built before the start_vllm.sh fix hardcode
+      # `export HF_HOME=/data/hf_cache`, which overrides the HF_HOME set
+      # above — this mount makes that stale path resolve to the same
+      # persistent cache instead of the throwaway overlay. Safe to drop
+      # once every deployed image carries the fixed script.
+      - ./hf_cache:/data/hf_cache
       - ./scripts/logs:/app/scripts/logs
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+      - /etc/localtime:/etc/localtime:ro
       - /data/dev/frames:/app/scripts/detection/results
     deploy:
       resources:

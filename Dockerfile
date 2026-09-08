@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     libgl1-mesa-glx \
     mysql-client \
+    tzdata \
     curl \
     git \
     nfs-common \

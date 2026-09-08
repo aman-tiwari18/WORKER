@@ -19,6 +19,15 @@ services:
       # container ID — it changes on every recreate and hides which box a GPU
       # is actually on. Defaults to the deploying shell's hostname.
       WORKER_HOSTNAME: ${WORKER_HOSTNAME:-${HOSTNAME:-unknown-host}}
+      # Logs were timestamped in UTC while the run header printed IST, so every
+      # line read 5h30m behind the wall clock. The base CUDA image ships no
+      # tzdata, so TZ alone is not enough — the zoneinfo mounts below supply it.
+      TZ: ${TZ:-Asia/Kolkata}
+      # Pin the HF cache to the bind mount below. start_vllm.sh used to hardcode
+      # /data/hf_cache, which is NOT a mount — the 62GB model landed on the
+      # container overlay and was lost on every recreate, forcing a full
+      # re-download on each cold start.
+      HF_HOME: /app/data/hf_cache
     # backend runs on the HOST under PM2 → reach it via the docker host gateway
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -26,7 +35,18 @@ services:
       - ./models:/app/models
       - ./data:/app/data
       - ${HF_CACHE_HOST_PATH:-./hf_cache}:/app/data/hf_cache
+      # Same host dir mounted a second time at the legacy container path.
+      # Images built before the start_vllm.sh fix hardcode
+      # `export HF_HOME=/data/hf_cache`, which overrides the HF_HOME set
+      # above — this mount makes that stale path resolve to the same
+      # persistent cache instead of the throwaway overlay. Safe to drop
+      # once every deployed image carries the fixed script.
+      - ${HF_CACHE_HOST_PATH:-./hf_cache}:/data/hf_cache
       - ./scripts/logs:/app/scripts/logs
+      # tzdata is absent from the nvidia/cuda base image; borrow the host's so
+      # TZ=Asia/Kolkata actually resolves and log timestamps read as IST.
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+      - /etc/localtime:/etc/localtime:ro
       # shared frames root — MUST equal the backend's FRAMES_DIR so images resolve
       - ${FRAMES_HOST_PATH:-./results}:/app/scripts/detection/results
     networks: [cctvv2_net]
