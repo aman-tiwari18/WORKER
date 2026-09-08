@@ -28,6 +28,15 @@ services:
       # container overlay and was lost on every recreate, forcing a full
       # re-download on each cold start.
       HF_HOME: /app/data/hf_cache
+      # db_client._canonicalize_frame_path() rewrites every frame_path to this
+      # root before the DB write, so the UI can resolve one canonical path
+      # regardless of which host captured the frame. Its default is the shared
+      # NFS root (/data/nfs/cctv_images/classification_frames), which this stack
+      # does NOT use — frames live under FRAMES_HOST_PATH — so rows were stored
+      # pointing at a directory that does not exist and every frame 404'd.
+      # Derive it from the same dir that is bind-mounted below so the worker and
+      # the backend's NFS_FRAMES_ROOT always agree.
+      NFS_FRAMES_ROOT: ${NFS_FRAMES_ROOT:-${FRAMES_HOST_PATH:-/data/new_dev/frames}/classification_frames}
     # backend runs on the HOST under PM2 → reach it via the docker host gateway
     extra_hosts:
       - "host.docker.internal:host-gateway"
