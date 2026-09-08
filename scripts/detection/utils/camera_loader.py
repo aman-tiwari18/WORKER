@@ -111,6 +111,17 @@ def _expand_classifications(values):
     return expanded
 
 
+def _text(row, key):
+    """Read a DB column as a clean string, with SQL NULL becoming "".
+
+    str(None) is "None" — a non-empty string that silently defeated the
+    "blank classification is processed by every analytic" rule below and
+    dropped every not-yet-classified camera from every script.
+    """
+    value = row.get(key)
+    return "" if value is None else str(value).strip()
+
+
 def _camera_matches_script(classification, script_code, custom_classifications=None):
     """Check if a camera's classification matches the requested script_code.
 
@@ -165,8 +176,8 @@ def load_cameras_for_execution(execution: dict) -> list:
     if link_type == "HLS":
         rows = get_hls_cameras_accessible(exam_id, shift_id, today)
         for row in rows:
-            ch_code = str(row.get("ch_code", "")).strip()
-            classification = str(row.get("classification", "")).strip()
+            ch_code = _text(row, "ch_code")
+            classification = _text(row, "classification")
             
             if not ch_code or not row.get("cctv_url"):
                 continue
@@ -178,13 +189,13 @@ def load_cameras_for_execution(execution: dict) -> list:
                 "cctv_url":       row["cctv_url"],
                 "camera_id":      ch_code,
                 "ch_no":          ch_code,   # Added to ensure workers get the channel code
-                "camera_id_pk":   str(row.get("id", "")),   # DB primary key — always unique
-                "classification": str(row.get("classification", "")).strip(),
+                "camera_id_pk":   _text(row, "id"),   # DB primary key — always unique
+                "classification": _text(row, "classification"),
                 "link_type":      "HLS",
                 "script_code":    script_code,
-                "camera_name":    str(row.get("camera_name", "")).strip(),
-                "centre_name":    str(row.get("centre_name", "")).strip(),
-                "tc_code":        str(row.get("tc_code", "")).strip(),
+                "camera_name":    _text(row, "camera_name"),
+                "centre_name":    _text(row, "centre_name"),
+                "tc_code":        _text(row, "tc_code"),
                 "exam_id":        exam_id,      # ← ADD exam_id to camera config
                 "shift_id":       shift_id,     # ← ADD shift_id to camera config
             })
@@ -192,8 +203,8 @@ def load_cameras_for_execution(execution: dict) -> list:
     elif link_type == "RTSP":
         rows = get_rtsp_cameras_accessible(exam_id)
         for row in rows:
-            device_id = str(row.get("device_id", "")).strip()
-            classification = str(row.get("classification", "")).strip()
+            device_id = _text(row, "device_id")
+            classification = _text(row, "classification")
             
             if not device_id or not row.get("cctv_url"):
                 continue
@@ -202,7 +213,7 @@ def load_cameras_for_execution(execution: dict) -> list:
                 continue
 
             # id is PRIMARY KEY — guaranteed unique per row
-            db_id     = str(row.get("id", "")).strip()
+            db_id     = _text(row, "id")
             
             raw_cam_no = row.get("camera_no")
             if raw_cam_no is None or str(raw_cam_no).strip().lower() in ("none", "null", ""):
@@ -215,12 +226,12 @@ def load_cameras_for_execution(execution: dict) -> list:
                 "camera_id":      device_id,
                 "camera_id_pk":   db_id,           # ← PRIMARY KEY (unique) — use for file naming
                 "camera_no":      camera_no,
-                "classification": str(row.get("classification", "")).strip(),
+                "classification": _text(row, "classification"),
                 "link_type":      "RTSP",
                 "script_code":    script_code,
-                "camera_name":    str(row.get("camera_name", "")).strip(),
-                "centre_name":    str(row.get("centre_name", "")).strip(),
-                "tc_code":        str(row.get("tc_code", "")).strip(),
+                "camera_name":    _text(row, "camera_name"),
+                "centre_name":    _text(row, "centre_name"),
+                "tc_code":        _text(row, "tc_code"),
                 "exam_id":        exam_id,      # ← ADD exam_id to camera config
                 "shift_id":       shift_id,     # ← ADD shift_id to camera config
             })

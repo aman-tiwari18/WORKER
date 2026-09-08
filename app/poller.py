@@ -29,7 +29,20 @@ class Poller:
 
         self.running_scripts = set()
         self.scheduled_scripts = {}  # id -> Task
-        self.completed_scripts = set()
+        # assignment_id -> the scheduled_at we actually completed. A dict, not a
+        # set: an operator re-running a script from the dashboard puts it back to
+        # PENDING with a NEW start time, which is a genuine new run rather than
+        # the restart loop this guard exists to stop. Keeping the completed
+        # start time lets queue_assignment tell those two cases apart; as a bare
+        # set it swallowed every re-run until the poller was restarted.
+        self.completed_scripts = {}
+        # Vision assignments already swept to COMPLETED. Kept separate from
+        # completed_scripts: that one means "do not relaunch locally" and a
+        # vision run joins it the moment it finishes, which is BEFORE its
+        # window closes. Gating the sweep on it therefore skipped exactly the
+        # assignments the sweep exists to close, leaving them RUNNING forever
+        # until the poller restarted and cleared it.
+        self.swept_scripts = set()
         self.group_members = {}      # group_key -> [member execution_ids] (grouped detection)
         self.group_analytics = {}    # group_key -> set(analytics) currently launched
         self.group_relaunching = set()  # group_keys mid-relaunch (membership grew)
@@ -255,12 +268,13 @@ class Poller:
                     for a in running_data:
                         aid = str(a["id"])
                         if (self._is_vision(a)
-                                and aid not in self.completed_scripts
+                                and aid not in self.swept_scripts
                                 and self._shift_window_closed(a)):
                             await self.update_assignment_status(
                                 aid, "COMPLETED",
                                 {"result_data": {"note": "shift window closed — sweep"}})
-                            self.completed_scripts.add(aid)
+                            self.swept_scripts.add(aid)
+                            self.completed_scripts[aid] = a.get("scheduled_at")
 
                 if all_data:
                     logger.info(f"Fetched {len(all_data)} assignment(s) (Pending: {len(pending_data)}, Running: {len(running_data)})")
@@ -314,8 +328,18 @@ class Poller:
             return
 
         if assignment_id in self.completed_scripts:
-            logger.debug(f"Assignment {assignment_id} already completed locally — skipping to prevent loop")
-            return
+            completed_sched = self.completed_scripts[assignment_id]
+            if completed_sched == assignment.get("scheduled_at"):
+                logger.debug(f"Assignment {assignment_id} already completed locally — skipping to prevent loop")
+                return
+            # Re-queued for a different start time — an operator re-run. Drop the
+            # guard so it launches instead of being silently ignored.
+            logger.info(
+                f"Assignment {assignment_id} re-queued for {assignment.get('scheduled_at')} "
+                f"(last completed {completed_sched}) — clearing completed guard"
+            )
+            self.completed_scripts.pop(assignment_id, None)
+            self.swept_scripts.discard(assignment_id)
 
         scheduled_at_str = assignment.get("scheduled_at")
 
@@ -407,7 +431,7 @@ class Poller:
             # ONLY for vision/classification scripts (vision, vision_neet). Other
             # detectors must restart if they exit early.
             if is_vision:
-                self.completed_scripts.add(assignment_id)
+                self.completed_scripts[assignment_id] = assignment.get("scheduled_at")
 
             # Only main worker updates global status to COMPLETED.
             # BUGFIX (camera coverage): a vision assignment runs ONCE per worker
@@ -432,7 +456,7 @@ class Poller:
                 # A clean duration-timeout is a successful run.
                 self._crash_tracker.pop(assignment_id, None)
                 if is_vision:
-                    self.completed_scripts.add(assignment_id)
+                    self.completed_scripts[assignment_id] = assignment.get("scheduled_at")
             else:
                 logger.error(f"✘ Assignment {assignment_id} failed: {e}")
                 if IS_MAIN_WORKER:
@@ -535,6 +559,20 @@ class Poller:
         COMPLETED. Before the window closes we keep it RUNNING so late/restarted
         workers can still run their own camera shard (see run_assignment / poll).
         Falls back to True (immediate completion) when no window info is present."""
+        # /executions/pending and /executions/running both send the window as
+        # end_at ("YYYY-MM-DDTHH:MM:SS", naive IST) — custom_end_time /
+        # shift_end_time are NOT in the payload, so read end_at first or every
+        # vision assignment gets swept to COMPLETED on the poll after it starts.
+        meta = assignment.get("execution_metadata", {}) or {}
+        end_at_str = assignment.get("end_at") or meta.get("end_at")
+        if end_at_str:
+            try:
+                end_at = datetime.fromisoformat(str(end_at_str))
+                if end_at.tzinfo is None:
+                    end_at = end_at.replace(tzinfo=IST)
+                return datetime.now(IST) >= end_at
+            except Exception:
+                pass
         end_str = assignment.get("custom_end_time") or assignment.get("shift_end_time")
         if not end_str:
             return True
