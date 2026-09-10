@@ -333,11 +333,52 @@ import re
 import logging
 import shutil
 import subprocess
+import select
+import time
 import uuid
 import os
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ── FFmpeg open/read timeout for OpenCV's FFmpeg backend ────────────────────
+# OpenCV IGNORES cap.set(CAP_PROP_OPEN_TIMEOUT_MSEC) for the FFmpeg HLS demuxer,
+# so a stale segment or a slow CDN response makes VideoCapture(url) block for the
+# FFmpeg default (~30s) — under round-robin fan-out that stalls capture slots and
+# starves the GPU. The only knob FFmpeg honours here is the `timeout` demuxer
+# option (microseconds), passed via OPENCV_FFMPEG_CAPTURE_OPTIONS BEFORE the
+# VideoCapture is constructed. Merge it in without clobbering an existing value
+# (master_pipeline sets `rtsp_transport;tcp` for the RTSP path).
+_HLS_OPEN_TIMEOUT_US = str(int(os.environ.get("HLS_FFMPEG_TIMEOUT_US", "12000000")))  # 12s
+def _ensure_ffmpeg_capture_timeout():
+    cur = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", "")
+    parts = [p for p in cur.split("|") if p]
+    if not any(p.split(";")[0] == "timeout" for p in parts):
+        parts.append(f"timeout;{_HLS_OPEN_TIMEOUT_US}")
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(parts)
+_ensure_ffmpeg_capture_timeout()
+
+# ── HLS capture strategy ───────────────────────────────────────────────────
+# cv2.VideoCapture's FFmpeg HLS demuxer ignores read timeouts, so a stalling
+# segment wedges the reader ~30s and cannot be interrupted from Python. The
+# subprocess-pipe path (HLSPipeCapture) runs our own ffmpeg with -timeout/
+# -rw_timeout (which it DOES honour) and a select()-guarded reader, so a dead
+# stream returns control in a few seconds and the process is hard-killable.
+#
+# BUT: this worker process holds a live CUDA context (the YOLO model), and
+# fork()-ing a subprocess out of a CUDA-loaded, multi-threaded process is slow
+# and gets slower under concurrent forks (measured: cv2 opens in ~1s p50, but
+# with the pipe as the PRIMARY path under round-robin fan-out, open latency hit
+# p90=11s / max=46s — worse than the 30s reads it was meant to avoid). So: cv2
+# stays primary (fast, no fork); the pipe is only the FALLBACK for cameras cv2
+# genuinely can't open, where paying the fork cost occasionally is cheap.
+# Set HLS_USE_FFMPEG_PIPE=1 to make the pipe primary instead (fine for a
+# capture-only process with no CUDA context loaded).
+HLS_USE_FFMPEG_PIPE   = os.environ.get("HLS_USE_FFMPEG_PIPE", "0").strip().lower() not in ("0", "false", "no", "off", "")
+HLS_PIPE_W           = int(os.environ.get("HLS_PIPE_WIDTH",  "1280"))
+HLS_PIPE_H           = int(os.environ.get("HLS_PIPE_HEIGHT", "720"))
+HLS_PIPE_READ_TIMEOUT = float(os.environ.get("HLS_PIPE_READ_TIMEOUT", "10"))  # seconds per frame
 
 
 # ── FFmpeg binary resolution ────────────────────────────────────────────────
@@ -580,7 +621,7 @@ def _get_stream_resolution(hls_url):
             "-of", "csv=p=0",
             hls_url
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
         if result.returncode == 0 and result.stdout.strip():
             parts = result.stdout.strip().split(",")
             if len(parts) == 2:
@@ -594,27 +635,49 @@ def _get_stream_resolution(hls_url):
 
 class HLSPipeCapture:
     """
-    Drop-in replacement for cv2.VideoCapture when OpenCV fails on HLS.
-    Wraps an FFmpeg subprocess pipe and exposes .read() and .release().
+    Drop-in replacement for cv2.VideoCapture for HLS.
+    Wraps an FFmpeg subprocess pipe and exposes .read() / .release().
+
+    read() accumulates one raw BGR frame with a select()-guarded loop and a hard
+    per-frame deadline, so a stalled stream returns (False, None) in
+    HLS_PIPE_READ_TIMEOUT seconds instead of blocking forever. release() kills the
+    ffmpeg process outright.
     """
 
-    def __init__(self, pipe, width, height):
+    def __init__(self, pipe, width, height, read_timeout=HLS_PIPE_READ_TIMEOUT):
         self._pipe   = pipe
         self._width  = width
         self._height = height
         self._frame_size = width * height * 3
+        self._read_timeout = read_timeout
+        self._fd = pipe.stdout.fileno()
         self._opened = True
 
     def isOpened(self):
         return self._opened and self._pipe.poll() is None
 
     def read(self):
+        need = self._frame_size
+        buf = bytearray()
+        deadline = time.time() + self._read_timeout
         try:
-            raw = self._pipe.stdout.read(self._frame_size)
-            if len(raw) != self._frame_size:
-                self._opened = False
-                return False, None
-            frame = np.frombuffer(raw, np.uint8).reshape((self._height, self._width, 3))
+            while len(buf) < need:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    self._opened = False
+                    return False, None
+                r, _, _ = select.select([self._fd], [], [], min(remaining, 2.0))
+                if not r:
+                    if self._pipe.poll() is not None:      # ffmpeg exited/timed out
+                        self._opened = False
+                        return False, None
+                    continue
+                chunk = os.read(self._fd, need - len(buf))
+                if not chunk:                              # EOF
+                    self._opened = False
+                    return False, None
+                buf.extend(chunk)
+            frame = np.frombuffer(bytes(buf), np.uint8).reshape((self._height, self._width, 3))
             return True, frame.copy()
         except Exception:
             self._opened = False
@@ -625,6 +688,10 @@ class HLSPipeCapture:
         try:
             self._pipe.kill()
             self._pipe.wait(timeout=3)
+        except Exception:
+            pass
+        try:
+            self._pipe.stdout.close()
         except Exception:
             pass
 
@@ -640,100 +707,83 @@ class HLSPipeCapture:
         return False  # Not supported for pipe
 
 
-def open_hls_stream(hls_url, timeout_ms=10000):
+def _open_hls_pipe(hls_url):
+    """Open the stream via our own ffmpeg subprocess → HLSPipeCapture.
+
+    ffmpeg is given -timeout/-rw_timeout (honoured, unlike cv2) and scales to a
+    fixed size so no ffprobe round-trip is needed and a wrong-resolution guess
+    can't corrupt frames. Returns HLSPipeCapture or None.
     """
-    Open an HLS stream for continuous reading.
-
-    Tries three methods in order:
-      1. cv2.VideoCapture with CAP_FFMPEG backend
-      2. cv2.VideoCapture with CAP_GSTREAMER backend
-      3. FFmpeg subprocess pipe (HLSPipeCapture) — most reliable fallback
-
-    Returns:
-        A cv2.VideoCapture OR HLSPipeCapture object (both expose .read() / .release()),
-        or None if all methods fail.
-    """
-    logger.info(f"Opening HLS stream: {hls_url[:100]}...")
-
-    # ── Method 1 & 2: OpenCV backends ──────────────────────────────────────
-    backends = [
-        (cv2.CAP_FFMPEG,    "FFmpeg"),
-        (cv2.CAP_GSTREAMER, "GStreamer"),
-        (cv2.CAP_ANY,       "Any available"),
-    ]
-
-    for backend, backend_name in backends:
-        try:
-            logger.debug(f"Trying {backend_name} backend...")
-            cap = cv2.VideoCapture(hls_url, backend)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
-            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
-
-            if cap.isOpened():
-                ret, test_frame = cap.read()
-                if ret and test_frame is not None:
-                    logger.info(f"✅ Successfully opened HLS stream with {backend_name} backend")
-                    return cap
-                else:
-                    logger.debug(f"{backend_name} opened but cannot read frames")
-                    cap.release()
-            else:
-                logger.debug(f"Failed to open with {backend_name} backend")
-                cap.release()
-
-        except Exception as e:
-            logger.debug(f"Error with {backend_name} backend: {e}")
-            try:
-                cap.release()
-            except Exception:
-                pass
-
-    # ── Method 3: FFmpeg subprocess pipe ───────────────────────────────────
-    logger.warning("All cv2 backends failed — trying FFmpeg subprocess pipe...")
-
     if not FFMPEG_BIN:
-        logger.error("ffmpeg binary not found on system — cannot open HLS stream via pipe")
         return None
-
-    width, height = _get_stream_resolution(hls_url)
-
+    w, h = HLS_PIPE_W, HLS_PIPE_H
     cmd = [
-        FFMPEG_BIN,
+        FFMPEG_BIN, "-nostdin", "-loglevel", "error",
         "-allowed_extensions", "ALL",
+        "-timeout", _HLS_OPEN_TIMEOUT_US,       # socket I/O timeout (µs) — dead CDN fails fast
+        "-rw_timeout", _HLS_OPEN_TIMEOUT_US,
         "-i", hls_url,
-        "-f", "image2pipe",
-        "-pix_fmt", "bgr24",
-        "-vcodec", "rawvideo",
-        "-s", f"{width}x{height}",
+        "-an", "-sn",
+        "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+               f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
+        "-f", "rawvideo", "-pix_fmt", "bgr24",
         "-"
     ]
-
     try:
-        pipe = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            bufsize=10 ** 8
-        )
-
-        # Test read one frame
-        frame_size = width * height * 3
-        test_bytes = pipe.stdout.read(frame_size)
-
-        if len(test_bytes) == frame_size:
-            logger.info(f"✅ HLS stream opened via FFmpeg pipe ({width}x{height})")
-            # Wrap in HLSPipeCapture so caller can use .read() / .release()
-            return HLSPipeCapture(pipe, width, height)
-        else:
-            logger.error("FFmpeg pipe test read failed — stream may be unavailable")
-            pipe.kill()
-            pipe.wait(timeout=3)
-            return None
-
+        pipe = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, bufsize=0)
     except Exception as e:
-        logger.error(f"FFmpeg pipe failed: {e}")
+        logger.error(f"FFmpeg pipe spawn failed: {e}")
         return None
+
+    cap = HLSPipeCapture(pipe, w, h)
+    ret, frame = cap.read()          # prove it actually produces a frame
+    if ret and frame is not None:
+        logger.info(f"✅ HLS stream opened via ffmpeg pipe ({w}x{h})")
+        return cap
+    cap.release()
+    return None
+
+
+def open_hls_stream(hls_url, timeout_ms=10000):
+    """
+    Open an HLS stream for continuous reading. Returns an object exposing
+    .read()/.release() (HLSPipeCapture or cv2.VideoCapture), or None.
+
+    Order is controlled by HLS_USE_FFMPEG_PIPE (default: pipe first, cv2 fallback).
+    The cv2 FFmpeg backend ignores read timeouts and wedges ~30s on a stalled
+    segment; the pipe path fails fast and is killable.
+    """
+    logger.info(f"Opening HLS stream: {hls_url[:100]}...")
+    _ensure_ffmpeg_capture_timeout()
+
+    def _try_cv2(url):
+        try:
+            c = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            c.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
+            c.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
+            if c.isOpened():
+                ret, fr = c.read()
+                if ret and fr is not None:
+                    logger.info("✅ Successfully opened HLS stream with cv2 FFmpeg backend")
+                    return c
+            c.release()
+        except Exception as e:
+            logger.debug(f"cv2 FFmpeg backend error: {e}")
+            try:
+                c.release()
+            except Exception:
+                pass
+        return None
+
+    order = (_open_hls_pipe, _try_cv2) if HLS_USE_FFMPEG_PIPE else (_try_cv2, _open_hls_pipe)
+    for opener in order:
+        cap = opener(hls_url)
+        if cap is not None:
+            return cap
+    logger.error("Could not open HLS stream (pipe + cv2 both failed)")
+    return None
 
 
 def get_hls_url_from_initial_url(initial_url, timeout=10):

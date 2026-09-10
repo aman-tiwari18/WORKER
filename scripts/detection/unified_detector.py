@@ -302,6 +302,12 @@ def unified_worker(frame_queue):
                 "exam_id":     pkt.get("exam_id", "0"),
                 "shift_id":    pkt.get("shift_id", "0"),
                 "source_type": src,
+                # Server_room_det reads tc_code to pick that centre's person
+                # threshold (get_min_persons). Without it the lookup misses and
+                # falls back to DEFAULT_MIN_PERSONS=1, i.e. a server-room alert
+                # on ANY single person. The per-script workers pass it, so the
+                # unified path has to as well.
+                "tc_code":     pkt.get("tc_code", ""),
             }
             for script in pkt.get("enabled_scripts", []):
                 fn = EVALUATORS.get(script)

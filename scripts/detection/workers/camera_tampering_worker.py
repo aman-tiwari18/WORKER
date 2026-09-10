@@ -182,7 +182,7 @@ def camera_tampering_worker(frame_queue):
 # =====================================================
 # 📡 HLS PATH
 # =====================================================
-def _hls_camera_thread(cfg, stop_event, q):
+def _hls_camera_thread(cfg, stop_event, q, state=None):  # state: unused, accepted for scheduler compat
     """HLS Camera reader thread."""
     from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
 
@@ -238,12 +238,9 @@ def camera_tampering_worker_hls(camera_configs, stop_event=None):
     t = threading.Thread(target=_cpu_worker, args=(stop_event, q, HLS_SAVE_FOLDER), daemon=True)
     t.start()
 
-    with ThreadPoolExecutor(max_workers=16) as executor:  # FIXED: was 64, reduces concurrent HLS stream threads
-        for cfg in camera_configs:
-            executor.submit(_hls_camera_thread, cfg, stop_event, q)
-            time.sleep(THREAD_DELAY)
-
-    stop_event.wait()
+    from workers.hls_scheduler import run_hls_cameras
+    run_hls_cameras(camera_configs, stop_event, _hls_camera_thread,
+                    label="Tampering", extra_args=(q,))
     stop_event.set()
     q.put(None)
     t.join(timeout=5)

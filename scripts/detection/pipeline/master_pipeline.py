@@ -1354,6 +1354,7 @@ def _rr_capture_once(label, configs, enabled_scripts, server_tokens_map, unified
     cam_pk     = first.get("camera_id_pk", "")
     exam_id    = first.get("exam_id", "0")
     shift_id   = first.get("shift_id") or os.environ.get("SHIFT_ID", "0")
+    tc_code    = str(first.get("tc_code") or first.get("TC_CODE") or "")
     direct_url = first.get("cctv_url") or first.get("stream_url", "")
     server     = _rr_resolve(first)
     use_dss    = bool(server and not str(direct_url).startswith("rtsp://"))
@@ -1398,6 +1399,7 @@ def _rr_capture_once(label, configs, enabled_scripts, server_tokens_map, unified
                     "camera_id_pk":    cam_pk,
                     "exam_id":         exam_id,
                     "shift_id":        shift_id,
+                    "tc_code":         tc_code,
                     "enabled_scripts": enabled_scripts,
                 }
                 try:
@@ -1459,7 +1461,300 @@ def _run_round_robin(grouped, server_tokens_map, unified_queue):
 # ============================================================
 # HLS PIPELINE RUNNER — unchanged, handles HLS cameras separately
 # ============================================================
+# ============================================================
+# HLS UNIFIED CAPTURE (Scaling Path A for HLS)
+# ============================================================
+# The per-script HLS model opened the SAME camera once per analytic and each
+# worker ran its own YOLO pass: with 7 unified-capable analytics over exam 35
+# shift 2 that was 6917 stream opens for 1592 distinct cameras. This mirrors
+# what the RTSP path already does — one capture, one shared inference, fanned
+# out to every analytic enabled for that camera (see unified_detector.py, whose
+# _save_and_report already speaks HLS).
+#
+# Set UNIFIED_HLS=0 for an instant rollback to the per-script path below.
+UNIFIED_HLS = os.environ.get("UNIFIED_HLS", "1") == "1"
+
+# Analytics the shared detector can serve. MUST stay in sync with
+# unified_detector.ANALYTIC_SPEC — listed literally rather than imported so the
+# parent process doesn't pull in torch/ultralytics just to read the keys.
+# 'tamper' and 'inversion' are classical-CV checks that consume no YOLO boxes,
+# so they deliberately stay on their own per-script capture path.
+UNIFIED_HLS_SCRIPTS = {
+    "crowd", "crowd_zero", "crowd_five", "proximity", "intruder", "entry_exit",
+    "server", "phone", "qp_box", "strongroom", "invigilator", "blind_spot",
+    "crowd_biometric", "furniture",
+}
+
+# A visit opens the stream, grabs a short burst and releases. RTSP bursts 2
+# frames in ~1s; an HLS open costs 3-10s, so the burst is bigger to amortise it
+# — but it is still a burst, not the 12-30s dwell the per-script workers used.
+# >=2 frames matters: unified_detector._passed_gate needs CONSEC_THRESHOLD=2
+# consecutive hits, and a burst supplies them inside a single visit.
+HLS_UNIFIED_BURST_FRAMES = int(os.environ.get("HLS_UNIFIED_BURST_FRAMES", "4"))
+HLS_UNIFIED_SAMPLE_EVERY = int(os.environ.get("HLS_UNIFIED_SAMPLE_EVERY", "5"))
+# Resolving the .m3u8 costs a ViewCameraFeedServlet round-trip; cache it per
+# camera across visits (0 disables). Mirrors the RTSP StartVideo cache.
+HLS_URL_CACHE_TTL = float(os.environ.get("HLS_URL_CACHE_TTL", "180"))
+
+# Frames dropped because the unified queue was full. A full queue means the GPU
+# is behind the producers and detections are being silently lost, so it is
+# counted and surfaced rather than swallowed by the `break` below.
+_hls_unified_stats = {"pushed": 0, "dropped": 0, "streams_live": 0, "reconnects": 0}
+_hls_unified_stats_lock = threading.Lock()
+
+
+# PERSISTENT mode: hold the stream open for the whole shift instead of
+# re-opening it every visit. An HLS open costs 3-10s while the frame grab costs
+# ~1s, so round-robin spends most of its time re-paying the expensive part —
+# 1592 opens per sweep, against an origin that collapses when opens arrive
+# together. The legacy path already held streams open and the origin was happy
+# with ~128 of them all morning; its 16-camera limit was HLS_RR_POOL_SIZE's
+# default, not an origin limit. Holding streams removes the revisit interval
+# entirely: every camera is watched continuously.
+#
+# The cost moves to CPU. cap.read() decodes every frame, and at ~25fps a few
+# hundred streams would bury 24 cores, so we grab() (demux, no colour convert /
+# copy) and only retrieve() the frames we actually sample.
+HLS_PERSIST_PUSH_INTERVAL = float(os.environ.get("HLS_PERSIST_PUSH_INTERVAL", "3.0"))
+HLS_PERSIST_RECONNECT_BACKOFF = float(os.environ.get("HLS_PERSIST_RECONNECT_BACKOFF", "10.0"))
+
+
+def _hls_unified_persistent(cfg, stop_event, unified_queue, state=None):
+    """Hold one HLS stream open for the whole shift, pushing a sampled frame
+    every HLS_PERSIST_PUSH_INTERVAL seconds into the unified queue."""
+    from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
+
+    ch_no    = cfg.get("ch_no") or cfg.get("camera_no") or cfg.get("camera_id")
+    exam_id  = cfg.get("exam_id", "0")
+    shift_id = cfg.get("shift_id") or os.environ.get("SHIFT_ID", "0")
+    tc_code  = str(cfg.get("tc_code") or cfg.get("TC_CODE") or "")
+    scripts  = cfg.get("enabled_scripts") or []
+    initial  = cfg.get("cctv_url") or cfg.get("stream_url") or cfg.get("url", "")
+    if not initial or not scripts:
+        return
+
+    while not stop_event.is_set():
+        cap = None
+        try:
+            hls = extract_hls_streaming_url(initial)
+            if not hls or not test_hls_stream(hls):
+                stop_event.wait(HLS_PERSIST_RECONNECT_BACKOFF)
+                continue
+            cap = open_hls_stream(hls)
+            if cap is None or not cap.isOpened():
+                stop_event.wait(HLS_PERSIST_RECONNECT_BACKOFF)
+                continue
+
+            with _hls_unified_stats_lock:
+                _hls_unified_stats["streams_live"] += 1
+            last_push = 0.0
+            try:
+                while not stop_event.is_set():
+                    # grab() advances the stream without paying for the decode
+                    # -> colour convert -> copy that retrieve() does.
+                    if not cap.grab():
+                        break
+                    now = time.time()
+                    if now - last_push < HLS_PERSIST_PUSH_INTERVAL:
+                        continue
+                    ok, frame = cap.retrieve()
+                    if not ok or frame is None:
+                        break
+                    last_push = now
+                    try:
+                        unified_queue.put({
+                            "frame":           frame,
+                            "device_id":       cfg.get("camera_id", ""),
+                            "ch_no":           ch_no,
+                            "camera_no":       ch_no,
+                            "exam_id":         exam_id,
+                            "shift_id":        shift_id,
+                            "tc_code":         tc_code,
+                            "source_type":     "HLS",
+                            "enabled_scripts": scripts,
+                        }, timeout=0.5)
+                        with _hls_unified_stats_lock:
+                            _hls_unified_stats["pushed"] += 1
+                    except queue_module.Full:
+                        with _hls_unified_stats_lock:
+                            _hls_unified_stats["dropped"] += 1
+            finally:
+                with _hls_unified_stats_lock:
+                    _hls_unified_stats["streams_live"] -= 1
+        except Exception as exc:
+            logger.debug("[UnifiedHLS] persistent capture error ch=%s: %s", ch_no, exc)
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+        if not stop_event.is_set():
+            with _hls_unified_stats_lock:
+                _hls_unified_stats["reconnects"] += 1
+            stop_event.wait(HLS_PERSIST_RECONNECT_BACKOFF)
+
+
+def _hls_unified_capture(cfg, stop_event, unified_queue, state=None):
+    """One HLS round-robin visit: resolve, open, burst frames into the unified
+    queue, release. Signature matches hls_scheduler's camera_fn contract
+    (``state`` is optional so the legacy non-RR branch can call it too).
+
+    Returns True if frames were actually pushed, False otherwise. The scheduler
+    uses that instead of its took<UNPRODUCTIVE_UNDER_S heuristic, which assumes
+    a dwelling visit and would score a fast, successful burst as dead."""
+    from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
+
+    if state is None:
+        state = {}
+
+    ch_no    = cfg.get("ch_no") or cfg.get("camera_no") or cfg.get("camera_id")
+    exam_id  = cfg.get("exam_id", "0")
+    shift_id = cfg.get("shift_id") or os.environ.get("SHIFT_ID", "0")
+    tc_code  = str(cfg.get("tc_code") or cfg.get("TC_CODE") or "")
+    scripts  = cfg.get("enabled_scripts") or []
+    initial  = cfg.get("cctv_url") or cfg.get("stream_url") or cfg.get("url", "")
+    if not initial or not scripts:
+        return False
+
+    # Reuse the resolved .m3u8 while it is still fresh; re-resolve on a miss or
+    # after a failed open (a stale token shows up exactly that way).
+    now = time.time()
+    hls = state.get("hls_url")
+    if not hls or (HLS_URL_CACHE_TTL and now - state.get("hls_ts", 0) > HLS_URL_CACHE_TTL):
+        hls = extract_hls_streaming_url(initial)
+        if not hls or not test_hls_stream(hls):
+            state.pop("hls_url", None)
+            return False
+        state["hls_url"] = hls
+        state["hls_ts"] = now
+
+    cap = open_hls_stream(hls)
+    if cap is None or not cap.isOpened():
+        if cap is not None:
+            cap.release()
+        state.pop("hls_url", None)   # force a fresh resolve next visit
+        return False
+
+    try:
+        pushed = 0
+        frames_read = 0
+        while pushed < HLS_UNIFIED_BURST_FRAMES and not stop_event.is_set():
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            frames_read += 1
+            # Consecutive decoded frames are near-identical; space the burst out
+            # so the analytics see genuinely different moments.
+            if frames_read % max(1, HLS_UNIFIED_SAMPLE_EVERY) != 0:
+                continue
+            try:
+                unified_queue.put({
+                    "frame":           frame.copy(),
+                    "device_id":       cfg.get("camera_id", ""),
+                    "ch_no":           ch_no,
+                    "camera_no":       ch_no,      # HLS: camera_no IS the ch_code
+                    "exam_id":         exam_id,
+                    "shift_id":        shift_id,
+                    "tc_code":         tc_code,
+                    "source_type":     "HLS",      # routes to report_to_db_hls
+                    "enabled_scripts": scripts,
+                }, timeout=0.5)
+                pushed += 1
+            except queue_module.Full:
+                with _hls_unified_stats_lock:
+                    _hls_unified_stats["dropped"] += 1
+                break
+        if pushed:
+            with _hls_unified_stats_lock:
+                _hls_unified_stats["pushed"] += pushed
+        return pushed > 0
+    finally:
+        cap.release()
+
+
 def run_hls_pipeline(camera_group):
+    if not (UNIFIED_DETECTOR and UNIFIED_HLS):
+        return _run_hls_pipeline_per_script(camera_group)
+
+    # Split: analytics the shared detector serves vs the classical-CV ones.
+    unified_cams, other_cams = [], []
+    for c in camera_group:
+        (unified_cams if c.get("script_code") in UNIFIED_HLS_SCRIPTS else other_cams).append(c)
+
+    # Collapse the unified set to ONE config per camera carrying every analytic
+    # enabled for it — this is where the 4.3x reduction in stream opens comes from.
+    by_camera, order = {}, []
+    for c in unified_cams:
+        key = str(c.get("ch_no") or c.get("camera_no") or c.get("camera_id"))
+        entry = by_camera.get(key)
+        if entry is None:
+            entry = dict(c)
+            entry["enabled_scripts"] = []
+            by_camera[key] = entry
+            order.append(key)
+        sc = c.get("script_code")
+        if sc and sc not in entry["enabled_scripts"]:
+            entry["enabled_scripts"].append(sc)
+    unified_configs = [by_camera[k] for k in order]
+
+    threads = []
+
+    if unified_configs:
+        all_scripts = sorted({s for c in unified_configs for s in c["enabled_scripts"]})
+        logger.info(
+            "HLS UNIFIED: %d analytic-camera pairs -> %d distinct cameras (%.1fx fewer opens); analytics: %s",
+            len(unified_cams), len(unified_configs),
+            len(unified_cams) / max(len(unified_configs), 1), all_scripts,
+        )
+
+        unified_queue = mp.Queue(maxsize=int(os.environ.get("UNIFIED_QUEUE_SIZE", "256")))
+        p = mp.Process(
+            target=_worker_process_entry,
+            args=("unified_detector", "unified_worker", unified_queue),
+            name="Worker-unified-hls",
+            daemon=True,
+        )
+        p.start()
+        _register_child_process(p)
+        logger.info("Started UNIFIED detector worker (pid=%s) for HLS analytics: %s", p.pid, all_scripts)
+
+        from workers.hls_scheduler import run_hls_cameras, HLS_RR_POOL_SIZE, HLS_RR_ENABLED
+        # The scheduler holds streams open when every camera fits the pool. Use
+        # the persistent capture there and the burst capture when it rotates.
+        persistent = (not HLS_RR_ENABLED) or len(unified_configs) <= HLS_RR_POOL_SIZE
+        capture_fn = _hls_unified_persistent if persistent else _hls_unified_capture
+        logger.info("HLS UNIFIED capture mode: %s", "PERSISTENT (streams held open)"
+                    if persistent else "ROUND-ROBIN (open/burst/release)")
+        stop_event = threading.Event()
+        t = threading.Thread(
+            target=run_hls_cameras,
+            args=(unified_configs, stop_event, capture_fn),
+            kwargs={"label": "UnifiedHLS", "extra_args": (unified_queue,)},
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+
+    # Classical-CV analytics (inversion / tamper) keep their own capture path.
+    grouped = {}
+    for c in other_cams:
+        grouped.setdefault(c.get("script_code", ""), []).append(c)
+    for script_code, configs in grouped.items():
+        worker_fn = get_worker(script_code, mode="hls")
+        if not worker_fn:
+            continue
+        t = threading.Thread(target=worker_fn, args=(configs,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+
+def _run_hls_pipeline_per_script(camera_group):
+    """Legacy HLS path: one worker per analytic, each opening its own streams
+    and running its own model. Kept for UNIFIED_HLS=0 rollback."""
     grouped = {}
     for c in camera_group:
         grouped.setdefault(c.get("script_code", ""), []).append(c)
@@ -1467,13 +1762,13 @@ def run_hls_pipeline(camera_group):
     threads = []
     for script_code, configs in grouped.items():
         worker_fn = get_worker(script_code, mode="hls")
-        if not worker_fn: 
+        if not worker_fn:
             continue
         t = threading.Thread(target=worker_fn, args=(configs,), daemon=True)
         t.start()
         threads.append(t)
 
-    for t in threads: 
+    for t in threads:
         t.join()
 
 

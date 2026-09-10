@@ -112,6 +112,9 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=60):
                 'ch_no':     item['ch_no'],
                 'camera_id': item.get('device_id') or item.get('camera_id'),
                 'tc_code':   item.get('tc_code', ''),
+                # Thresholds are per exam, not global — a centre code can appear
+                # in two exams with different limits (see server_room_constants).
+                'exam_id':   item.get('exam_id'),
                 'state':     item.get('state', {}),
             }
             for item in batch
@@ -175,6 +178,13 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=60):
             path = os.path.join(save_folder, fname)
             cv2.imwrite(path, annotated_frame)
             logger.warning(f"[ServerRoom] 🚨 SAVED persons={person_count} camera={camera_key} → {path}")
+
+            # Same call detect_persons_batch used to decide `detected`, so the
+            # number reported here is the limit this detection actually crossed.
+            threshold = get_min_persons(
+                str(item.get("tc_code", "") or ""),
+                exam_id=item.get("exam_id"),
+            )
 
             # Report to database
             if item.get("source_type") == "HLS":
@@ -271,7 +281,7 @@ def server_room_worker(frame_queue):
 # =====================================================
 # 📡 HLS PATH
 # =====================================================
-def _hls_camera_thread(cfg, stop_event):
+def _hls_camera_thread(cfg, stop_event, state=None):  # state: unused, accepted for scheduler compat
     """HLS Camera reader thread."""
     from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
 
@@ -359,12 +369,8 @@ def server_room_worker_hls(camera_configs, stop_event=None):
     )
     gpu_t.start()
 
-    with ThreadPoolExecutor(max_workers=16) as executor:  # FIXED: was 64, reduces concurrent HLS stream threads
-        for cfg in valid_configs:
-            executor.submit(_hls_camera_thread, cfg, stop_event)
-            time.sleep(THREAD_DELAY)
-
-    stop_event.wait()
+    from workers.hls_scheduler import run_hls_cameras
+    run_hls_cameras(valid_configs, stop_event, _hls_camera_thread, label="ServerRoom")
     stop_event.set()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

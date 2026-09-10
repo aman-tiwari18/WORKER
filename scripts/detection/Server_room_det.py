@@ -129,7 +129,9 @@ def detect_persons_batch(items, results=None):
         ]
         person_count = len(person_boxes)
         tc_code = item.get('tc_code', '')
-        min_persons = get_min_persons(tc_code)
+        # exam_id scopes the lookup to this exam's own threshold sheet; without
+        # it the global (exam-independent) CTGD table is used, as before.
+        min_persons = get_min_persons(tc_code, exam_id=item.get('exam_id'))
         server_detected = person_count >= min_persons
 
         for box in person_boxes:

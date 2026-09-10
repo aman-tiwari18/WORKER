@@ -242,7 +242,7 @@ def qp_box_det_worker(frame_queue):
 # =====================================================
 # 📡 HLS PATH
 # =====================================================
-def _hls_camera_thread(cfg, stop_event):
+def _hls_camera_thread(cfg, stop_event, state=None):
     """HLS Camera reader thread."""
     from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
 
@@ -262,7 +262,8 @@ def _hls_camera_thread(cfg, stop_event):
         return
 
     frame_count = 0
-    state = {"last_save": 0}
+    if state is None:
+        state = {"last_save": 0}
 
     while not stop_event.is_set():
         ret, frame = cap.read()
@@ -316,12 +317,8 @@ def qp_box_det_worker_hls(camera_configs, stop_event=None):
     )
     gpu_t.start()
 
-    with ThreadPoolExecutor(max_workers=16) as executor:  # FIXED: was 64, reduces concurrent HLS stream threads
-        for cfg in valid_configs:
-            executor.submit(_hls_camera_thread, cfg, stop_event)
-            time.sleep(THREAD_DELAY)
-
-    stop_event.wait()
+    from workers.hls_scheduler import run_hls_cameras
+    run_hls_cameras(valid_configs, stop_event, _hls_camera_thread, label="QPBox")
     stop_event.set()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
