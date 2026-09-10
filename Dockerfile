@@ -1,8 +1,16 @@
 # Script Server Dockerfile - Optimized for H200 GPU
 FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
 
+# tzdata's postinst opens an interactive debconf menu ("select the geographic
+# area") unless the frontend is preset, which hangs a TTY-less CI build forever.
+# Presetting the zone here also gives the image IST without relying on the
+# compose bind-mounts of /etc/localtime.
+ARG DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Kolkata
+
 # Install Python 3.10 and system dependencies
-RUN apt-get update && apt-get install -y \
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone && \
+    apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
     python3.10-dev \
