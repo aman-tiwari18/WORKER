@@ -132,7 +132,12 @@ def detect_persons_batch(items, results=None):
         # exam_id scopes the lookup to this exam's own threshold sheet; without
         # it the global (exam-independent) CTGD table is used, as before.
         min_persons = get_min_persons(tc_code, exam_id=item.get('exam_id'))
-        server_detected = person_count >= min_persons
+        # No threshold configured for this tc_code -> skip detection entirely.
+        # (Previously this fell back to DEFAULT_MIN_PERSONS=1, which flagged
+        # any single person as a breach for every centre missing from the
+        # threshold sheet — false-flagging normal staff.)
+        no_threshold = min_persons is None
+        server_detected = (not no_threshold) and person_count >= min_persons
 
         for box in person_boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -147,8 +152,12 @@ def detect_persons_batch(items, results=None):
         overlay = frame.copy()
         cv2.rectangle(overlay, (10, 10), (460, 100), (0, 0, 0), -1)
         cv2.addWeighted(frame, 0.7, overlay, 0.3, 0, frame)
-        status_color = (0, 0, 255) if server_detected else (0, 255, 0)
-        status_text = f"SERVER ROOM BREACH! ({person_count}/{min_persons})" if server_detected else "All Clear"
+        if server_detected:
+            status_color, status_text = (0, 0, 255), f"SERVER ROOM BREACH! ({person_count}/{min_persons})"
+        elif no_threshold:
+            status_color, status_text = (0, 165, 255), f"No threshold configured (TC: {tc_code or 'unknown'})"
+        else:
+            status_color, status_text = (0, 255, 0), "All Clear"
         cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
         cv2.putText(frame, f"Persons: {person_count}", (20, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)

@@ -459,13 +459,14 @@ class Poller:
                     self.completed_scripts[assignment_id] = assignment.get("scheduled_at")
             else:
                 logger.error(f"✘ Assignment {assignment_id} failed: {e}")
-                if IS_MAIN_WORKER:
-                    await self._update_status_all(assignment, "FAILED", {"error_log": str(e)})
 
-                # --- Crash backoff: track failures for non-vision scripts ---
-                # Vision is one-shot (completed_scripts), so it can't crash-loop;
-                # only restartable detectors need quarantine protection.
-                if not is_vision:
+                if is_vision:
+                    # Vision is one-shot (completed_scripts) — a crash here is
+                    # terminal, same as before.
+                    if IS_MAIN_WORKER:
+                        await self._update_status_all(assignment, "FAILED", {"error_log": str(e)})
+                else:
+                    # --- Crash backoff: track failures for restartable detectors ---
                     now = time.time()
                     t = self._crash_tracker.setdefault(
                         assignment_id, {"failures": 0, "last_fail_ts": now}
@@ -475,13 +476,35 @@ class Poller:
                         t["failures"] = 0
                     t["failures"] += 1
                     t["last_fail_ts"] = now
-                    if t["failures"] >= self._MAX_CRASHES_IN_WINDOW:
+                    quarantined = t["failures"] >= self._MAX_CRASHES_IN_WINDOW
+                    if quarantined:
                         t["quarantine_until"] = now + self._QUARANTINE_S
                         logger.error(
                             f"Assignment {assignment_id} quarantined for {self._QUARANTINE_S}s "
                             f"after {t['failures']} crashes in {self._CRASH_WINDOW_S}s window — "
                             f"prevents GPU memory thrashing from crash-restarting workers."
                         )
+
+                    # A crash before the scheduled window has closed is recoverable:
+                    # report RUNNING (not FAILED) so the assignment stays visible to
+                    # /executions/running and gets relaunched on the next poll cycle
+                    # (queue_assignment → run_assignment, gated by the quarantine
+                    # check above). Only give up for real once quarantined or the
+                    # window has actually ended — otherwise a mid-window crash
+                    # (e.g. 1pm–3pm script dying at 1:30pm) previously got marked
+                    # FAILED, which getPending/getRunning both exclude, so it was
+                    # never picked up again for the rest of its window.
+                    window_closed = self._shift_window_closed(assignment)
+                    if IS_MAIN_WORKER:
+                        if quarantined or window_closed:
+                            await self._update_status_all(assignment, "FAILED", {"error_log": str(e)})
+                        else:
+                            logger.warning(
+                                f"Assignment {assignment_id} crashed mid-window "
+                                f"(failure {t['failures']}/{self._MAX_CRASHES_IN_WINDOW}) — "
+                                f"will retry on next poll"
+                            )
+                            await self._update_status_all(assignment, "RUNNING", {"error_log": str(e)})
 
         finally:
             # Hand the shards back so another worker can take them straight away

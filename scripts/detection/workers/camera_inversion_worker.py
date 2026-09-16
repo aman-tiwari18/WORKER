@@ -61,6 +61,11 @@ BATCH_WAIT_TIMEOUT  = 0.2
 THREAD_DELAY        = 0.1
 HLS_SAMPLE_EVERY    = 10
 
+# The 180°-rotated candidate must score at least this much higher (relative)
+# than the original before we flag the frame as inverted — guards against
+# false positives from marginal YOLO/Places365 scoring noise.
+INVERSION_SCORE_MARGIN = float(os.environ.get("INVERSION_SCORE_MARGIN", "0.20"))
+
 _gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
 
 # ================= MODELS (lazy load) =================
@@ -150,16 +155,24 @@ def _detect_orientation_batch(frames):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    index_map = {}
+    scores_by_idx = {}
     for (idx, name, img), (obj_count, obj_conf), scene_conf in zip(meta, yolo_outs, scene_scores):
         score = obj_count * obj_conf + scene_conf
-        if idx not in index_map or score > index_map[idx][0]:
-            index_map[idx] = (score, img, name)
+        scores_by_idx.setdefault(idx, {})[name] = score
 
+    # Only call it "inverted" when the 180° candidate clearly beats the
+    # original — a marginal win is more likely model noise than a real
+    # upside-down feed, and used to produce false positives.
     outputs = []
     for i in range(len(frames)):
-        outputs.append((index_map[i][1], index_map[i][2]))
-    
+        scores = scores_by_idx.get(i, {})
+        orig_score = scores.get("original", 0.0)
+        rot_score = scores.get("180", 0.0)
+        if rot_score > 0 and rot_score > orig_score * (1 + INVERSION_SCORE_MARGIN):
+            outputs.append("180")
+        else:
+            outputs.append("original")
+
     return outputs
 
 # ================= GPU WORKER =================
@@ -189,9 +202,9 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
 
         try:
             frames = [ item['frame'] for item in batch ]
-            results = _detect_orientation_batch(frames)
+            orientations = _detect_orientation_batch(frames)
 
-            for item, (corrected, orientation) in zip(batch, results):
+            for item, orientation in zip(batch, orientations):
                 if orientation == "original":
                     continue
 
@@ -215,7 +228,10 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
                     fname = f"{script_name}_{cam_id}_{ch_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
                 
                 path = os.path.join(save_folder, fname)
-                cv2.imwrite(path, corrected)
+                # Save the raw frame as received — not the 180°-rotated candidate —
+                # so the snapshot shows the camera's actual orientation as proof,
+                # instead of a software-flipped copy with an upside-down OSD.
+                cv2.imwrite(path, item['frame'])
                 logger.warning(f"[Inversion] 🚨 SAVED inversion → {path}")
                 
                 # Report to database
@@ -241,7 +257,6 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
                     except Exception as e:
                         logger.error(f"[Inversion] RTSP DB Reporting Error: {e}")
                 
-                del corrected
                 if 'frame' in item: del item['frame']
 
             del batch

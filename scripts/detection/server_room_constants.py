@@ -10,8 +10,11 @@ exam in EXAM_TC_CODE_THRESHOLDS instead — centre codes repeat across exam
 bodies, so a global entry would retune every other exam using the same code.
 
 get_min_persons(tc_code, exam_id=None, exam_date=None, shift_no=None) resolves
-the exam's own sheet first and falls back to the global table, then to
-DEFAULT_MIN_PERSONS.
+the exam's own sheet first, then the global table. If the tc_code isn't found
+in either, it returns None — callers must treat that as "no threshold
+configured for this centre" and skip detection, NOT fall back to a guessed
+default. (DEFAULT_MIN_PERSONS below is kept only for legacy callers that
+still want the old any-person-triggers behaviour and ask for it explicitly.)
 """
 
 import os
@@ -657,20 +660,24 @@ EXAM_SHIFT_TC_CODE_THRESHOLDS = {
 
 
 def get_min_persons(tc_code, exam_id=None, exam_date=None, shift_no=None):
-    """Return the server-room person threshold for a centre.
+    """Return the server-room person threshold for a centre, or None if unknown.
 
     Resolved most specific first:
       1. The exam's own sheet, for this exact sitting  (exam_id + exam_date + shift_no)
       2. The exam's own sheet, flat per centre          (exam_id)
       3. The global CTGD table                          (tc_code alone)
-      4. DEFAULT_MIN_PERSONS
+      4. None — no threshold configured for this tc_code, caller must skip
 
     exam_id is what keeps one exam's sheet off another's centres: the same
-    tc_code can appear in two exams with different limits. Callers that pass no
-    exam_id keep the pre-existing behaviour exactly — global table, then default.
+    tc_code can appear in two exams with different limits.
+
+    A None return must NOT be treated as "0 persons allowed" — that silently
+    turned every centre missing from the sheet into the strictest possible
+    rule (flag on 1 person present), which false-flagged normal staff at
+    centres nobody had gotten around to adding to the table.
     """
     if not tc_code:
-        return DEFAULT_MIN_PERSONS
+        return None
     key = str(tc_code).strip()
 
     if exam_id is not None:
@@ -692,4 +699,4 @@ def get_min_persons(tc_code, exam_id=None, exam_date=None, shift_no=None):
 
     if key in TC_CODE_THRESHOLDS:
         return TC_CODE_THRESHOLDS[key]
-    return DEFAULT_MIN_PERSONS
+    return None
