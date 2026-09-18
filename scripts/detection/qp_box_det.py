@@ -57,7 +57,7 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
-COOLDOWN_TIME  = 240    # seconds between saved violations per camera
+COOLDOWN_TIME  = int(os.environ.get("COOLDOWN_TIME", 240))    # seconds between saved violations per camera
 CONF_THRESHOLD = 0.30   # lowered from 0.45 — yellow boxes often score lower
 
 # Expanded set of COCO classes that can plausibly look like a QP packet

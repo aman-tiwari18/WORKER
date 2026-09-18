@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "yolov10m.pt")
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/strongroom_detection")
 
-COOLDOWN_TIME = 180       # 3 minutes between saves per camera
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 180))       # 3 minutes between saves per camera
 MIN_PERSONS = 0           # Threshold for violation (>0 persons)
 CONF_THRESHOLD = 0.30     # Confidence for person detection
 

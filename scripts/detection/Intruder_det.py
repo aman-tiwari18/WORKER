@@ -23,7 +23,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/intruder_detection")
 # - Computer Lab / Inside Lab / Exam Lab
 # - Server Room / Strong Room
 
-COOLDOWN_TIME = 0         # Immediate alert for intruder
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 0))         # Immediate alert for intruder
 MIN_PERSONS = 0           # Threshold for violation (>0)
 CONF_THRESHOLD = 0.30     # Confidence for intruder detection
 

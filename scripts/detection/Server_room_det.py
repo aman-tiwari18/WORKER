@@ -23,7 +23,7 @@ SAVE_FOLDER = os.path.join(PROJECT_ROOT, "results/tcs_detections/server_room_det
 # This detection runs on cameras classified as:
 # - Server Room / Strong Room
 
-COOLDOWN_TIME = 60        # Seconds between saves per camera (1 minute - reduced for faster alerts)
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 60))        # Seconds between saves per camera (1 minute - reduced for faster alerts)
 CONF_THRESHOLD = 0.50     # Confidence for person detection (increased for accuracy)
 
 # Per-TC-code thresholds loaded from server_room_constants.py

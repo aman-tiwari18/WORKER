@@ -25,7 +25,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/blind_spot_detection")
 
 EDGE_OBSTRUCTION_THRESHOLD = 0.15
 CONF_THRESHOLD = 0.40
-COOLDOWN_TIME = 180
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 180))
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 

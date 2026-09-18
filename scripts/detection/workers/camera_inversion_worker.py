@@ -66,6 +66,12 @@ HLS_SAMPLE_EVERY    = 10
 # false positives from marginal YOLO/Places365 scoring noise.
 INVERSION_SCORE_MARGIN = float(os.environ.get("INVERSION_SCORE_MARGIN", "0.20"))
 
+# On noisy/low-quality frames (e.g. IR grain) both orientations can score
+# near zero, where a tiny random fluctuation is enough to clear the relative
+# margin above. Require the winning side to clear an absolute floor too,
+# so near-zero-vs-near-zero noise can't masquerade as a confident win.
+INVERSION_MIN_ABS_SCORE = float(os.environ.get("INVERSION_MIN_ABS_SCORE", "0.5"))
+
 _gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
 
 # ================= MODELS (lazy load) =================
@@ -162,16 +168,25 @@ def _detect_orientation_batch(frames):
 
     # Only call it "inverted" when the 180° candidate clearly beats the
     # original — a marginal win is more likely model noise than a real
-    # upside-down feed, and used to produce false positives.
+    # upside-down feed, and used to produce false positives. Also require
+    # the winning score to clear an absolute floor, since two near-zero
+    # scores (e.g. on grainy/IR frames) can satisfy the relative margin
+    # on noise alone.
     outputs = []
     for i in range(len(frames)):
         scores = scores_by_idx.get(i, {})
         orig_score = scores.get("original", 0.0)
         rot_score = scores.get("180", 0.0)
-        if rot_score > 0 and rot_score > orig_score * (1 + INVERSION_SCORE_MARGIN):
-            outputs.append("180")
-        else:
-            outputs.append("original")
+        is_inverted = (
+            rot_score > 0
+            and rot_score > orig_score * (1 + INVERSION_SCORE_MARGIN)
+            and rot_score >= INVERSION_MIN_ABS_SCORE
+        )
+        outputs.append({
+            "orientation": "180" if is_inverted else "original",
+            "orig_score": orig_score,
+            "rot_score": rot_score,
+        })
 
     return outputs
 
@@ -202,13 +217,22 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
 
         try:
             frames = [ item['frame'] for item in batch ]
-            orientations = _detect_orientation_batch(frames)
+            results = _detect_orientation_batch(frames)
 
-            for item, orientation in zip(batch, orientations):
+            for item, result in zip(batch, results):
+                cam_id = item.get('device_id') or item.get('camera_id', 'unknown')
+                ch_no = item.get('ch_no', '0')
+                orientation = result["orientation"]
+                logger.info(
+                    f"[Inversion] scores cam={cam_id} ch={ch_no} "
+                    f"orig={result['orig_score']:.3f} rot180={result['rot_score']:.3f} "
+                    f"margin={INVERSION_SCORE_MARGIN} min_abs={INVERSION_MIN_ABS_SCORE} "
+                    f"-> {orientation}"
+                )
+
                 if orientation == "original":
                     continue
 
-                cam_id = item.get('device_id') or item.get('camera_id', 'unknown')
                 now = time.time()
                 if now - last_save_time.get(cam_id, 0) < cooldown_time:
                     continue

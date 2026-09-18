@@ -23,8 +23,13 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/proximity_detection")
 # This detection runs on cameras classified as:
 # - Computer Lab / Inside Lab / Exam Lab / Inside Classroom
 
-COOLDOWN_TIME       = 120     # Seconds between saves (2 min — per detection frequency spec)
-PROXIMITY_THRESHOLD = 100     # Pixels — floor distance for background figures
+COOLDOWN_TIME       = int(os.environ.get("COOLDOWN_TIME", 120))     # Seconds between saves (2 min — per detection frequency spec)
+PROXIMITY_THRESHOLD = 30      # Pixels — small absolute safety floor only, to stop the scaled
+                              # threshold collapsing to near-zero on tiny/far boxes. NOT a flat
+                              # "close" distance — a 100px gap between small background figures
+                              # is a much larger real-world gap than 100px between large
+                              # near-camera figures (perspective), so a big flat floor here was
+                              # wrongly flagging aisles-apart pairs in the back rows as violations.
 PROXIMITY_SCALE     = 0.50    # Adaptive: effective_threshold = max(PROXIMITY_THRESHOLD, avg_box_height * PROXIMITY_SCALE)
 CONF_THRESHOLD      = 0.55    # Raised from 0.45 — drops weak phantom detections (chairs/bags usually land at conf 0.50–0.70; real students ≥ 0.70)
 MIN_BOX_AREA        = 1500    # ~40×38 px — drops unreliable tiny boxes (matches crowd_zero_det.py convention)

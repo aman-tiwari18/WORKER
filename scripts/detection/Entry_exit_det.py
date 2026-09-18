@@ -23,7 +23,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/entry_exit_detection")
 # - Entry / Entry-Exit / Entry Gate / Exit Gate
 # - Outdoor Scene / Outside Area / Crowd at Entry/Exit Gate
 
-COOLDOWN_TIME = 120       # Seconds between saves (2 min — per detection frequency spec)
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))       # Seconds between saves (2 min — per detection frequency spec)
 MIN_PERSONS = 2           # Threshold for violation
 CONF_THRESHOLD = 0.45     # Confidence for person detection
 

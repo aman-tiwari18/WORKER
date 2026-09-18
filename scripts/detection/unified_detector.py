@@ -84,11 +84,14 @@ GPU_BATCH_SIZE     = int(os.environ.get("UNIFIED_GPU_BATCH_SIZE", "24"))
 GPU_QUEUE_SIZE     = int(os.environ.get("UNIFIED_GPU_QUEUE_SIZE", "128"))
 BATCH_WAIT_TIMEOUT = float(os.environ.get("UNIFIED_BATCH_WAIT_TIMEOUT", "0.2"))
 
-# Per-analytic cooldowns (CLIENT-DEFINED — fixed, never tuned for capacity).
-# Mirrors the COOLDOWN_TIME constants in each detection script.
-COOLDOWNS = {
+# Per-analytic cooldowns. Mirrors the COOLDOWN_TIME constants in each detection
+# script. Each is overridable via COOLDOWN_TIME_<KEY>, and script_runner.py's
+# generic COOLDOWN_TIME (set from the UI's per-shift-script Frequency field)
+# is used as a fallback for whichever analytic doesn't have its own override —
+# this matches script_runner today only setting one global value per execution.
+_COOLDOWN_DEFAULTS = {
     "crowd":      120,
-    "crowd_zero": 360,
+    "crowd_zero": 1800,
     "crowd_five": 120,
     "proximity":  120,
     "intruder":   0,
@@ -99,6 +102,12 @@ COOLDOWNS = {
     "qp_box":     240,
     "blind_spot": 180,
     "furniture":  300,
+    "invigilator": 420,
+}
+_GLOBAL_COOLDOWN = os.environ.get("COOLDOWN_TIME")
+COOLDOWNS = {
+    key: int(os.environ.get(f"COOLDOWN_TIME_{key.upper()}", _GLOBAL_COOLDOWN or default))
+    for key, default in _COOLDOWN_DEFAULTS.items()
 }
 
 RESULTS_ROOT = os.path.join(BASE_DIR, "results")

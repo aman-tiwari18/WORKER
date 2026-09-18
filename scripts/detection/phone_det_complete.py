@@ -27,7 +27,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 # - Computer Lab / Inside Lab / Exam Lab / Inside Classroom
 # - Server Room / Inside Server Room
 
-COOLDOWN_TIME = 90        # Seconds between saves (1.5 min — per detection frequency spec)
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 90))        # Seconds between saves (1.5 min — per detection frequency spec)
 CONF_THRESHOLD = 0.25     # Confidence for phone detection
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)

@@ -28,7 +28,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/crowd_detection_threshold")
 # during a scheduled exam window is exactly the signal we want operators to see.
 
 # --- Threshold ---
-COOLDOWN_TIME = 120              # G9: seconds between saves per camera
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))              # G9: seconds between saves per camera
 MAX_PERSONS   = 5                # Violation when 0 < smoothed_count < MAX_PERSONS
 
 # G2: Confidence (raised from 0.35 — low CONF was inflating count via ghost detections

@@ -26,7 +26,7 @@ if BASE_DIR not in sys.path:
 # - Entry / Entry-Exit / Entry Gate / Exit Gate
 # - Outdoor Scene / Outside Area / Biometric Area
 
-COOLDOWN_TIME = 120       # Seconds between saves (2 min — per detection frequency spec)
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))       # Seconds between saves (2 min — per detection frequency spec)
 MIN_PERSONS = 10          # Threshold for crowd violation
 CONF_THRESHOLD = 0.45     # Confidence for person detection
 

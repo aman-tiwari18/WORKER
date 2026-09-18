@@ -62,7 +62,7 @@ BASELINE_FRAMES = int(os.environ.get("FURNITURE_BASELINE_FRAMES", "15"))
 MIN_BASELINE_COUNT = int(os.environ.get("FURNITURE_MIN_BASELINE", "4"))
 MISSING_RATIO = float(os.environ.get("FURNITURE_MISSING_RATIO", "0.6"))
 
-COOLDOWN_TIME = 300
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 300))
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 

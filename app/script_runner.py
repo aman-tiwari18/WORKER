@@ -249,10 +249,23 @@ class ScriptRunner:
             env["LEASE_SHARDS"] = ",".join(str(s) for s in sorted(lease["shards"]))
             env["LEASE_SHARD_COUNT"] = str(lease.get("shard_count") or "")
 
-        # Pass custom frequency as COOLDOWN_TIME (seconds) so workers override their default.
+        # Pass custom frequency as COOLDOWN_TIME (seconds) so workers override their
+        # default. For a single-analytic execution this is the only cooldown the
+        # process needs. For a MERGED group (unified_detector running several
+        # analytics in one process, see poller._group_detection_assignments), each
+        # analytic keeps its own DB-configured frequency via COOLDOWN_TIME_<SCRIPT> —
+        # COOLDOWN_TIME alone would apply just the group's representative assignment's
+        # value to every analytic in the group.
         freq_secs = meta.get("custom_frequency_minutes") or execution.get("custom_frequency_minutes")
         if freq_secs:
             env["COOLDOWN_TIME"] = str(int(freq_secs))
+
+        freq_by_script = execution.get("_freq_by_script") or {}
+        for script_key, freq in freq_by_script.items():
+            try:
+                env[f"COOLDOWN_TIME_{str(script_key).upper()}"] = str(int(freq))
+            except (TypeError, ValueError):
+                continue
 
         # Both the regular vision classification (vision → rtsp/hls script) and the
         # NEET classification (vision_neet) consume the assignment via this payload.

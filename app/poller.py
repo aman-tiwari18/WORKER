@@ -104,10 +104,19 @@ class Poller:
             key   = f"grp-{exam}-{shift}-{link}-{sched}-{end}"
             g = groups.get(key)
             if g is None:
-                g = groups[key] = {"rep": a, "members": [], "analytics": []}
+                g = groups[key] = {"rep": a, "members": [], "analytics": [], "freq_by_script": {}}
             g["members"].append(str(a["id"]))
             if code not in g["analytics"]:
                 g["analytics"].append(code)
+            # Each merged analytic keeps its OWN DB-configured frequency (the
+            # UI's per-shift-script Frequency field) — a merged group used to
+            # collapse onto whichever assignment happened to be first in the
+            # poll batch, so every other analytic silently inherited a
+            # sibling's cooldown instead of its own. Recorded per script code
+            # here and consumed as COOLDOWN_TIME_<SCRIPT> by script_runner.py.
+            freq = meta.get("custom_frequency_minutes") or a.get("custom_frequency_minutes")
+            if freq and code not in g["freq_by_script"]:
+                g["freq_by_script"][code] = freq
         combined = []
         for key, g in groups.items():
             if len(g["members"]) == 1:
@@ -117,6 +126,7 @@ class Poller:
             rep["id"] = key
             rep["_member_ids"] = g["members"]
             rep["_analytics"]  = g["analytics"]
+            rep["_freq_by_script"] = g["freq_by_script"]
             combined.append(rep)
             logger.info(f"[group] {key}: {len(g['members'])} analytics → one master_pipeline ({g['analytics']})")
         return passthrough + combined

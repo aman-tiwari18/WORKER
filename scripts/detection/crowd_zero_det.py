@@ -24,7 +24,7 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/zero_person_detection")
 # - Computer Lab / Inside Lab / Exam Lab / Inside Classroom
 # Detects when 0 candidates are present in the room
 
-COOLDOWN_TIME = 360       # Seconds between saves (changed from 240 to match worker)
+COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 1800))      # Seconds between saves (30 min default)
 MAX_PERSONS = 1           # Threshold for violation (0 persons)
 CONF_THRESHOLD = 0.45     # Confidence for person detection
 MIN_BOX_AREA = 1500       # Ignore tiny detections (far-away or partial persons, ~40x38px)

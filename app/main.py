@@ -2159,7 +2159,11 @@ def list_client_detections(
             def _build_where(include_type: bool) -> tuple:
                 """WHERE shared by count/group/data queries. `include_type` adds the
                 detection_type filter (kept OUT for the sidebar counts pass)."""
-                conds = ["pushed_to_client = 1", "remove_from_client = 0"]
+                # Accepted detections move to the "Accepted Detections" page and
+                # should not linger here after a refresh — same convention as
+                # remove_from_client already excluding removed ones.
+                conds = ["pushed_to_client = 1", "remove_from_client = 0",
+                         "(accepted_by_client IS NULL OR accepted_by_client = 0)"]
                 params: list = []
                 if exam_id:
                     conds.append("exam_id = %s"); params.append(exam_id)
