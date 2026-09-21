@@ -149,6 +149,7 @@ class Poller:
         """Stop a grouped detection job and relaunch it with the full (grown)
         analytics set. Kept guarded by group_relaunching so polls don't double-run."""
         key = str(assignment["id"])
+        already_started = key in self.running_scripts
         try:
             task = self.scheduled_scripts.pop(key, None)
             if task:
@@ -162,6 +163,12 @@ class Poller:
             self.running_scripts.discard(key)
         except Exception as e:
             logger.warning(f"[group] relaunch cleanup for {key} failed: {e}")
+        # Not started yet (only queued for its window): re-queue so it still waits for
+        # its scheduled start instead of launching the moment membership changes.
+        if key not in self.running_scripts and not already_started:
+            self.group_relaunching.discard(key)
+            self.queue_assignment(assignment)
+            return
         # run_assignment re-adds the key and clears group_relaunching once committed.
         await self.run_assignment(assignment)
 
@@ -388,6 +395,8 @@ class Poller:
             asyncio.create_task(self.run_assignment(assignment))
         else:
             logger.info(f"Assignment {assignment_id} queued — fires in {round(delay_s)}s")
+            if grouped:
+                self.group_analytics[assignment_id] = set(grouped)   # so a later poll doesn't see "grew []"
             task = asyncio.create_task(self._delayed_run(assignment, delay_s))
             self.scheduled_scripts[assignment_id] = task
 
