@@ -1827,6 +1827,11 @@ def main():
             cameras = load_cameras_for_execution(execution)
             if cameras: 
                 results.append((execution, cameras))
+
+        # Tell the GPU Monitor how many cameras this job runs on, whatever capture path it takes.
+        _distinct = {(c.get("camera_id"), c.get("ch_no") or c.get("camera_no")) for _, cams in results for c in cams}
+        if _distinct:
+            _publish_camera_count(len(_distinct), script_codes)
     else:
         results = load_all_pending_cameras()
 
