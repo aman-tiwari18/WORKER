@@ -300,13 +300,10 @@ def crowd_det_biometric_worker_hls(camera_configs, stop_event=None):
     if stop_event is None:
         stop_event = _STOP_EVENT
 
-    # Scene filtering - Crowd detection for Biometric cameras only
-    valid_configs = []
-    for cfg in camera_configs:
-        cls_val = str(cfg.get('classification', '')).lower()
-        if not cls_val or any(s in cls_val for s in ('biometric',)):
-            valid_configs.append(cfg)
-            
+    # Scene filtering is done by camera_loader (SCRIPT_CLASSIFICATION_MAP["crowd_biometric"],
+    # incl. per-shift custom classifications) - no second filter here.
+    valid_configs = list(camera_configs)
+
     if not valid_configs:
         return
 
