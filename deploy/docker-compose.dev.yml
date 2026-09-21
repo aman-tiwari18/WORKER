@@ -17,6 +17,7 @@ services:
     entrypoint: ["python", "run.py"]
     command: []
     environment:
+      IS_MAIN_WORKER: "1"           # single-worker stack: write RUNNING/COMPLETED so the Executions tab is correct
       # Base CUDA image has no tzdata and defaults to UTC, so log lines read
       # 5h30m behind the IST wall clock; zoneinfo is bind-mounted below.
       TZ: ${TZ:-Asia/Kolkata}

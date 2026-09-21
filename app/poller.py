@@ -11,7 +11,12 @@ from app.script_runner import script_runner
 from app.camera_distributor import should_process_camera
 
 WORKER_ID = os.environ.get("WORKER_ID", "worker-0")
-IS_MAIN_WORKER = WORKER_ID in ("worker-0", "main")
+# Only the main worker writes RUNNING/COMPLETED status back (feeds the Executions tab).
+# A single-worker stack (uat/dev) has a differently named worker, so allow an env override.
+IS_MAIN_WORKER = (
+    WORKER_ID in ("worker-0", "main")
+    or os.environ.get("IS_MAIN_WORKER", "").strip().lower() in ("1", "true", "yes")
+)
 
 # Capture-once scaling: collapse all of a shift's detection analytics into ONE
 # master_pipeline process per worker (shared YOLO, fan-out to every analytic)

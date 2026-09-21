@@ -13,6 +13,7 @@ services:
     shm_size: '16gb'
     env_file: .env
     environment:
+      IS_MAIN_WORKER: "1"           # single-worker stack: write RUNNING/COMPLETED so the Executions tab is correct
       WORKER_MODE: agent            # headless: poller only, no HTTP API / socket
       # Report the PHYSICAL host to the fleet registry. Without this the agent
       # falls back to socket.gethostname(), which inside a container is the
