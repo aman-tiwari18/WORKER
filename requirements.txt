@@ -20,7 +20,12 @@ Pillow>=10.0.0
 # Deep Learning
 torch>=2.0.0
 torchvision>=0.15.0
-ultralytics>=8.0.0
+# ultralytics>=8.0.0 does NOT ship the YOLO26 architecture configs (added in the
+# 8.4.x line — verified: yolo26*.pt release assets are tagged v8.4.0). All
+# detection scripts load the model named by YOLO_DETECTION_MODEL/
+# YOLO_INVERSION_MODEL in .env (see scripts/detection/model_config.py), which
+# defaults to yolo26m.pt/yolo26n.pt, so the floor must cover that.
+ultralytics>=8.4.0,<9.0.0
 
 # Database
 pymysql>=1.1.0

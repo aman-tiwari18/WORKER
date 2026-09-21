@@ -89,11 +89,12 @@ def _load_models():
     if _yolo_model is not None: return
 
     from ultralytics import YOLO
-    
-    # YOLO
-    yolo_path = os.path.join(DETECTION_ROOT, "models/yolo11n.pt")
+    from model_config import INVERSION_MODEL_PATH
+
+    # YOLO — single source of truth in model_config.py (YOLO_INVERSION_MODEL env var)
+    yolo_path = INVERSION_MODEL_PATH
     if not os.path.exists(yolo_path):
-        yolo_path = "yolo11n.pt"
+        yolo_path = os.path.basename(yolo_path)  # fall back to ultralytics auto-download
     _yolo_model = YOLO(yolo_path)
     if torch.cuda.is_available():
         _yolo_model.to('cuda')

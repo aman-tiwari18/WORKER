@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # Shared model — loaded ONCE, used for every analytic
 # ============================================================
-MODEL_PATH = os.path.join(BASE_DIR, "models", "yolov10m.pt")
+from model_config import DETECTION_MODEL_PATH as MODEL_PATH
 CONF_THRESHOLD = 0.45          # base detector confidence; per-rule filters tighten further
 
 _model = None

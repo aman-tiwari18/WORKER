@@ -51,7 +51,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH  = os.path.join(BASE_DIR, "models", "yolov10m.pt")
+from model_config import DETECTION_MODEL_PATH as MODEL_PATH
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/qp_box_missing")
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
