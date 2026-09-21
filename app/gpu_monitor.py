@@ -12,6 +12,7 @@ Returns:
 """
 
 import os
+import json
 import re
 import subprocess
 import psutil
@@ -263,7 +264,18 @@ def get_camera_counts():
     """
     camera_counts = {}
     
-    # Path to shared state file (created by detection scripts)
+    # One JSON file per job pid, written by master_pipeline._publish_camera_count
+    try:
+        for f in Path("/tmp/detection_camera_counts").glob("*.json"):
+            try:
+                camera_counts[f.stem] = json.loads(f.read_text())
+            except Exception:
+                continue
+        if camera_counts:
+            return camera_counts
+    except Exception as e:
+        logger.debug(f"Error reading camera count files: {e}")
+
     state_file = Path("/tmp/detection_camera_counts.json")
     
     try:
@@ -305,6 +317,23 @@ def _compute_local_gpu_stats_data():
     gpus = get_gpu_stats()
     gpu_processes = get_gpu_processes()
     camera_counts = get_camera_counts()
+
+    # Running jobs that hold no VRAM (e.g. CPU/OCR-only inversion) never appear in
+    # nvidia-smi; list them anyway so the page shows every running analytic.
+    listed = {p["pid"] for procs in gpu_processes.values() for p in procs}
+    default_gpu = int(os.environ.get("WORKER_INDEX", "0") or 0)
+    for ct, cpid, ccmd, cproc in _container_gpu_candidates():
+        if cpid in listed:
+            continue
+        ptype, pname = _classify_cmdline(ccmd, "Job")
+        try:
+            uname = cproc.username()
+        except Exception:
+            uname = ""
+        gpu_processes.setdefault(default_gpu, []).append({
+            "pid": cpid, "name": pname, "type": ptype, "memory_mb": 0, "cmdline": ccmd[:200],
+            "username": uname, "runtime_seconds": int(datetime.now().timestamp() - ct), "status": "running",
+        })
 
     util_by_gpu = {g.get("gpu_id"): g.get("utilization", 0) for g in gpus}
     for gpu_id, processes in gpu_processes.items():

@@ -1464,22 +1464,18 @@ def _run_round_robin(grouped, server_tokens_map, unified_queue):
 def _publish_camera_count(n_cameras, analytics):
     """Record how many cameras this job runs on, for the GPU Monitor page.
 
-    Keyed by this process's pid in a small shared JSON file that the worker
+    One JSON file per pid under /tmp/detection_camera_counts/ that the worker
     API (app/gpu_monitor.py) reads; entries are only looked up for live pids.
     """
     import json as _json
-    path = "/tmp/detection_camera_counts.json"
+    # One file per pid: jobs start simultaneously, and a shared read-modify-write file lost entries.
+    d = "/tmp/detection_camera_counts"
     try:
-        try:
-            with open(path) as f:
-                data = _json.load(f)
-        except Exception:
-            data = {}
-        data[str(os.getpid())] = {"cameras": int(n_cameras), "analytics": sorted(analytics)}
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            _json.dump(data, f)
-        os.replace(tmp, path)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"{os.getpid()}.json")
+        with open(path + ".tmp", "w") as f:
+            _json.dump({"cameras": int(n_cameras), "analytics": sorted(analytics)}, f)
+        os.replace(path + ".tmp", path)
     except Exception as exc:
         logger.debug(f"camera-count publish failed: {exc}")
     logger.info("[GPU-MONITOR] %d cameras running analytics: %s", n_cameras, ", ".join(sorted(analytics)))
