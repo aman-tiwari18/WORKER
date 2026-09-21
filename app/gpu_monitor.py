@@ -104,6 +104,46 @@ def get_cuda_version() -> str:
     return ""
 
 
+def _classify_cmdline(cmdline, fallback_name):
+    """Map a process command line to (type, friendly name) for the GPU page."""
+    if "master_pipeline" in cmdline:
+        m = re.search(r"--analytics\s+(\S+)", cmdline)
+        label = f"Master Pipeline ({m.group(1)})" if m else "Master Pipeline"
+        return "master", label
+    if "server_room_worker" in cmdline:
+        return "server_room", "Server Room Worker"
+    if "crowd_worker" in cmdline:
+        return "crowd", "Crowd Detection Worker"
+    if "proximity_worker" in cmdline:
+        return "proximity", "Proximity Worker"
+    if "camera_inversion_worker" in cmdline:
+        return "inversion", "Camera Inversion Worker"
+    if "worker" in cmdline:
+        return "worker", "Detection Worker"
+    if "vision_classification" in cmdline:
+        return "classification", "Vision Classification"
+    return "unknown", fallback_name
+
+
+def _container_gpu_candidates():
+    """Running detection jobs inside this container, oldest first.
+
+    nvidia-smi inside a container reports HOST pids, which psutil cannot resolve
+    ("[Not Found]"). Each worker container owns one GPU, so unresolved GPU
+    processes are attributed to the container's own job processes instead.
+    """
+    out = []
+    for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        try:
+            cmd = " ".join(proc.info["cmdline"] or [])
+            if "master_pipeline" in cmd and "multiprocessing" not in cmd:
+                out.append((proc.info["create_time"], proc.info["pid"], cmd, proc))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    out.sort()
+    return out
+
+
 def get_gpu_processes():
     """Get processes running on each GPU using nvidia-smi"""
     try:
@@ -173,31 +213,8 @@ def get_gpu_processes():
                     except Exception:
                         status = "unknown"
 
-                    # Extract script name and type
-                    script_type = "unknown"
-                    script_name = process_name
-                    
-                    if "master_pipeline" in cmdline:
-                        script_type = "master"
-                        script_name = "Master Pipeline"
-                    elif "worker" in cmdline:
-                        # Extract worker type
-                        if "server_room_worker" in cmdline:
-                            script_type = "server_room"
-                            script_name = "Server Room Worker"
-                        elif "crowd_worker" in cmdline:
-                            script_type = "crowd"
-                            script_name = "Crowd Detection Worker"
-                        elif "proximity_worker" in cmdline:
-                            script_type = "proximity"
-                            script_name = "Proximity Worker"
-                        else:
-                            script_type = "worker"
-                            script_name = "Detection Worker"
-                    elif "vision_classification" in cmdline:
-                        script_type = "classification"
-                        script_name = "Vision Classification"
-                    
+                    script_type, script_name = _classify_cmdline(cmdline, process_name)
+
                     gpu_processes[gpu_id].append({
                         "pid": pid,
                         "name": script_name,
@@ -210,17 +227,28 @@ def get_gpu_processes():
                     })
 
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    gpu_processes[gpu_id].append({
-                        "pid": pid,
-                        "name": process_name,
-                        "type": "unknown",
-                        "memory_mb": memory_mb,
-                        "cmdline": "",
-                        "username": "",
-                        "runtime_seconds": 0,
-                        "status": "unknown",
-                    })
-        
+                    # Host pid invisible from this container: attribute to a local job.
+                    cands = _container_gpu_candidates()
+                    if cands:
+                        ct, cpid, ccmd, cproc = cands[min(len(gpu_processes[gpu_id]), len(cands) - 1)]
+                        ptype, pname = _classify_cmdline(ccmd, process_name)
+                        try:
+                            uname = cproc.username()
+                        except Exception:
+                            uname = ""
+                        gpu_processes[gpu_id].append({
+                            "pid": cpid, "name": pname, "type": ptype, "memory_mb": memory_mb,
+                            "cmdline": ccmd[:200], "username": uname,
+                            "runtime_seconds": int(datetime.now().timestamp() - ct),
+                            "status": "running",
+                        })
+                    else:
+                        gpu_processes[gpu_id].append({
+                            "pid": pid, "name": "Unattributed GPU process", "type": "unknown",
+                            "memory_mb": memory_mb, "cmdline": "", "username": "",
+                            "runtime_seconds": 0, "status": "unknown",
+                        })
+
         return gpu_processes
     
     except Exception as e:
@@ -278,9 +306,19 @@ def _compute_local_gpu_stats_data():
     gpu_processes = get_gpu_processes()
     camera_counts = get_camera_counts()
 
+    util_by_gpu = {g.get("gpu_id"): g.get("utilization", 0) for g in gpus}
     for gpu_id, processes in gpu_processes.items():
         for proc in processes:
-            proc["camera_count"] = camera_counts.get(proc["pid"], 0)
+            entry = camera_counts.get(str(proc["pid"]), camera_counts.get(proc["pid"], 0))
+            if isinstance(entry, dict):
+                proc["camera_count"] = int(entry.get("cameras", 0))
+                proc["analytics"] = entry.get("analytics", [])
+            else:
+                proc["camera_count"] = int(entry or 0)
+                proc["analytics"] = []
+            # nvidia-smi has no per-process utilisation inside a container; report the
+            # GPU's utilisation (one job set per worker GPU), same source as Prometheus.
+            proc["gpu_percent"] = util_by_gpu.get(gpu_id, 0)
 
     return {
         "success": True,
