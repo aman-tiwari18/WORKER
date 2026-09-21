@@ -54,6 +54,11 @@ RUN pip install --no-cache-dir uv && \
 # Copy application code
 COPY . .
 
+# Bake the pinned YOLO weights into the image (sha256-verified, models.lock.json).
+# They live in /opt/models because hosts bind-mount ./models over /app/models;
+# docker-entrypoint.sh seeds the mount from here, so a new node needs no manual copy.
+RUN python3 fetch_models.py /opt/models
+
 # Apply the vLLM stability patch (deep_gemm / flashinfer guard). WITHOUT this,
 # vLLM crashes on the 224-core / runtime-image hosts (no nvcc). Makes the SAME
 # image usable on worker-0..3 AND the big vLLM hosts w5/6.

@@ -1,0 +1,95 @@
+# One pod per GPU. StatefulSet gives a stable identity (cctv-worker-0/1/2 → WORKER_ID),
+# which the fleet registry, lease ownership and logs all key on. Scaling out = raise
+# `replicas` (needs a free GPU node); with COORDINATION_MODE=lease the new pod registers,
+# claims shards and the fleet rebalances — no TOTAL_WORKERS / WORKER_INDEX edits anywhere.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cctv-worker
+  labels: { app: cctv-worker }
+spec:
+  serviceName: cctv-worker
+  replicas: 3
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  selector:
+    matchLabels: { app: cctv-worker }
+  template:
+    metadata:
+      labels: { app: cctv-worker }
+    spec:
+      terminationGracePeriodSeconds: 150     # running jobs get SIGTERM, flush detections, release leases
+      priorityClassName: system-node-critical
+      nodeSelector:
+        nvidia.com/gpu.present: "true"       # set by GPU Operator / NFD
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+      affinity:
+        podAntiAffinity:                     # never two workers on one GPU box unless it has more GPUs
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector: { matchLabels: { app: cctv-worker } }
+      imagePullSecrets:
+        - name: ghcr-pull
+      containers:
+        - name: worker
+          image: cctv-worker
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: cctv-worker-config }
+            - secretRef:    { name: cctv-worker-secrets }
+          env:
+            - name: WORKER_ID
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: WORKER_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: WORKER_HOSTNAME               # the PHYSICAL node, not the pod
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: WORKER_INDEX                  # ordinal; only used as a GPU label in lease mode
+              valueFrom: { fieldRef: { fieldPath: "metadata.labels['apps.kubernetes.io/pod-index']" } }
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+          resources:
+            requests: { cpu: "8", memory: 32Gi, nvidia.com/gpu: 1 }
+            limits:   { memory: 64Gi, nvidia.com/gpu: 1 }
+          # Models are baked in; the entrypoint verifies/seeds them. Start slow (weights + CUDA init).
+          startupProbe:
+            exec: { command: ["sh", "-c", "test -s /app/models/yolo26m.pt && pgrep -f 'python run.py' >/dev/null"] }
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            exec: { command: ["sh", "-c", "pgrep -f 'python run.py' >/dev/null"] }
+            periodSeconds: 30
+            failureThreshold: 4
+          readinessProbe:
+            exec: { command: ["sh", "-c", "test -s /app/models/yolo26m.pt"] }
+            periodSeconds: 15
+          lifecycle:
+            preStop:
+              # Stop taking new work: tell the backend registry this worker is draining, then
+              # give in-flight detections time to finish before SIGTERM.
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >
+                    curl -fsS -m 5 -X PATCH -H "x-api-key: $API_KEY" -H "content-type: application/json"
+                    -d '{"status":"DRAINING"}' "$MAIN_BACKEND_URL/fleet/workers/$WORKER_ID/status" || true; sleep 20
+          volumeMounts:
+            - { name: frames, mountPath: /app/scripts/detection/results }
+            - { name: shm,    mountPath: /dev/shm }
+            - { name: logs,   mountPath: /app/scripts/logs }
+            - { name: tz,     mountPath: /usr/share/zoneinfo, readOnly: true }
+      volumes:
+        - name: frames
+          persistentVolumeClaim: { claimName: cctv-frames }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+        - name: logs
+          emptyDir: {}
+        - name: tz
+          hostPath: { path: /usr/share/zoneinfo }

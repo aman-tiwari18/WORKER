@@ -1,0 +1,25 @@
+# Frames must be visible to the backend, so they sit on shared (RWX) storage — the
+# same NFS export the fleet already uses. Models are NOT here: they are baked into
+# the image and seeded at start (fetch_models.py), so no volume and no manual copy.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cctv-frames
+spec:
+  capacity: { storage: 2Ti }
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  mountOptions: [nfsvers=4.1, hard, noatime]
+  nfs:
+    server: 192.168.19.40        # overridden per overlay
+    path: /data/nfs/cctv_images
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cctv-frames
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: cctv-frames
+  resources: { requests: { storage: 2Ti } }

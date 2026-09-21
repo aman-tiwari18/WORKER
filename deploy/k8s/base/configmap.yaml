@@ -1,0 +1,18 @@
+# Non-secret worker config. Secrets (API_KEY, DB creds, CAMVIEW token) live in the
+# `cctv-worker-secrets` Secret, created out-of-band (sealed-secrets / external-secrets / kubectl).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cctv-worker-config
+data:
+  WORKER_MODE: agent
+  DB_ACCESS_MODE: backend          # workers need no MySQL; DB goes through the backend gateway
+  COORDINATION_MODE: lease         # REQUIRED for scaling: shards are claimed, not derived from WORKER_INDEX/TOTAL
+  FLEET_ENABLED: "true"
+  FLEET_HEARTBEAT_INTERVAL_S: "10"
+  IS_MAIN_WORKER: "1"
+  TZ: Asia/Kolkata
+  YOLO_DETECTION_MODEL: yolo26m.pt
+  YOLO_INVERSION_MODEL: yolo26n.pt
+  POLL_INTERVAL_MS: "30000"
+  MAIN_BACKEND_URL: http://backend.cctv.svc.cluster.local:4000/prod_cctv/api   # overlays override

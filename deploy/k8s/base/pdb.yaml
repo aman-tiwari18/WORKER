@@ -1,0 +1,9 @@
+# Voluntary disruptions (node drain / rollout) may take at most one GPU worker at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cctv-worker
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: cctv-worker }

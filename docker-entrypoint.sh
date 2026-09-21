@@ -17,21 +17,11 @@ else
   echo "✅ MySQL is ready!"
 fi
 
-# Download YOLO models if not present
-echo "📦 Checking YOLO models..."
-if [ ! -f "models/yolov10m.pt" ]; then
-    echo "Downloading YOLOv10m model..."
-    mkdir -p models
-    # You can add wget/curl commands here to download models
-    # wget -O models/yolov10m.pt https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov10m.pt
-    echo "⚠️  Please manually place yolov10m.pt in the models directory"
-fi
-
-if [ ! -f "models/yolov10x.pt" ]; then
-    echo "Downloading YOLOv10x model..."
-    # wget -O models/yolov10x.pt https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov10x.pt
-    echo "⚠️  Please manually place yolov10x.pt in the models directory"
-fi
+# Models: seed the (possibly bind-mounted, possibly empty) models dir from the copy
+# baked into the image; fall back to the pinned download. sha256 verified.
+echo "📦 Ensuring pinned YOLO models..."
+python3 /app/fetch_models.py /app/models --from /opt/models || {
+    echo "❌ Required model weights unavailable (image seed and download both failed)"; exit 1; }
 
 # Test database connection (skipped in backend mode — no direct DB there)
 if [ "${DB_ACCESS_MODE:-direct}" != "backend" ]; then
