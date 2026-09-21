@@ -280,7 +280,6 @@ def get_camera_counts():
     
     try:
         if state_file.exists():
-            import json
             with open(state_file, 'r') as f:
                 camera_counts = json.load(f)
             return camera_counts
