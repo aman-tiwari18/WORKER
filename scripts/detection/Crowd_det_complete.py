@@ -27,7 +27,7 @@ if BASE_DIR not in sys.path:
 # - Outdoor Scene / Outside Area / Biometric Area
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))       # Seconds between saves (2 min — per detection frequency spec)
-MIN_PERSONS = 10          # Threshold for crowd violation
+MIN_PERSONS = 10          # Crowd violation when persons > 10 (strictly greater)
 CONF_THRESHOLD = 0.45     # Confidence for person detection
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
@@ -68,7 +68,7 @@ def detect_crowd_in_frame(frame, device_id="unknown", camera_no="unknown", scrip
 
     person_count = len(person_detections)
 
-    crowd_detected = person_count >= MIN_PERSONS
+    crowd_detected = person_count > MIN_PERSONS
 
     # Draw detections
     for box in person_detections:
@@ -137,7 +137,7 @@ def detect_crowd_batch(items, results=None):
             if int(box.cls[0]) == 0 and float(box.conf[0]) >= CONF_THRESHOLD
         ]
         person_count = len(person_boxes)
-        crowd_detected = person_count >= MIN_PERSONS
+        crowd_detected = person_count > MIN_PERSONS
 
         for box in person_boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])

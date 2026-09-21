@@ -26,8 +26,18 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))       # Seconds between saves (2 min — per detection frequency spec)
-MIN_PERSONS = 12          # Threshold for crowd violation at biometric area
+MIN_PERSONS = 5           # Crowd violation when > 5 persons AND they are in one very-close group
 CONF_THRESHOLD = 0.45     # Confidence for person detection
+
+# "Very close proximity": a crowd is only flagged when MORE than MIN_PERSONS people are
+# standing together in one connected group (chain of neighbours), not merely scattered
+# across the frame. Two people are "neighbours" when their foot-centres are within
+# max(CLOSE_MIN_PX, avg_box_height * CLOSE_SCALE) pixels (adaptive to perspective) and
+# not in clearly different depth rows (y-gap <= max(CLOSE_ROW_FLOOR, avg_h * CLOSE_ROW_RATIO)).
+CLOSE_MIN_PX    = 30
+CLOSE_SCALE     = 0.50
+CLOSE_ROW_FLOOR = 40
+CLOSE_ROW_RATIO = 0.30
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -48,6 +58,41 @@ def get_yolo_model():
                     logger.info("YOLO model moved to CUDA")
     return yolo_model
 
+
+# ================= PROXIMITY GROUPING ==================
+def _largest_close_group(xyxy_boxes):
+    """Return indices of the largest group of people standing very close together.
+
+    Single-linkage clustering: A-B close and B-C close => A, B, C are one group.
+    """
+    n = len(xyxy_boxes)
+    if n == 0:
+        return []
+    feet = [((b[0] + b[2]) / 2.0, float(b[3])) for b in xyxy_boxes]
+    heights = [float(b[3] - b[1]) for b in xyxy_boxes]
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            avg_h = (heights[i] + heights[j]) / 2.0
+            dx = feet[i][0] - feet[j][0]
+            dy = feet[i][1] - feet[j][1]
+            if abs(dy) > max(CLOSE_ROW_FLOOR, avg_h * CLOSE_ROW_RATIO):
+                continue
+            if (dx * dx + dy * dy) ** 0.5 <= max(CLOSE_MIN_PX, avg_h * CLOSE_SCALE):
+                parent[find(i)] = find(j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return max(groups.values(), key=len)
+
 # ================= STATE ===================
 last_save_times = {}
 _state_lock = threading.Lock()
@@ -66,12 +111,14 @@ def detect_crowd_biometric_in_frame(frame, device_id="unknown", camera_no="unkno
     ]
 
     person_count = len(person_detections)
-    crowd_detected = person_count >= MIN_PERSONS
+    xyxy = [box.xyxy[0].cpu().numpy() for box in person_detections]
+    group = set(_largest_close_group(xyxy))
+    crowd_detected = person_count > MIN_PERSONS and len(group) > MIN_PERSONS
 
-    # Draw detections
-    for box in person_detections:
+    # Draw detections (red = in the close group, green = elsewhere)
+    for idx, box in enumerate(person_detections):
         x1, y1, x2, y2 = map(int, box.xyxy[0])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255) if idx in group else (0, 200, 0), 2)
 
     # Status overlay
     overlay = frame.copy()
@@ -80,7 +127,7 @@ def detect_crowd_biometric_in_frame(frame, device_id="unknown", camera_no="unkno
     status_color = (0, 0, 255) if crowd_detected else (0, 255, 0)
     status_text = f"BIOMETRIC CROWD! ({person_count})" if crowd_detected else "All Clear"
     cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-    cv2.putText(frame, f"Biometric Area - Persons: {person_count}", (20, 62),
+    cv2.putText(frame, f"Biometric Area - Persons: {person_count} (close group: {len(group)})", (20, 62),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
     cv2.putText(frame, f"{device_id} - Cam {camera_no}", (20, 87),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
@@ -126,11 +173,13 @@ def detect_crowd_biometric_batch(items, results=None):
             if int(box.cls[0]) == 0 and float(box.conf[0]) >= CONF_THRESHOLD
         ]
         person_count = len(person_boxes)
-        crowd_detected = person_count >= MIN_PERSONS
+        xyxy = [box.xyxy[0].cpu().numpy() for box in person_boxes]
+        group = set(_largest_close_group(xyxy))
+        crowd_detected = person_count > MIN_PERSONS and len(group) > MIN_PERSONS
 
-        for box in person_boxes:
+        for idx, box in enumerate(person_boxes):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255) if idx in group else (0, 200, 0), 2)
 
         ch_no = item.get('ch_no', item.get('camera_id', 'unknown'))
 
@@ -141,7 +190,7 @@ def detect_crowd_biometric_batch(items, results=None):
         status_color = (0, 0, 255) if crowd_detected else (0, 255, 0)
         status_text = f"BIOMETRIC CROWD! ({person_count})" if crowd_detected else "All Clear"
         cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-        cv2.putText(frame, f"Biometric - Persons: {person_count}", (20, 62),
+        cv2.putText(frame, f"Biometric - Persons: {person_count} (close group: {len(group)})", (20, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.putText(frame, f"CH: {ch_no}", (20, 87),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)

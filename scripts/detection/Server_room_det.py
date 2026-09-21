@@ -137,7 +137,7 @@ def detect_persons_batch(items, results=None):
         # any single person as a breach for every centre missing from the
         # threshold sheet — false-flagging normal staff.)
         no_threshold = min_persons is None
-        server_detected = (not no_threshold) and person_count >= min_persons
+        server_detected = (not no_threshold) and person_count > min_persons
 
         for box in person_boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
