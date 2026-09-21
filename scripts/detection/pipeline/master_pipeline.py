@@ -1200,6 +1200,7 @@ def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
         grouped.setdefault(label, []).append(c)
 
     logger.info(f"Launching producers for {len(grouped)} camera groups (max_concurrent={max_concurrent})")
+    _publish_camera_count(len(grouped), {c.get("script_code") for c in camera_group if c.get("script_code")})
 
     # 5a. ROUND-ROBIN mode (Scaling Path A): rotate all cameras over a bounded pool.
     rr_mode = ROUND_ROBIN and UNIFIED_DETECTOR and unified_queue is not None
