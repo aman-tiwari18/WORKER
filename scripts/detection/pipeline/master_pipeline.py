@@ -1155,9 +1155,6 @@ def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
     if UNIFIED_DETECTOR:
         # Scaling Path A: ONE shared YOLO worker for ALL analytics.
         # Big feed buffer so a large RR pool bursting frames doesn't drop them before the GPU.
-        _per_u = {sc: sum(1 for c in unified_configs if sc in c["enabled_scripts"]) for sc in all_scripts}
-        _publish_camera_count(len(unified_configs), all_scripts, per_analytic=_per_u,
-                              unified={"pairs": len(unified_cams), "distinct": len(unified_configs)})
         unified_queue = mp.Queue(maxsize=int(os.environ.get("UNIFIED_QUEUE_SIZE", "256")))
         p = mp.Process(
             target=_worker_process_entry,
@@ -1747,6 +1744,9 @@ def run_hls_pipeline(camera_group):
             len(unified_cams) / max(len(unified_configs), 1), all_scripts,
         )
 
+        _per_u = {sc: sum(1 for c in unified_configs if sc in c["enabled_scripts"]) for sc in all_scripts}
+        _publish_camera_count(len(unified_configs), all_scripts, per_analytic=_per_u,
+                              unified={"pairs": len(unified_cams), "distinct": len(unified_configs)})
         unified_queue = mp.Queue(maxsize=int(os.environ.get("UNIFIED_QUEUE_SIZE", "256")))
         p = mp.Process(
             target=_worker_process_entry,

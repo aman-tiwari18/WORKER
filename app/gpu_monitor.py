@@ -108,8 +108,12 @@ def get_cuda_version() -> str:
 def _classify_cmdline(cmdline, fallback_name):
     """Map a process command line to (type, friendly name) for the GPU page."""
     if "master_pipeline" in cmdline:
-        m = re.search(r"--analytics\s+(\S+)", cmdline)
-        label = f"Master Pipeline ({m.group(1)})" if m else "Master Pipeline"
+        m = re.search(r"--analytics((?:\s+[a-z_0-9]+)+)", cmdline)
+        names = m.group(1).split() if m else []
+        if len(names) > 2:
+            label = f"Unified Pipeline ({len(names)} analytics)"
+        else:
+            label = f"Master Pipeline ({', '.join(names)})" if names else "Master Pipeline"
         return "master", label
     if "server_room_worker" in cmdline:
         return "server_room", "Server Room Worker"
