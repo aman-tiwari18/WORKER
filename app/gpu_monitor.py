@@ -342,6 +342,8 @@ def _compute_local_gpu_stats_data():
             if isinstance(entry, dict):
                 proc["camera_count"] = int(entry.get("cameras", 0))
                 proc["analytics"] = entry.get("analytics", [])
+                proc["per_analytic"] = entry.get("per_analytic", {})
+                proc["unified"] = entry.get("unified")
             else:
                 proc["camera_count"] = int(entry or 0)
                 proc["analytics"] = []

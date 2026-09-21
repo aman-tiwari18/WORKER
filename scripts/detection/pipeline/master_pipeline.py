@@ -1155,7 +1155,9 @@ def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
     if UNIFIED_DETECTOR:
         # Scaling Path A: ONE shared YOLO worker for ALL analytics.
         # Big feed buffer so a large RR pool bursting frames doesn't drop them before the GPU.
-        _publish_camera_count(len(unified_configs), all_scripts)
+        _per_u = {sc: sum(1 for c in unified_configs if sc in c["enabled_scripts"]) for sc in all_scripts}
+        _publish_camera_count(len(unified_configs), all_scripts, per_analytic=_per_u,
+                              unified={"pairs": len(unified_cams), "distinct": len(unified_configs)})
         unified_queue = mp.Queue(maxsize=int(os.environ.get("UNIFIED_QUEUE_SIZE", "256")))
         p = mp.Process(
             target=_worker_process_entry,
@@ -1200,7 +1202,10 @@ def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
         grouped.setdefault(label, []).append(c)
 
     logger.info(f"Launching producers for {len(grouped)} camera groups (max_concurrent={max_concurrent})")
-    _publish_camera_count(len(grouped), {c.get("script_code") for c in camera_group if c.get("script_code")})
+    _per_r = {}
+    for _c in camera_group:
+        _per_r.setdefault(_c.get("script_code"), set()).add(f"{_c['camera_id']}_{_c.get('ch_no') or _c.get('camera_no', '1')}")
+    _publish_camera_count(len(grouped), {k for k in _per_r if k}, per_analytic={k: len(v) for k, v in _per_r.items() if k})
 
     # 5a. ROUND-ROBIN mode (Scaling Path A): rotate all cameras over a bounded pool.
     rr_mode = ROUND_ROBIN and UNIFIED_DETECTOR and unified_queue is not None
@@ -1461,11 +1466,13 @@ def _run_round_robin(grouped, server_tokens_map, unified_queue):
 
 
 # ============================================================
-def _publish_camera_count(n_cameras, analytics):
+def _publish_camera_count(n_cameras, analytics, per_analytic=None, unified=None):
     """Record how many cameras this job runs on, for the GPU Monitor page.
 
     One JSON file per pid under /tmp/detection_camera_counts/ that the worker
     API (app/gpu_monitor.py) reads; entries are only looked up for live pids.
+    `per_analytic` = {script: cameras}; `unified` = shared-capture stats
+    {pairs, distinct}. Repeated calls merge (later fields win).
     """
     import json as _json
     # One file per pid: jobs start simultaneously, and a shared read-modify-write file lost entries.
@@ -1473,8 +1480,18 @@ def _publish_camera_count(n_cameras, analytics):
     try:
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, f"{os.getpid()}.json")
+        try:
+            with open(path) as f:
+                rec = _json.load(f)
+        except Exception:
+            rec = {}
+        rec.update({"cameras": int(n_cameras), "analytics": sorted(analytics)})
+        if per_analytic is not None:
+            rec["per_analytic"] = {k: int(v) for k, v in per_analytic.items()}
+        if unified is not None:
+            rec["unified"] = unified
         with open(path + ".tmp", "w") as f:
-            _json.dump({"cameras": int(n_cameras), "analytics": sorted(analytics)}, f)
+            _json.dump(rec, f)
         os.replace(path + ".tmp", path)
     except Exception as exc:
         logger.debug(f"camera-count publish failed: {exc}")
@@ -1825,9 +1842,11 @@ def main():
                 results.append((execution, cameras))
 
         # Tell the GPU Monitor how many cameras this job runs on, whatever capture path it takes.
-        _distinct = {(c.get("camera_id"), c.get("ch_no") or c.get("camera_no")) for _, cams in results for c in cams}
+        _key = lambda c: (c.get("camera_id"), c.get("ch_no") or c.get("camera_no"))
+        _distinct = {_key(c) for _, cams in results for c in cams}
+        _per = {ex["script_code"]: len({_key(c) for c in cams}) for ex, cams in results}
         if _distinct:
-            _publish_camera_count(len(_distinct), script_codes)
+            _publish_camera_count(len(_distinct), script_codes, per_analytic=_per)
     else:
         results = load_all_pending_cameras()
 
