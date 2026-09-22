@@ -38,6 +38,9 @@ spec:
       containers:
         - name: worker
           image: cctv-worker
+          # Correct ONLY because overlays must pin an immutable uat-<sha> tag (see the
+          # comment on `newTag` in each overlay). Against a floating tag like `uat`,
+          # IfNotPresent means k8s never re-pulls once cached — new pushes go unnoticed.
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef: { name: cctv-worker-config }

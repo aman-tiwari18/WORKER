@@ -8,7 +8,7 @@ data:
   WORKER_MODE: agent
   DB_ACCESS_MODE: backend          # workers need no MySQL; DB goes through the backend gateway
   COORDINATION_MODE: lease         # REQUIRED for scaling: shards are claimed, not derived from WORKER_INDEX/TOTAL
-  FLEET_ENABLED: "true"
+  FLEET_ENABLED: "1"
   FLEET_HEARTBEAT_INTERVAL_S: "10"
   IS_MAIN_WORKER: "1"
   TZ: Asia/Kolkata

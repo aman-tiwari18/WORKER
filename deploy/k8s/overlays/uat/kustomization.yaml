@@ -4,15 +4,39 @@ resources: [../../base]
 images:
   - name: cctv-worker
     newName: ghcr.io/aman-tiwari18/cctv-worker
-    newTag: uat            # CI replaces with uat-<sha>:  kustomize edit set image cctv-worker=...:uat-$SHA
+    # Pinned to an immutable tag, not the floating `uat` tag — imagePullPolicy: IfNotPresent
+    # means k8s NEVER re-pulls a tag it already has cached, so `uat` silently goes stale
+    # after every new push (bit us during the 2026-09-22 smoke test: the pod kept running
+    # a build from hours earlier). CI's k8s deploy step doesn't exist yet (see
+    # docs/kubernetes_scaling_guide.md §5); bump this by hand after each push until it does:
+    #   kustomize edit set image cctv-worker=ghcr.io/aman-tiwari18/cctv-worker:uat-$(git rev-parse HEAD)
+    newTag: uat-aecea0e61c617744e15c4dabc485c97e5991874b
 patches:
   - target: { kind: ConfigMap, name: cctv-worker-config }
     patch: |-
       - op: replace
         path: /data/MAIN_BACKEND_URL
         value: http://192.168.19.30:4000/prod_cctv/api
+      # --- SMOKE TEST (2026-09-22): hash-mode distribution across worker-0 (this main
+      # VM, Compose) + worker-1 (this pod, k8s). Reverts to COORDINATION_MODE=lease once
+      # lease-based sharding has been proven; see docs/kubernetes_scaling_guide.md §5.
+      - op: replace
+        path: /data/COORDINATION_MODE
+        value: hash
+      - op: add
+        path: /data/DISTRIBUTION_MODE
+        value: auto
+      - op: add
+        path: /data/TOTAL_WORKERS
+        value: "2"
   - target: { kind: StatefulSet, name: cctv-worker }
     patch: |-
       - op: replace
         path: /spec/replicas
         value: 1
+      # Hardcoded for the smoke test above — the fleet's 2nd worker (main VM/Compose
+      # is index 0). Ordinal-based WORKER_INDEX (base default) returns once
+      # COORDINATION_MODE reverts to lease, where WORKER_INDEX isn't used for ownership.
+      - op: replace
+        path: /spec/template/spec/containers/0/env/3
+        value: { name: WORKER_INDEX, value: "1" }
