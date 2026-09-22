@@ -26,7 +26,11 @@ from app.config import MAIN_BACKEND_URL, API_KEY, WORKER_ID, WORKER_NAME, TOTAL_
 from app.logger import logger
 
 HEARTBEAT_INTERVAL_S = int(os.getenv("FLEET_HEARTBEAT_INTERVAL_S", "10"))
-FLEET_ENABLED = os.getenv("FLEET_ENABLED", "1") == "1"
+def _truthy(name, default):
+    """Accept the usual truthy spellings for a boolean env var (Compose uses "1",
+    Kubernetes manifests more often use "true") instead of a strict == "1"."""
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
+FLEET_ENABLED = _truthy("FLEET_ENABLED", "1")
 REQUEST_TIMEOUT_S = float(os.getenv("FLEET_REQUEST_TIMEOUT_S", "10"))
 _MAX_BACKOFF_S = 120
 
@@ -41,10 +45,10 @@ def _worker_index() -> int:
 def _capabilities() -> dict:
     """What this worker can do — config, never code (plan §4.0 bucket 3)."""
     return {
-        "detector": os.getenv("ENABLE_DETECTION", "1") == "1",
-        "vllm": os.getenv("ENABLE_VLLM", "0") == "1",
-        "nvdec": os.getenv("USE_NVDEC", "0") == "1",
-        "unified_detector": os.getenv("UNIFIED_DETECTOR", "0") == "1",
+        "detector": _truthy("ENABLE_DETECTION", "1"),
+        "vllm": _truthy("ENABLE_VLLM", "0"),
+        "nvdec": _truthy("USE_NVDEC", "0"),
+        "unified_detector": _truthy("UNIFIED_DETECTOR", "0"),
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT", ""),
     }
