@@ -10,4 +10,9 @@ patches:
     patch: |-
       - op: replace
         path: /data/MAIN_BACKEND_URL
-        value: http://192.168.19.10:4000/prod_cctv/api
+        value: http://192.168.19.30:4000/prod_cctv/api
+  - target: { kind: StatefulSet, name: cctv-worker }
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1

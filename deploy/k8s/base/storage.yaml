@@ -1,6 +1,11 @@
-# Frames must be visible to the backend, so they sit on shared (RWX) storage — the
-# same NFS export the fleet already uses. Models are NOT here: they are baked into
-# the image and seeded at start (fetch_models.py), so no volume and no manual copy.
+# Frames must land where the BACKEND (main VM, 192.168.19.30) can serve them from —
+# it reads NFS_FRAMES_ROOT=/data/new_dev/frames/classification_frames locally (backend/.env).
+# That dir was previously only a local bind mount (fine when the sole worker was co-located
+# with the backend); a remote pod needs it shared, so it is now also an NFS export
+# (added to /etc/exports on the main VM, confirmed mountable from worker-1). The whole
+# export is mounted at /app/scripts/detection/results — matches the Compose worker's
+# FRAMES_HOST_PATH bind mount 1:1, so frame_path values stay identical either way.
+# Models are NOT here: they are baked into the image and seeded at start (fetch_models.py).
 apiVersion: v1
 kind: PersistentVolume
 metadata:
@@ -11,8 +16,8 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   mountOptions: [nfsvers=4.1, hard, noatime]
   nfs:
-    server: 192.168.19.40        # overridden per overlay
-    path: /data/nfs/cctv_images
+    server: 192.168.19.30        # main VM — overridden per overlay if the backend ever moves
+    path: /data/new_dev/frames
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

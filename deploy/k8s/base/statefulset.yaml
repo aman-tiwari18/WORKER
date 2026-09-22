@@ -33,8 +33,8 @@ spec:
               podAffinityTerm:
                 topologyKey: kubernetes.io/hostname
                 labelSelector: { matchLabels: { app: cctv-worker } }
-      imagePullSecrets:
-        - name: ghcr-pull
+      # ghcr.io/aman-tiwari18/cctv-worker is a PUBLIC package — `docker pull` needs no
+      # login, so no imagePullSecrets. Add one back only if the package is ever made private.
       containers:
         - name: worker
           image: cctv-worker
