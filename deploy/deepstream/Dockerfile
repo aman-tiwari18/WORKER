@@ -33,7 +33,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir torch torchvision --index-url ${TORCH_INDEX} && \
     pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir "${PYDS_WHEEL}" onnx onnxslim
+    pip install --no-cache-dir "${PYDS_WHEEL}" onnx onnxslim "numpy>=1.24,<2"
+# numpy<2 kept explicitly: onnx pulls numpy 2.x otherwise, but requirements.txt
+# (OpenCV/ultralytics) and pyds are built against numpy 1.x
 
 COPY . .
 

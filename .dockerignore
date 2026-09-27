@@ -21,5 +21,8 @@ ENV/
 results/*
 frames/*
 models/
+# vLLM / Hugging Face download cache (tens of GB, bind-mounted at runtime) — never build context
+hf_cache/
+data/hf_cache/
 data/sheets/*.xlsx
 logs/*.log
