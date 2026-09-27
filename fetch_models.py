@@ -3,12 +3,15 @@
 
 Usage:  fetch_models.py DEST [--from SEED_DIR]
   --from  copy from a seed dir (the copy baked into the image) before trying the network.
-Exit 1 if a REQUIRED model cannot be made valid (required = yolo26m/yolo26n); other
+Exit 1 if a REQUIRED model cannot be made valid (yolo26m/yolo26n + the two fine-tuned); other
 models only warn, so an offline node still starts with the models it has.
+
+"bundled" models (the fine-tuned ones) live in the repo under models_bundled/ and
+are copied from there instead of downloaded — they are not hosted anywhere.
 """
 import hashlib, json, os, shutil, sys, urllib.request
 
-REQUIRED = {"yolo26m.pt", "yolo26n.pt"}
+REQUIRED = {"yolo26m.pt", "yolo26n.pt", "monitor_person_model.pt", "phone_model.pt"}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -33,7 +36,9 @@ def main():
     lock = json.load(open(os.path.join(HERE, "models.lock.json")))
     os.makedirs(dest, exist_ok=True)
     failed = []
-    for name, want in lock["models"].items():
+    bundled_dir = os.path.join(HERE, lock.get("bundled_dir", "models_bundled"))
+    bundled = lock.get("bundled", {})
+    for name, want in {**lock["models"], **bundled}.items():
         path = os.path.join(dest, name)
         if ok(path, want):
             continue
@@ -43,6 +48,14 @@ def main():
             os.replace(path + ".tmp", path)
             print(f"[models] {name}: seeded from image")
             got = True
+        elif name in bundled:
+            if ok(os.path.join(bundled_dir, name), want):
+                shutil.copy2(os.path.join(bundled_dir, name), path + ".tmp")
+                os.replace(path + ".tmp", path)
+                print(f"[models] {name}: copied from {bundled_dir}")
+                got = True
+            else:
+                print(f"[models] {name}: FAILED (not in image seed or {bundled_dir}, or sha256 mismatch)")
         else:
             try:
                 print(f"[models] {name}: downloading")

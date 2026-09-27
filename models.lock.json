@@ -2,10 +2,16 @@
   "_comment": "Pinned model weights. Baked into the image at build (/opt/models) and seeded into a bind-mounted ./models at container start. sha256 is enforced; add a new model here, never by hand-copying onto hosts.",
   "base_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0",
   "models": {
-    "yolo26m.pt":  "401cea9ab23ad19246ff7744859816bc599f350e93c9dd30367b6f0a0745d0b7",
-    "yolo26n.pt":  "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
-    "yolo11n.pt":  "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
+    "yolo26m.pt": "401cea9ab23ad19246ff7744859816bc599f350e93c9dd30367b6f0a0745d0b7",
+    "yolo26n.pt": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+    "yolo11n.pt": "0ebbc80d4a7680d14987a577cd21342b65ecfd94632bd9a8da63ae6417644ee1",
     "yolov10m.pt": "6dc78f7a88591cec1e8716b8f5c7e3aefa9206684f025d202be34439ccb329a0",
     "yolov10x.pt": "605982e0b2c2ff070351afc8df3ecb38c54cfd7f133813acb366f454eb79b9a6"
+  },
+  "_comment_bundled": "Fine-tuned models committed in models_bundled/ (not hosted anywhere): copied, never downloaded. Replace the file AND its sha256 here together. Strip training state first (ultralytics.utils.torch_utils.strip_optimizer) so each file stays well under GitHub's 100 MB limit.",
+  "bundled_dir": "models_bundled",
+  "bundled": {
+    "monitor_person_model.pt": "c1ac4b2f96a63f4712c0b1e856db82b837513fab46d4c10a9e28604d685883b7",
+    "phone_model.pt": "0c64db9bccb66b0a251e9a8f9e9dd239613116d34d5d96ee777803d73457950f"
   }
 }

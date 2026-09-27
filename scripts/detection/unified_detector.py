@@ -25,6 +25,17 @@ Additive proof-of-concept. The existing per-script workers in `workers/` are lef
 intact. Crowd is implemented as the reference evaluator; other analytics follow the
 same pattern (refactor each `detect_*_batch` to accept a precomputed `results`).
 
+MODELS (Sep 2026)
+-----------------
+"Once per frame" is now once per frame *per model*. Three detectors, see
+model_config.py; each analytic reads boxes from one of them (ANALYTIC_MODEL):
+  person  monitor_person_model.pt  every person-based analytic (default)
+  phone   phone_model.pt           phone
+  coco    yolo26m.pt               furniture (chair / table / bench)
+  (qp_box runs its own COCO YOLO + colour check and ignores shared boxes)
+A model only runs on the frames of cameras that have an analytic needing it,
+so a camera without phone/furniture costs one inference, as before.
+
 INTEGRATION (not wired yet — flip after evaluators exist for all needed scripts):
   In master_pipeline.run_rtsp_pipeline, instead of one queue+worker per script_code,
   create ONE queue + one `unified_worker` process, and have producers push packets
@@ -53,26 +64,45 @@ from ultralytics import YOLO
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# Shared model — loaded ONCE, used for every analytic
+# Shared models — each loaded ONCE, shared by every analytic that reads it
 # ============================================================
-from model_config import DETECTION_MODEL_PATH as MODEL_PATH
+from model_config import DETECTION_MODEL_PATH, PERSON_MODEL_PATH, PHONE_MODEL_PATH
 CONF_THRESHOLD = 0.45          # base detector confidence; per-rule filters tighten further
 
-_model = None
+MODEL_PATHS = {
+    "person": PERSON_MODEL_PATH,     # fine-tuned: 0 person, 1 monitor
+    "phone":  PHONE_MODEL_PATH,      # fine-tuned: 0 mobile
+    "coco":   DETECTION_MODEL_PATH,  # stock COCO-80
+}
+# analytic -> model whose boxes its rule reads; anything not listed reads "person".
+# None = the analytic runs its own detector and ignores the shared result.
+ANALYTIC_MODEL = {
+    "phone":     "phone",
+    "furniture": "coco",
+    "qp_box":    None,
+}
+
+_models = {}
 _model_lock = threading.Lock()
 
 
-def get_shared_model():
-    global _model
-    if _model is None:
+def model_for(script):
+    return ANALYTIC_MODEL.get(script, "person")
+
+
+def get_shared_model(key="person"):
+    model = _models.get(key)
+    if model is None:
         with _model_lock:
-            if _model is None:
-                logger.info(f"[Unified] Loading shared YOLO model {MODEL_PATH}")
-                _model = YOLO(MODEL_PATH)
+            model = _models.get(key)
+            if model is None:
+                logger.info(f"[Unified] Loading shared '{key}' model {MODEL_PATHS[key]}")
+                model = YOLO(MODEL_PATHS[key])
                 if torch.cuda.is_available():
-                    _model.to("cuda")
-                    logger.info("[Unified] Shared model on CUDA")
-    return _model
+                    model.to("cuda")
+                    logger.info(f"[Unified] '{key}' model on CUDA")
+                _models[key] = model
+    return model
 
 
 # ============================================================
@@ -285,19 +315,26 @@ def unified_worker(frame_queue):
             except queue_module.Empty:
                 time.sleep(0.002)
 
-        # ---- ONE inference for the whole batch ----
-        model = get_shared_model()
-        frames = [p["frame"] for p in batch]
-        try:
-            results = model(frames, conf=CONF_THRESHOLD, verbose=False)
-        except Exception as e:
-            logger.error(f"[Unified] inference error: {e}")
-            for p in batch:
-                p.pop("frame", None)
-            continue
+        # ---- ONE inference per model, only on the frames whose analytics need it ----
+        results = [{} for _ in batch]           # per packet: model key -> result
+        need = {}                               # model key -> packet indexes
+        for i, p in enumerate(batch):
+            for script in p.get("enabled_scripts", []):
+                key = model_for(script)
+                if key is not None and script in EVALUATORS:
+                    need.setdefault(key, set()).add(i)
+        for key, idx in need.items():
+            idx = sorted(idx)
+            try:
+                out = get_shared_model(key)([batch[i]["frame"] for i in idx], conf=CONF_THRESHOLD, verbose=False)
+            except Exception as e:
+                logger.error(f"[Unified] '{key}' inference error: {e}")
+                continue                        # its analytics skip this batch; the others still run
+            for i, r in zip(idx, out):
+                results[i][key] = r
 
         # ---- dispatch boxes to each camera's enabled analytics ----
-        for pkt, result in zip(batch, results):
+        for pkt, per_model in zip(batch, results):
             dev = pkt.get("device_id", "unknown")
             # RTSP: camera_no is the camera number; HLS: it's the ch_code.
             cam_no = pkt.get("camera_no") or pkt.get("ch_no") or "1"
@@ -322,6 +359,10 @@ def unified_worker(frame_queue):
                 fn = EVALUATORS.get(script)
                 if fn is None:
                     continue  # not yet converted to the unified path
+                key = model_for(script)
+                if key is not None and key not in per_model:
+                    continue  # that model's inference failed for this batch
+                result = per_model.get(key)
                 try:
                     fn(result, item, state_for(dev, cam_no, script))
                 except Exception as e:

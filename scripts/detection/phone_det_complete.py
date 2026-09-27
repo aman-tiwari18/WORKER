@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from model_config import DETECTION_MODEL_PATH as MODEL_PATH
+from model_config import PHONE_MODEL_PATH as MODEL_PATH  # fine-tuned phone model (class "mobile")
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 
 # CAMERA CLASSIFICATION: Inside Lab, Inside Server Room
@@ -29,6 +29,8 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 90))        # Seconds between saves (1.5 min — per detection frequency spec)
 CONF_THRESHOLD = 0.25     # Confidence for phone detection
+# "mobile" = fine-tuned phone_model.pt; "cell phone" = stock COCO model (fallback)
+PHONE_CLASS_NAMES = {"mobile", "cell phone"}
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -126,7 +128,7 @@ def detect_phone_in_frame(frame, device_id="unknown", camera_no="unknown", scrip
     names = results.names
     phone_boxes = [
         box for box in results.boxes
-        if names[int(box.cls[0])] == "cell phone" and box.conf[0] >= CONF_THRESHOLD
+        if names[int(box.cls[0])] in PHONE_CLASS_NAMES and box.conf[0] >= CONF_THRESHOLD
     ]
 
     phone_count = len(phone_boxes)
@@ -184,7 +186,7 @@ def detect_phone_batch(items, results=None):
         names = result.names
         phone_boxes = [
             box for box in result.boxes
-            if names[int(box.cls[0])] == "cell phone" and float(box.conf[0]) >= CONF_THRESHOLD
+            if names[int(box.cls[0])] in PHONE_CLASS_NAMES and float(box.conf[0]) >= CONF_THRESHOLD
         ]
         phone_count = len(phone_boxes)
         phone_detected = phone_count > 0

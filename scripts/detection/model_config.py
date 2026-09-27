@@ -2,6 +2,32 @@
 model_config.py — single source of truth for which YOLO checkpoint every
 detection script loads.
 
+THREE DETECTION MODELS (fine-tuned models, Sep 2026)
+----------------------------------------------------
+  PERSON_MODEL_PATH     monitor_person_model.pt  classes 0=person, 1=monitor
+                        fine-tuned YOLO26m @960 on exam-lab CCTV. Used by every
+                        person-based script: crowd, crowd_zero, crowd_five,
+                        proximity, intruder, entry_exit, server, strongroom,
+                        invigilator, blind_spot, crowd_biometric.
+                        person keeps COCO id 0, so `cls == 0` checks still hold.
+  PHONE_MODEL_PATH      phone_model.pt           class 0=mobile
+                        fine-tuned YOLO26m @960. Used by phone_det_complete.
+  DETECTION_MODEL_PATH  yolo26m.pt               stock COCO-80
+                        still needed by the scripts that use classes the
+                        fine-tuned models do not have: qp_box (boxes, bags...)
+                        and furniture (chair / table / bench).
+
+Override via .env: YOLO_PERSON_MODEL, YOLO_PHONE_MODEL, YOLO_DETECTION_MODEL.
+The fine-tuned files are committed in models_bundled/ and pinned (sha256) in
+models.lock.json under "bundled": the image build copies them into /opt/models and
+docker-entrypoint.sh seeds the bind-mounted ./models from there, like the stock
+models, so every image/host has them. If one is still missing (e.g. a host that
+runs the code without the image), the script logs an error and falls back to the
+stock COCO model (person is id 0 there too and the phone script also accepts
+"cell phone"), so detection keeps running instead of crash-looping.
+The input size (960 for the fine-tuned models, 640 for yolo26m) is read by
+Ultralytics from each checkpoint, so callers do not pass imgsz.
+
 Every core detection module (blind_spot_det.py, close_proximity.py,
 Crowd_det_*.py, Entry_exit_det.py, improper_furniture_det.py, Intruder_det.py,
 invigilator_tracking.py, phone_det_complete.py, qp_box_det.py,
@@ -42,6 +68,7 @@ never matched it. Dropping a new .pt file into the host's ./models/ and
 changing the env var is now enough to switch models fleet-wide with no code
 change, no image rebuild, and no re-download on recreate.
 """
+import logging
 import os
 
 _DETECTION_DIR = os.path.dirname(os.path.abspath(__file__))  # .../scripts/detection
@@ -50,6 +77,20 @@ _MODELS_DIR = os.path.normpath(os.path.join(_DETECTION_DIR, "..", "..", "models"
 DETECTION_MODEL_PATH = os.path.join(
     _MODELS_DIR, os.environ.get("YOLO_DETECTION_MODEL", "yolo26m.pt")
 )
+
+
+def _finetuned(env_name, default_file):
+    """Fine-tuned model path, or the stock COCO model if the file is missing."""
+    path = os.path.join(_MODELS_DIR, os.environ.get(env_name, default_file))
+    if os.path.isfile(path):
+        return path
+    logging.getLogger(__name__).error(
+        f"[model_config] {path} not found ({env_name}) — falling back to {DETECTION_MODEL_PATH}")
+    return DETECTION_MODEL_PATH
+
+
+PERSON_MODEL_PATH = _finetuned("YOLO_PERSON_MODEL", "monitor_person_model.pt")
+PHONE_MODEL_PATH = _finetuned("YOLO_PHONE_MODEL", "phone_model.pt")
 
 INVERSION_MODEL_PATH = os.path.join(
     _MODELS_DIR, os.environ.get("YOLO_INVERSION_MODEL", "yolo26n.pt")

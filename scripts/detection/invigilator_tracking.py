@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from model_config import DETECTION_MODEL_PATH as MODEL_PATH
+from model_config import PERSON_MODEL_PATH as MODEL_PATH  # fine-tuned person+monitor (person = 0)
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/invigilator_detection")
 
 # CAMERA CLASSIFICATION: Inside Lab

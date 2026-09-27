@@ -12,6 +12,8 @@ data:
   FLEET_HEARTBEAT_INTERVAL_S: "10"
   IS_MAIN_WORKER: "1"
   TZ: Asia/Kolkata
+  YOLO_PERSON_MODEL: monitor_person_model.pt   # fine-tuned, baked into the image (models_bundled/)
+  YOLO_PHONE_MODEL: phone_model.pt              # fine-tuned, baked into the image (models_bundled/)
   YOLO_DETECTION_MODEL: yolo26m.pt
   YOLO_INVERSION_MODEL: yolo26n.pt
   POLL_INTERVAL_MS: "30000"
