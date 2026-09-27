@@ -1114,7 +1114,7 @@ def rtsp_producer(cam_configs, queues, pre_fetched_token=None, enabled_scripts=N
 # ============================================================
 # RTSP PIPELINE RUNNER — FIXED: Better concurrency and lifecycle management
 # ============================================================
-def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
+def _run_rtsp_pipeline_legacy(camera_group, max_concurrent=MAX_CONCURRENT):
     """
     FIXED: 
     - Pre-authenticates per unique server ONCE in the parent process
@@ -1709,7 +1709,7 @@ def _hls_unified_capture(cfg, stop_event, unified_queue, state=None):
         cap.release()
 
 
-def run_hls_pipeline(camera_group):
+def _run_hls_pipeline_legacy(camera_group):
     if not (UNIFIED_DETECTOR and UNIFIED_HLS):
         return _run_hls_pipeline_per_script(camera_group)
 
@@ -1814,6 +1814,60 @@ def _run_hls_pipeline_per_script(camera_group):
 # ============================================================
 # MAIN
 # ============================================================
+# ============================================================
+# SCALING PATH B (DeepStream + TensorRT) — opt-in per worker with SCALE_PATH=B
+# ============================================================
+# Cameras whose analytics the shared detector serves run through
+# scripts/detection/pathb (GPU decode, TensorRT, stream budgets); anything else
+# (classical-CV tamper/inversion) keeps the existing path. SCALE_PATH unset or "A"
+# = unchanged behaviour. See docs/SCALING_PATH_B_IMPLEMENTATION.md.
+SCALE_PATH = os.environ.get("SCALE_PATH", "A").strip().upper()
+
+
+def _pathb_helpers():
+    """DSS helpers handed to Plan B (it must not re-import this __main__ module)."""
+    return {
+        "get_server_token": get_server_token,
+        "get_rtsp_cached": get_rtsp_cached,
+        "order_urls": order_urls,
+        "add_token_to_url": add_token_to_url,
+        "is_private_ip_url": is_private_ip_url,
+        "rr_resolve": _rr_resolve,
+        "startvideo_cache": _startvideo_cache,
+        "startvideo_cache_lock": _startvideo_cache_lock,
+    }
+
+
+def _run_with_pathb(camera_group, link_type, legacy_fn, *legacy_args):
+    from pathb.runner import run_pathb, split_for_pathb
+    pathb_cams, legacy_cams = split_for_pathb(camera_group)
+    logger.info("SCALE_PATH=B (%s): %d camera-analytic pairs on Plan B, %d on the existing path",
+                link_type, len(pathb_cams), len(legacy_cams))
+    t = None
+    if pathb_cams:
+        t = threading.Thread(target=run_pathb, name=f"PathB-{link_type}",
+                             args=(pathb_cams, link_type, _pathb_helpers(), lambda: STOP))
+        t.start()
+    try:
+        if legacy_cams:
+            legacy_fn(legacy_cams, *legacy_args)
+    finally:
+        if t is not None:
+            t.join()
+
+
+def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT):
+    if SCALE_PATH == "B":
+        return _run_with_pathb(camera_group, "RTSP", _run_rtsp_pipeline_legacy, max_concurrent)
+    return _run_rtsp_pipeline_legacy(camera_group, max_concurrent)
+
+
+def run_hls_pipeline(camera_group):
+    if SCALE_PATH == "B":
+        return _run_with_pathb(camera_group, "HLS", _run_hls_pipeline_legacy)
+    return _run_hls_pipeline_legacy(camera_group)
+
+
 def main():
     exam_id   = os.environ.get("EXAM_ID",  "").strip()
     shift_id  = os.environ.get("SHIFT_ID", "").strip()

@@ -1,0 +1,60 @@
+# Plan B model manifest — replaces model_config.py for the DeepStream path.
+#
+# One entry per model = one nvinfer element = one TensorRT engine. Every frame is
+# decoded once and run through the models its camera's analytics need (never one
+# model per analytic).
+#
+# weights / onnx / engine are relative to the models folder (repo-root models/,
+# bind-mounted; override with PATHB_MODELS_DIR). nvinfer_template is relative to
+# scripts/detection/. The runner fills the template with these values at start-up.
+#
+# class_map: model's own class index -> the COCO class id the analytics rules
+# expect. The rules hard-code COCO ids (0 person, 67 cell phone, 56 chair,
+# 60 dining table, 13 bench, ...), so a fine-tuned model with its own class list
+# must map onto them. `coco` = identity (model already uses COCO ids). Classes a
+# model outputs but that are not in an explicit map are dropped.
+
+models:
+  yolo26:
+    gie_id: 1
+    parser: NvDsInferParseYolo26          # end-to-end (NMS-free) output [300, 6]
+    weights: yolo26m.pt                   # TODO: point at the fine-tuned YOLO26 weights
+    onnx: pathb/yolo26.onnx
+    engine: pathb/yolo26_fp16.engine
+    nvinfer_template: pathb/configs/nvinfer_yolo26.txt
+    input_size: 640
+    num_classes: 80
+    precision: fp16
+    max_batch: 32
+    conf_threshold: 0.45                  # same base threshold as unified_detector.CONF_THRESHOLD
+    enabled: true
+    class_map: coco
+
+  rfdetr:
+    gie_id: 2
+    parser: NvDsInferParseRFDETR          # outputs `dets` [300, 4] cxcywh (0-1) + `labels` [300, C] logits
+    weights: rfdetr_finetuned.pth         # TODO: fine-tuned RF-DETR checkpoint
+    onnx: pathb/rfdetr.onnx
+    engine: pathb/rfdetr_fp16.engine
+    nvinfer_template: pathb/configs/nvinfer_rfdetr.txt
+    input_size: 560
+    num_classes: 2                        # EXAMPLE — the fine-tuned model's class count
+    precision: fp16                       # FP16 or FP8 — never INT8 for RF-DETR
+    max_batch: 16
+    conf_threshold: 0.50
+    enabled: false                        # switch on once fine-tuned weights + engine exist
+    class_map:                            # EXAMPLE — replace with the fine-tuned model's classes
+      0: 0                                # person
+      1: 67                               # cell phone
+
+# Which models each analytic reads boxes from. Boxes from several models are
+# merged. A disabled model is skipped, so an analytic falls back to the rest.
+analytics:
+  default: [yolo26]
+  phone: [yolo26, rfdetr]                 # person boxes from YOLO26, phones from RF-DETR
+
+# Analytics that need boxes below their model's conf_threshold. The engine keeps
+# boxes down to the lowest value here; every other analytic still only sees
+# boxes >= its model's conf_threshold.
+analytic_min_conf:
+  qp_box: 0.30                            # qp_box_det.CONF_THRESHOLD — yellow boxes score low

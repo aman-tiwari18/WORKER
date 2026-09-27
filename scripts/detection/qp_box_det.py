@@ -192,16 +192,18 @@ def _count_color_pixels_gpu(frame_np: np.ndarray, roi=None) -> int:
 
 
 # ── Core two-stage detector ───────────────────────────────────────────────────
-def _detect_qp_box(frame: np.ndarray):
+def _detect_qp_box(frame: np.ndarray, results=None):
     """
-    Stage 1: YOLO on GPU finds bounding boxes.
+    Stage 1: YOLO on GPU finds bounding boxes (or use `results` from Plan B's
+             shared TensorRT inference, already thresholded at CONF_THRESHOLD).
     Stage 2: GPU color check confirms each bbox contains target color.
     Fallback: global GPU color density if YOLO finds nothing.
 
     Returns: (found: bool, annotated_frame: np.ndarray, box_count: int)
     """
-    model   = get_yolo_model()
-    results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+    if results is None:
+        model   = get_yolo_model()
+        results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
 
     annotated  = frame.copy()
     found      = False
@@ -284,14 +286,17 @@ def detect_qp_box_in_frame(frame, device_id="unknown", camera_no="unknown",
 def detect_qp_box_batch(items, results=None):
     """
     Batch detection (called by the GPU batch worker).
-    `results` param kept for API compatibility — ignored since we run
-    YOLO internally with color verification per item.
+    `results` from the unified (Path A) detector are ignored — they are
+    thresholded at 0.45 and this detector needs 0.30, so it runs its own YOLO.
+    Plan B results (`from_pathb`) already carry the 0.30 threshold and are used
+    directly, avoiding a second inference.
     Returns list of (annotated_frame, violation_detected, box_count).
     """
     outputs = []
-    for item in items:
+    for i, item in enumerate(items):
         frame = item["frame"].copy()
-        qp_box_found, annotated, box_count = _detect_qp_box(frame)
+        shared = results[i] if results is not None and getattr(results[i], "from_pathb", False) else None
+        qp_box_found, annotated, box_count = _detect_qp_box(frame, shared)
         violation_detected = not qp_box_found
 
         status_text  = "QP BOX PRESENT" if qp_box_found else "QP BOX MISSING!"

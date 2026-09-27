@@ -1,0 +1,28 @@
+# nvinfer template for YOLO26 (end-to-end, NMS-free). The placeholders are
+# filled from pathb/models.yaml by pathb/nvinfer_config.py at start-up.
+[property]
+gpu-id={gpu_id}
+gie-unique-id={gie_id}
+process-mode=1
+network-type=0
+onnx-file={onnx}
+model-engine-file={engine}
+batch-size={batch}
+network-mode={network_mode}
+num-detected-classes={num_classes}
+# Ultralytics preprocessing: RGB, /255, letterbox with centred padding
+model-color-format=0
+net-scale-factor=0.0039215697906911373
+maintain-aspect-ratio=1
+symmetric-padding=1
+# NMS-free head -> no clustering
+cluster-mode=4
+output-blob-names=output0
+parse-bbox-func-name={parser}
+custom-lib-path={parser_lib}
+
+[class-attrs-all]
+# lowest confidence any analytic needs from this model; per-analytic thresholds
+# are applied afterwards in pathb/boxes.py
+pre-cluster-threshold={threshold}
+topk=300

@@ -48,7 +48,10 @@ def _capabilities() -> dict:
         "detector": _truthy("ENABLE_DETECTION", "1"),
         "vllm": _truthy("ENABLE_VLLM", "0"),
         "nvdec": _truthy("USE_NVDEC", "0"),
-        "unified_detector": _truthy("UNIFIED_DETECTOR", "0"),
+        # Same default as master_pipeline.UNIFIED_DETECTOR ("1"), so an unset env
+        # isn't reported as off while the pipeline actually runs unified.
+        "unified_detector": _truthy("UNIFIED_DETECTOR", "1"),
+        "scale_path": os.getenv("SCALE_PATH", "A").strip().upper() or "A",
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT", ""),
     }

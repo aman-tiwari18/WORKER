@@ -1,0 +1,29 @@
+# nvinfer template for RF-DETR. The placeholders are filled from
+# pathb/models.yaml by pathb/nvinfer_config.py at start-up.
+[property]
+gpu-id={gpu_id}
+gie-unique-id={gie_id}
+process-mode=1
+network-type=0
+onnx-file={onnx}
+model-engine-file={engine}
+batch-size={batch}
+network-mode={network_mode}
+num-detected-classes={num_classes}
+# RF-DETR preprocessing: RGB, square resize (no letterbox), ImageNet normalisation.
+# nvinfer takes one scale for all channels: 1/(0.226*255) ~ mean of the ImageNet
+# stds (0.229, 0.224, 0.225); per-channel means as offsets. Check the accuracy
+# against the PyTorch model after export (pathb/export/validate_engine.py).
+model-color-format=0
+net-scale-factor=0.017352074
+offsets=123.675;116.28;103.53
+maintain-aspect-ratio=0
+# DETR heads are NMS-free -> no clustering
+cluster-mode=4
+output-blob-names=dets;labels
+parse-bbox-func-name={parser}
+custom-lib-path={parser_lib}
+
+[class-attrs-all]
+pre-cluster-threshold={threshold}
+topk=300
