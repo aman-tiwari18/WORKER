@@ -46,6 +46,8 @@ def _install_fake_deepstream():
     mod.DsPipeline = FakeDsPipeline
     mod.start_main_loop = lambda: None
     mod.stop_main_loop = lambda: None
+    mod.FDS_PER_SOURCE = 16
+    mod.raise_fd_limit = lambda needed: (65536, 65536)
     sys.modules["pathb.ds_pipeline"] = mod
 
 
@@ -100,3 +102,19 @@ def test_run_pathb_end_to_end():
     hits = [f for f in os.listdir(out) if f.startswith("proximity_")]
     assert hits, "expected proximity hits saved by the dry run"
     return f"{len(hits)} annotated hit(s) in {out}"
+
+
+def test_fit_budget_never_starves_a_recorder():
+    """Load test on DeepStream found 84 of 120 cameras never opened: all were 'held'
+    but a recorder only gets 6 streams. Over-limit recorders must rotate instead."""
+    from pathb.sources import Resolver
+    res = Resolver("RTSP", None)
+    cfgs = [{"camera_id": f"dvr{d}", "ch_no": str(ch), "cctv_url": f"file:///v{d}_{ch}.mp4",
+             "enabled_scripts": ["crowd"]} for d in range(3) for ch in range(1, 11)]      # 3 DVRs x 10 cams
+    cfgs += [{"camera_id": "small", "ch_no": str(ch), "cctv_url": f"file:///s{ch}.mp4",
+              "enabled_scripts": ["crowd"]} for ch in range(1, 5)]                          # 1 DVR x 4 cams
+    keys = {runner.camera_key(c, "RTSP") for c in cfgs}
+    held = runner.fit_budget(keys, cfgs, "RTSP", res, per_server=50, per_device=6)
+    assert held == {f"small_{ch}" for ch in range(1, 5)}          # only the recorder that fits is held
+    held = runner.fit_budget(keys, cfgs, "RTSP", res, per_server=20, per_device=0)
+    assert len(held) == 10                                         # server can't fit all 34 -> half its limit

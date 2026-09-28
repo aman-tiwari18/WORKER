@@ -10,16 +10,18 @@ The probe hands (camera, raw boxes, frame-or-None, box space) to a callback. A
 full frame is copied from the GPU only when `want_frame` says that camera is due
 for evaluation; otherwise only box metadata leaves the GPU.
 
-Streammux: the NEW nvstreammux is used by default (PATHB_NEW_STREAMMUX=1). It
-batches frames at their own resolution, so nvinfer letterboxes each camera
-straight from its native frame, exactly like Ultralytics does on Path A. The
-legacy mux first resizes every camera to one width x height (no aspect ratio);
-on the test videos that extra resize changed ~8% of person boxes vs Path A
-(re-encoding a frame alone changes ~3%), and 6-7% of crowd/proximity results.
-Set PATHB_NEW_STREAMMUX=0 to fall back to the legacy mux.
+Streammux: the classic nvstreammux, which scales every camera to one fixed
+mux_width x mux_height (default 1920x1080), so box coordinates are always in a
+known space. The new nvstreammux (USE_NEW_NVSTREAMMUX) was tried and dropped:
+tested on DeepStream 7.1, nvurisrcbin's converter scales every source to the
+resolution of whichever camera attached FIRST, which changes as cameras rotate.
+The frame handed to the rules is resized back to the camera's own resolution
+(boxes are scaled to it in to_detections), so rules and saved evidence keep the
+camera's aspect ratio. 1920x1080 cameras (most DSS channels) are never resized.
 
 Requires the DeepStream SDK + pyds (DeepStream container, see deploy/deepstream/).
 """
+import ctypes
 import logging
 import os
 import threading
@@ -27,10 +29,10 @@ import threading
 import cv2
 import numpy as np
 
-NEW_STREAMMUX = os.getenv("PATHB_NEW_STREAMMUX", "1").strip().lower() in ("1", "true", "yes")
-if NEW_STREAMMUX:
-    # read by the nvstreammux plugin when it loads, so it must be set before Gst.init
-    os.environ["USE_NEW_NVSTREAMMUX"] = "yes"
+# GStreamer's RTSP/HTTP sources ask GIO for proxy settings; GIO's libproxy backend
+# throws std::runtime_error("Unable to read configuration") inside the container and
+# aborts the whole process on the first live stream. The workers use no proxy.
+os.environ.setdefault("GIO_USE_PROXY_RESOLVER", "dummy")
 
 import gi  # noqa: E402
 
@@ -40,6 +42,26 @@ from gi.repository import GLib, Gst  # noqa: E402
 import pyds  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+_BUS_LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parsers", "libpathb_bus.so")
+
+
+def _drop_qos_messages(bus):
+    """Drop decoder QoS messages before they reach the bus queue (see parsers/pathb_bus.c).
+
+    Keyframes-only decoding makes every skipped frame post a QoS message (~24 per
+    camera per second); left alone they jam the bus and stall the pipeline. Uses the
+    C filter so no Python runs per message; falls back to a Python sync handler."""
+    try:
+        lib = ctypes.CDLL(_BUS_LIB)
+        get = ctypes.pythonapi.PyCapsule_GetPointer
+        get.restype, get.argtypes = ctypes.c_void_p, [ctypes.py_object, ctypes.c_char_p]
+        lib.pathb_drop_qos_messages.argtypes = [ctypes.c_void_p]
+        lib.pathb_drop_qos_messages(get(bus.__gpointer__, None))
+    except (OSError, AttributeError) as exc:
+        log.warning("[PathB] %s unavailable (%s); dropping QoS messages in Python", _BUS_LIB, exc)
+        bus.set_sync_handler(lambda b, m: Gst.BusSyncReply.DROP
+                             if m.type == Gst.MessageType.QOS else Gst.BusSyncReply.PASS)
 
 _loop = None
 _loop_users = 0
@@ -65,6 +87,28 @@ def stop_main_loop():
         if _loop is not None and _loop_users == 0:
             _loop.quit()
             _loop = None
+
+
+FDS_PER_SOURCE = 16   # measured ~11.5 open files per nvurisrcbin (decoder, sockets, polls)
+
+
+def raise_fd_limit(needed):
+    """Raise this process's open-file soft limit to its hard limit.
+
+    Every source holds ~12 file descriptors, and during rotation the old decoder
+    still holds its fds while the new one opens. At Docker's default soft limit
+    (1024) ~80 sources exhaust it: new decoders fail with "Failed to allocate
+    required memory" or the pipeline silently stops. Returns (soft, hard)."""
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    want = hard if hard != resource.RLIM_INFINITY else max(soft, needed, 65536)
+    if soft < want:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+        soft = want
+    if soft < needed:
+        log.warning("[PathB] open-file limit %d is below the ~%d needed; raise the container's "
+                    "nofile ulimit or lower PATHB_MAX_SOURCES_PER_PIPELINE", soft, needed)
+    return soft, hard
 
 
 def _make(factory, name, **props):
@@ -99,20 +143,22 @@ class DsPipeline:
         self.gpu_id = gpu_id
         self._on_frame, self._want_frame, self._on_error = on_frame, want_frame, on_source_error
         self._sources = {}   # source id -> nvurisrcbin
+        self._stopping = False
         Gst.init(None)
         self._build(model_configs)
 
     # ---------------------------------------------------------------- build
     def _build(self, model_configs):
         p = self.pipeline = Gst.Pipeline.new(f"pathb-{self.name}")
-        self.mux = _make("nvstreammux", "mux", **{"batch-size": self.max_sources})
-        _try_set(self.mux, "batched-push-timeout", 40000)
-        if not NEW_STREAMMUX:
-            # legacy mux scales every camera to one size; CUDA unified memory (3)
-            # so the probe can map a frame on dGPU when needed
-            for prop, value in (("width", self.mux_width), ("height", self.mux_height),
-                                ("live-source", 1), ("gpu-id", self.gpu_id), ("nvbuf-memory-type", 3)):
-                _try_set(self.mux, prop, value)
+        # CUDA unified memory (3) so the probe can map a frame on dGPU when needed.
+        self.mux = _make("nvstreammux", "mux", **{
+            "batch-size": self.max_sources, "width": self.mux_width, "height": self.mux_height,
+            "live-source": 1, "batched-push-timeout": 40000, "gpu-id": self.gpu_id,
+            "nvbuf-memory-type": 3})
+        # Without this the mux ends the whole pipeline (EOS) the moment every source
+        # is gone — e.g. all cameras rotating out in one tick, or a network outage —
+        # and no source added afterwards ever produces a frame again.
+        _try_set(self.mux, "drop-pipeline-eos", True)
         chain = [self.mux]
         for model_name, cfg_path in model_configs:
             chain.append(_make("nvinfer", f"infer-{model_name}", **{
@@ -128,6 +174,7 @@ class DsPipeline:
                 raise RuntimeError(f"cannot link {a.get_name()} -> {b.get_name()}")
         sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._probe)
         bus = p.get_bus()
+        _drop_qos_messages(bus)
         bus.add_signal_watch()
         bus.connect("message", self._on_bus)
 
@@ -136,8 +183,26 @@ class DsPipeline:
             raise RuntimeError(f"pipeline {self.name} failed to start")
         log.info("[PathB] pipeline %s playing (max %d sources)", self.name, self.max_sources)
 
-    def stop(self):
-        self.pipeline.set_state(Gst.State.NULL)
+    def stop(self, timeout=None):
+        """Stop everything in one go: setting the pipeline to NULL takes every source
+        down with it. Runs ON the GLib thread, like _add/_remove, so it can never
+        overlap a source add/remove — under overload (cameras being dropped at the
+        moment of shutdown) the two raced for the state locks and deadlocked."""
+        self._stopping = True
+        done = threading.Event()
+
+        def _do():
+            self.pipeline.get_bus().remove_signal_watch()
+            self.pipeline.set_state(Gst.State.NULL)
+            self._sources.clear()
+            done.set()
+            return False
+
+        # tearing down a source takes ~0.1-0.2 s; 300 sources took over 20 s
+        timeout = timeout or max(20.0, 0.25 * len(self._sources))
+        GLib.idle_add(_do)
+        if not done.wait(timeout):
+            log.error("[PathB] pipeline %s did not stop within %.0fs", self.name, timeout)
 
     # -------------------------------------------------------------- sources
     def add_source(self, sid, uri):
@@ -148,6 +213,8 @@ class DsPipeline:
         GLib.idle_add(self._remove, sid)
 
     def _add(self, sid, uri):
+        if self._stopping:
+            return False
         if sid in self._sources:
             self._remove(sid)
         src = _make("nvurisrcbin", f"src-{sid}", uri=uri)
@@ -173,10 +240,13 @@ class DsPipeline:
             log.error("[PathB] %s: could not link source %d", self.name, sid)
 
     def _remove(self, sid):
+        if self._stopping:
+            return False
         src = self._sources.pop(sid, None)
         if src is None:
             return False
-        src.set_state(Gst.State.NULL)
+        if src.set_state(Gst.State.NULL) == Gst.StateChangeReturn.ASYNC:
+            src.get_state(5 * Gst.SECOND)   # the decoder must be really stopped before its pad goes
         sinkpad = self.mux.get_static_pad(f"sink_{sid}")
         if sinkpad is not None:
             sinkpad.send_event(Gst.Event.new_flush_stop(False))
@@ -202,16 +272,22 @@ class DsPipeline:
                 raw.append((om.unique_component_id, om.class_id, om.confidence,
                             r.left, r.top, r.width, r.height))
                 l_obj = l_obj.next
-            # coordinate space of rect_params: the camera's own frame (new mux)
-            # or the legacy mux's output size
-            if NEW_STREAMMUX:
-                space = (fm.source_frame_width, fm.source_frame_height)
-            else:
-                space = (self.mux_width, self.mux_height)
+            # rect_params are in the mux's output space
+            space = (self.mux_width, self.mux_height)
             frame = None
             if self._want_frame(self.group, sid):
                 surface = pyds.get_nvds_buf_surface(hash(buf), fm.batch_id)
-                frame = cv2.cvtColor(np.array(surface, copy=True, order="C"), cv2.COLOR_RGBA2BGR)
+                try:
+                    frame = cv2.cvtColor(np.array(surface, copy=True, order="C"), cv2.COLOR_RGBA2BGR)
+                finally:
+                    # every map must be undone on dGPU, or mapped surfaces pile up until
+                    # the buffer pool runs dry and the whole pipeline stalls (seen at
+                    # ~50 copies/s: frames fell from 55/s to 1/s within a minute)
+                    del surface
+                    pyds.unmap_nvds_buf_surface(hash(buf), fm.batch_id)
+                w, h = fm.source_frame_width, fm.source_frame_height
+                if w > 0 and h > 0 and (w, h) != (frame.shape[1], frame.shape[0]):
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)  # camera's own size
             try:
                 self._on_frame(self.group, sid, raw, frame, space=space)
             except Exception as exc:  # never let a callback error stall the stream
@@ -235,9 +311,16 @@ class DsPipeline:
                 log.error("[PathB] %s pipeline error: %s (%s)", self.name, err, dbg)
             else:
                 self._on_error(self.group, sid, str(err))
-        elif msg.type == Gst.MessageType.ELEMENT and pyds.gst_nvmessage_is_stream_eos(msg):
-            sid = pyds.gst_nvmessage_parse_stream_eos(msg)
-            self._on_error(self.group, sid, "end of stream")
+        elif msg.type == Gst.MessageType.ELEMENT:
+            # nvstreammux posts "stream-eos" with the source's pad index. Read the
+            # structure directly: pyds 1.2.0 has no gst_nvmessage_* bindings.
+            s = msg.get_structure()
+            if s is not None and s.get_name() == "stream-eos":
+                ok, sid = s.get_uint("stream-id")
+                if not ok:
+                    ok, sid = s.get_int("stream-id")
+                if ok:
+                    self._on_error(self.group, sid, "end of stream")
         elif msg.type == Gst.MessageType.WARNING:
             w, _ = msg.parse_warning()
             log.debug("[PathB] %s warning: %s", self.name, w)

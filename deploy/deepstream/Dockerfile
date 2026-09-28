@@ -61,6 +61,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 ENV SCALE_PATH=B
+# libproxy aborts the process on the first RTSP stream (see pathb/ds_pipeline.py)
+ENV GIO_USE_PROXY_RESOLVER=dummy
 
 # Same start-up as the standard worker image; Plan B is selected by SCALE_PATH.
 ENTRYPOINT ["docker-entrypoint.sh"]

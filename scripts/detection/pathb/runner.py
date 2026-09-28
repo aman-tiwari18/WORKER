@@ -14,18 +14,21 @@ Environment (all optional):
   PATHB_PERSISTENT_SHARE          0.5  max share of a group's slots for held cameras
   PATHB_DWELL_S                   20   rotating camera's time on a slot
   PATHB_STALL_S                   15   no frame for this long = dead stream
+  PATHB_MAX_STARTS_PER_TICK       8    new streams started per second (pace decoder creation)
+  PATHB_MAX_SWAPS_PER_TICK        8    rotating streams closed per second
+  PATHB_SLOT_REUSE_S              3    wait before a freed slot takes a new camera
   PATHB_EVAL_INTERVAL_S           2    run the rules on a camera at most this often
   PATHB_KEYFRAMES_ONLY            1    decode keyframes only (~1 frame / GOP)
   PATHB_EVAL_WORKERS / _QUEUE     8 / 64
   PATHB_BREAKER_FAILS / _COOLOFF_S 5 / 300
-  PATHB_NEW_STREAMMUX             1    keep each camera's resolution (see ds_pipeline)
-  PATHB_MUX_WIDTH / _HEIGHT       1920 / 1080  legacy streammux only
+  PATHB_MUX_WIDTH / _HEIGHT       1920 / 1080  batch size every camera is scaled to for inference
   PATHB_GPU_ID                    0
   PATHB_PROGRESS_EVERY            30
   PATHB_DRY_RUN_DIR               ""   save annotated hits here instead of DB/SMS (tests)
   PATHB_LOOP_FILES                0    loop file:// sources (tests)
 """
 import logging
+from collections import defaultdict
 import os
 import tempfile
 import time
@@ -86,8 +89,39 @@ def choose_persistent(cfgs, link_type, capacity, persistent_analytics, share):
     return set(picked[:limit])
 
 
+def fit_budget(keys, cfgs, link_type, resolver, per_server, per_device):
+    """Drop held cameras the stream budget could never keep open together.
+
+    A held camera never gives its slot up, so holding more cameras on a recorder
+    (or server) than its limit allows would leave the rest of that recorder's
+    cameras waiting forever. A recorder's cameras are held only if ALL of its
+    cameras fit its per-device limit; otherwise they all rotate through its slots.
+    A server whose cameras do not all fit keeps at most half its limit held, so
+    rotating cameras still get slots there.
+    """
+    per_dev, per_srv = defaultdict(list), defaultdict(list)
+    for c in cfgs:
+        k = camera_key(c, link_type)
+        per_dev[(resolver.server(c), resolver.device(c))].append(k)
+        per_srv[resolver.server(c)].append(k)
+    out, srv_held = set(), defaultdict(int)
+    for (srv, dev), ks in per_dev.items():
+        if dev is not None and per_device > 0 and len(ks) > per_device:
+            continue
+        for k in ks:
+            if k not in keys:
+                continue
+            fits_all = per_server <= 0 or len(per_srv[srv]) <= per_server
+            if not fits_all and srv_held[srv] >= per_server // 2:
+                continue
+            srv_held[srv] += 1
+            out.add(k)
+    return out
+
+
 def run_pathb(camera_group, link_type, helpers=None, should_stop=lambda: False):
-    from pathb.ds_pipeline import DsPipeline, start_main_loop, stop_main_loop  # needs DeepStream
+    from pathb.ds_pipeline import (FDS_PER_SOURCE, DsPipeline, raise_fd_limit,  # needs DeepStream
+                                   start_main_loop, stop_main_loop)
 
     link_type = link_type.upper()
     manifest = load_manifest()
@@ -110,15 +144,22 @@ def run_pathb(camera_group, link_type, helpers=None, should_stop=lambda: False):
         log.info("[PathB] %s: nothing to run", link_type)
         return
 
+    if link_type == "HLS":
+        per_server, per_device = _i("PATHB_MAX_STREAMS_PER_HLS_ORIGIN", 32), 0
+    else:
+        per_server, per_device = _i("PATHB_MAX_STREAMS_PER_DSS", 50), _i("PATHB_MAX_STREAMS_PER_DEVICE", 6)
+    budget = StreamBudget(per_server, per_device)
+
+    # x2: during rotation an old decoder still holds its fds while its replacement opens
+    soft, hard = raise_fd_limit(FDS_PER_SOURCE * max_sources * len(groups) * 2 + 256)
+    log.info("[PathB %s] open-file limit %d (hard %d)", link_type, soft, hard)
+
     held = set()
     for cfgs in groups.values():
         held |= choose_persistent(cfgs, link_type, max_sources, persistent_analytics, share)
-    cams = make_cams([c for cfgs in groups.values() for c in cfgs], link_type, manifest, resolver, held)
-
-    if link_type == "HLS":
-        budget = StreamBudget(_i("PATHB_MAX_STREAMS_PER_HLS_ORIGIN", 32), 0)
-    else:
-        budget = StreamBudget(_i("PATHB_MAX_STREAMS_PER_DSS", 50), _i("PATHB_MAX_STREAMS_PER_DEVICE", 6))
+    all_cfgs = [c for cfgs in groups.values() for c in cfgs]
+    held = fit_budget(held, all_cfgs, link_type, resolver, per_server, per_device)
+    cams = make_cams(all_cfgs, link_type, manifest, resolver, held)
     breaker = CircuitBreaker(_i("PATHB_BREAKER_FAILS", 5), _f("PATHB_BREAKER_COOLOFF_S", 300))
     evaluator = EvaluatorPool(manifest, workers=_i("PATHB_EVAL_WORKERS", 8),
                               queue_size=_i("PATHB_EVAL_QUEUE", 64),
@@ -142,7 +183,10 @@ def run_pathb(camera_group, link_type, helpers=None, should_stop=lambda: False):
     manager = holder["m"] = StreamManager(
         cams, pipelines, max_sources, budget, breaker, resolver, evaluator, manifest, link_type,
         mux_width=mux_w, mux_height=mux_h, dwell_s=_f("PATHB_DWELL_S", 20),
-        stall_s=_f("PATHB_STALL_S", 15), eval_interval_s=_f("PATHB_EVAL_INTERVAL_S", 2))
+        stall_s=_f("PATHB_STALL_S", 15), eval_interval_s=_f("PATHB_EVAL_INTERVAL_S", 2),
+        max_starts_per_tick=_i("PATHB_MAX_STARTS_PER_TICK", 8),
+        max_swaps_per_tick=_i("PATHB_MAX_SWAPS_PER_TICK", 8),
+        slot_reuse_s=_f("PATHB_SLOT_REUSE_S", 3))
 
     start_main_loop()
     evaluator.start()
@@ -172,7 +216,6 @@ def run_pathb(camera_group, link_type, helpers=None, should_stop=lambda: False):
             time.sleep(1.0)
     finally:
         manager.shutdown()
-        time.sleep(0.5)
         for p in pipelines.values():
             p.stop()
         evaluator.stop()

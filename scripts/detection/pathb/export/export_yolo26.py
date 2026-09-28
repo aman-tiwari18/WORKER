@@ -30,7 +30,8 @@ def main():
     spec = load_manifest().models[args.model]
     exported = YOLO(spec.weights).export(
         format="onnx", dynamic=True, imgsz=spec.input_size, opset=args.opset,
-        simplify=True, half=False)
+        simplify=True, half=False,
+        nms=False)  # NMS-free head; newer Ultralytics (8.4.1xx) exports the raw head unless nms=False
 
     inputs, outputs = output_shapes(exported)
     print(f"inputs  {inputs}\noutputs {outputs}")

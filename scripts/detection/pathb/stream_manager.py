@@ -44,7 +44,12 @@ class StreamManager:
     def __init__(self, cams, pipelines, max_sources, budget, breaker, resolver, evaluator,
                  manifest, link_type, mux_width=1920, mux_height=1080, dwell_s=20.0,
                  stall_s=15.0, eval_interval_s=2.0, resolve_workers=16, clock=time.monotonic,
-                 executor=None):
+                 executor=None, max_starts_per_tick=0, max_swaps_per_tick=0, slot_reuse_s=0.0):
+        """max_starts_per_tick / max_swaps_per_tick (0 = no limit) and slot_reuse_s pace
+        stream churn: on DeepStream, swapping dozens of sources at once made every new
+        decoder fail to allocate ("Failed to allocate required memory") and then took
+        the whole pipeline down (cudaErrorIllegalAddress). Rotation is spread over
+        ticks, and a freed slot is only reused once its old decoder had time to go."""
         self.link_type = link_type
         self.pipelines = pipelines                       # group -> DsPipeline
         self.budget, self.breaker, self.resolver = budget, breaker, resolver
@@ -53,7 +58,9 @@ class StreamManager:
         self.dwell_s, self.stall_s, self.eval_interval_s = dwell_s, stall_s, eval_interval_s
         self.clock = clock
         self.cams = cams
-        self.free = {g: deque(range(max_sources)) for g in pipelines}
+        self.max_starts_per_tick, self.max_swaps_per_tick = max_starts_per_tick, max_swaps_per_tick
+        self.slot_reuse_s = slot_reuse_s
+        self.free = {g: deque((0.0, sid) for sid in range(max_sources)) for g in pipelines}  # (ready_at, sid)
         self.by_sid = {}                                  # (group, sid) -> Cam
         self.rotation = deque(c for c in cams if not c.persistent)
         self.executor = executor if executor is not None else ThreadPoolExecutor(
@@ -68,7 +75,7 @@ class StreamManager:
         return cam is not None and self.clock() - cam.last_eval >= self.eval_interval_s
 
     def on_frame(self, group, sid, raw, frame, space=None):
-        """space: (w, h) the raw boxes are in; default the legacy mux size."""
+        """space: (w, h) the raw boxes are in; default the mux size."""
         cam = self.by_sid.get((group, sid))
         if cam is None:
             return
@@ -100,6 +107,7 @@ class StreamManager:
     def tick(self):
         now = self.clock()
         waiting = any(c.state == IDLE and c.retry_at <= now for c in self.rotation)
+        swaps = 0
         for cam in self.cams:
             if cam.state == RESOLVING and cam.future.done():
                 self._finish_resolve(cam, now)
@@ -109,10 +117,16 @@ class StreamManager:
                     reason = cam.error or f"no frame for {self.stall_s:.0f}s"
                     log.info("[PathB] %s: dropping stream (%s)", cam.key, reason)
                     self._stop(cam, now, failed=True)
-                elif not cam.persistent and waiting and now - cam.since >= self.dwell_s:
+                elif (not cam.persistent and waiting and now - cam.since >= self.dwell_s
+                      and not (self.max_swaps_per_tick and swaps >= self.max_swaps_per_tick)):
                     self._stop(cam, now, failed=False)
+                    swaps += 1
+        starts = 0
         for cam in self._candidates(now):
-            if not self.free[cam.group]:
+            if self.max_starts_per_tick and starts >= self.max_starts_per_tick:
+                break
+            free = self.free[cam.group]
+            if not free or free[0][0] > now:
                 continue
             if self.breaker.is_open(cam.server):
                 self.stats["breaker_skipped"] += 1
@@ -120,7 +134,8 @@ class StreamManager:
             if not self.budget.try_acquire(cam.server, cam.device):
                 self.stats["budget_blocked"] += 1
                 continue
-            cam.sid = self.free[cam.group].popleft()
+            cam.sid = free.popleft()[1]
+            starts += 1
             cam.state = RESOLVING
             cam.future = self.executor.submit(self.resolver.resolve, cam.cfg)
 
@@ -160,7 +175,7 @@ class StreamManager:
 
     def _release(self, cam):
         self.budget.release(cam.server, cam.device)
-        self.free[cam.group].append(cam.sid)
+        self.free[cam.group].append((self.clock() + self.slot_reuse_s, cam.sid))
         cam.sid, cam.state, cam.error = None, IDLE, None
 
     def _fail(self, cam, now):
@@ -174,9 +189,8 @@ class StreamManager:
         return sum(1 for c in self.cams if c.state == ACTIVE)
 
     def shutdown(self):
-        for cam in self.cams:
-            if cam.state == ACTIVE:
-                self.pipelines[cam.group].remove_source(cam.sid)
+        """Stop resolving. The pipelines themselves are stopped by DsPipeline.stop(),
+        which takes every source down at once (no per-source removal races)."""
         self.executor.shutdown(wait=False, cancel_futures=True)
 
 

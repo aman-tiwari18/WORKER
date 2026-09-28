@@ -165,3 +165,26 @@ def test_box_space_from_pipeline():
     sm.on_frame(g, sid, raw, frame)                   # legacy mux: 1920x1080 space
     d = ev.packets[-1]["detections"][0]
     assert np.allclose((d.x1, d.y2), (100 * 1570 / 1920, 450 * 882 / 1080))
+
+
+def test_rotation_is_paced():
+    """DeepStream load test: swapping ~36 sources at once made every new decoder fail
+    to allocate and crashed the pipeline. Starts/swaps per tick are capped and a freed
+    slot waits slot_reuse_s before the next camera gets it."""
+    sm, pipe, res, ev, now, cams = _setup(0, 12, max_sources=6)
+    sm.max_starts_per_tick, sm.max_swaps_per_tick, sm.slot_reuse_s = 2, 2, 3.0
+    started = []
+    for _ in range(4):
+        before = sum(1 for c in cams if c.state != IDLE)
+        _step(sm, now)
+        started.append(sum(1 for c in cams if c.state != IDLE) - before)
+    assert max(started) <= 2 and len(pipe.active) == 6        # 6 slots filled 2 per tick
+    now[0] += 20                                              # dwell over for everyone
+    removes = sum(1 for e in pipe.log if e[0] == "remove")
+    _step(sm, now, dt=0.0)
+    assert sum(1 for e in pipe.log if e[0] == "remove") - removes == 2   # only 2 swaps per tick
+    assert all(ready > now[0] for ready, _ in sm.free[G])     # freed slots are cooling down
+    assert sum(1 for c in cams if c.state != IDLE) == 4       # ...so nobody took them yet
+    _step(sm, now, dt=3.0)
+    assert sum(1 for c in cams if c.state != IDLE) >= 6 - 2 + 2 - 2  # refilled after the cool-down
+    assert any(c.state != IDLE for c in cams if c.key in ("c6", "c7", "c8"))
