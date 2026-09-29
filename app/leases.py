@@ -80,6 +80,12 @@ class LeaseClient:
             resp.raise_for_status()
             data = resp.json().get("data") or {}
 
+        if data.get("refused"):
+            # Operator drained this worker (Fleet page) or the backend thinks it is
+            # DEAD: take no new cameras. The caller skips the launch.
+            logger.info(f"leases: claim for assignment {assignment_id} refused — worker is {data['refused']}")
+            return {"refused": data["refused"]}
+
         claimed = data.get("claimed") or []
         if not claimed:
             logger.info(f"leases: no claimable shards for assignment {assignment_id} (other workers own them)")

@@ -443,6 +443,11 @@ class Poller:
             # Claim the camera shards this worker will own (plan §4.2). No-op
             # unless COORDINATION_MODE=lease, so hash mode is unaffected.
             lease = await self._claim_lease(assignment, assignment_id)
+            if lease and lease.get("refused"):
+                # Drained from the Fleet page: start nothing new here. The other
+                # workers claim these cameras; the finally block cleans up.
+                logger.info(f"⏸ Assignment {assignment_id} not started: worker is {lease['refused']}")
+                return
 
             result = await script_runner.execute_script(assignment, lease=lease)
 
