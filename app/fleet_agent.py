@@ -52,6 +52,9 @@ def _capabilities() -> dict:
         # How this worker splits cameras (Fleet page): "lease" = claimed shards,
         # rebalanced automatically; "hash" = static WORKER_INDEX/TOTAL_WORKERS split.
         "coordination_mode": os.getenv("COORDINATION_MODE", "hash").strip().lower() or "hash",
+        # Prometheus scrape target (Fleet /prometheus/sd): host LAN IP + port
+        "metrics_port": int(os.getenv("METRICS_PORT", "0") or 0) or None,
+        "vision": os.getenv("ENABLE_VISION", "1").strip().lower() in ("1", "true", "yes"),
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT", ""),
     }
@@ -82,6 +85,8 @@ class FleetAgent:
         self._registered = False
         self._stopping = False
         self._started_at = time.time()
+        # RETIRED on the Fleet page: take no work, hold no leases, until resumed.
+        self.retired = False
 
     # ── payloads ────────────────────────────────────────────────────────────
     def _register_payload(self) -> dict:
@@ -92,6 +97,8 @@ class FleetAgent:
             "worker_id": self.worker_id,
             "name": WORKER_NAME,
             "hostname": os.getenv("WORKER_HOSTNAME") or socket.gethostname(),
+            # LAN IP of the host (set by the Fleet bootstrap) — Prometheus scrapes it
+            "ip_address": os.getenv("WORKER_HOST_IP") or None,
             "gpu_index": first.get("gpu_id"),
             "gpu_name": first.get("name"),
             "gpu_uuid": first.get("uuid"),
@@ -125,6 +132,7 @@ class FleetAgent:
         )
         resp.raise_for_status()
         self._registered = True
+        await self._apply_status(((resp.json() or {}).get("data") or {}).get("status"))
         logger.info(f"fleet: registered {self.worker_id} with backend (heartbeat every {HEARTBEAT_INTERVAL_S}s)")
         return True
 
@@ -142,6 +150,33 @@ class FleetAgent:
             await self.register(client)
             return
         resp.raise_for_status()
+        await self._apply_status(((resp.json() or {}).get("data") or {}).get("status"))
+
+    async def _apply_status(self, status) -> None:
+        """React to an operator action on the Fleet page. RETIRED: stop everything
+        this worker runs and hand its camera shards back, then idle (the container
+        may keep restarting; it stays idle). Anything else: normal operation."""
+        retired = str(status or "").upper() == "RETIRED"
+        if retired == self.retired:
+            return
+        self.retired = retired
+        if not retired:
+            logger.info("fleet: resumed from the Fleet page — taking work again")
+            return
+        logger.warning("fleet: RETIRED from the Fleet page — stopping all work and releasing leases")
+        try:
+            from app.poller import poller_service
+            from app.script_runner import script_runner
+            for key in list(getattr(poller_service, "running_scripts", set())):
+                try:
+                    await script_runner.cancel(key)   # run_assignment's finally releases the lease
+                except Exception as exc:
+                    logger.warning(f"fleet: could not stop {key} on retire: {exc}")
+            for task in list(getattr(poller_service, "scheduled_scripts", {}).values()):
+                task.cancel()
+            poller_service.scheduled_scripts.clear()
+        except Exception as exc:
+            logger.error(f"fleet: retire cleanup failed: {exc}")
 
     # ── loop ────────────────────────────────────────────────────────────────
     async def _loop(self) -> None:

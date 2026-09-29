@@ -22,6 +22,8 @@ IS_MAIN_WORKER = (
 # master_pipeline process per worker (shared YOLO, fan-out to every analytic)
 # instead of one process per analytic. Set GROUP_DETECTION_ANALYTICS=0 to revert.
 GROUP_DETECTION_ANALYTICS = os.environ.get("GROUP_DETECTION_ANALYTICS", "1") == "1"
+# 0 = never run vision classification here (no local vLLM); see queue_assignment.
+ENABLE_VISION = os.getenv("ENABLE_VISION", "1").strip().lower() in ("1", "true", "yes")
 
 class Poller:
     def __init__(self):
@@ -51,6 +53,10 @@ class Poller:
         self.group_members = {}      # group_key -> [member execution_ids] (grouped detection)
         self.group_analytics = {}    # group_key -> set(analytics) currently launched
         self.group_relaunching = set()  # group_keys mid-relaunch (membership grew)
+        # lease mode: backend assignment id -> (poller key, assignment) for rebalance relaunches
+        self._lease_keys = {}
+        self._lease_waiting = set()     # poller keys waiting for shards (not running)
+        self._lease_relaunching = set() # poller keys restarting after a rebalance (keep shards)
         self._poll_task = None
 
         # --- Crash backoff tracking (merged from worker poller) ---
@@ -178,6 +184,8 @@ class Poller:
             return
 
         logger.info("Starting poller service...")
+        from app.leases import lease_client
+        lease_client.on_change = self._on_lease_change
         self.is_running = True
 
         # Poll immediately then loop
@@ -317,6 +325,19 @@ class Poller:
         assignment_id = str(assignment["id"])
         already_running = str(assignment.get("status", "")).upper() == "RUNNING"
 
+        # A rebalance restart is in flight for this assignment — don't double-launch.
+        if assignment_id in self._lease_relaunching:
+            return
+        # Retired from the Fleet page: this worker takes no work at all.
+        from app.fleet_agent import fleet_agent
+        if fleet_agent.retired:
+            return
+        # Detection-only servers (ENABLE_VISION=0, e.g. a server added from the
+        # Fleet page without a local vLLM) leave vision classification to the
+        # workers that have it.
+        if not ENABLE_VISION and self._is_vision(assignment):
+            return
+
         grouped = assignment.get("_analytics")
         # A relaunch (membership grew) is in flight — don't double-launch.
         if grouped and assignment_id in self.group_relaunching:
@@ -448,6 +469,15 @@ class Poller:
                 # workers claim these cameras; the finally block cleans up.
                 logger.info(f"⏸ Assignment {assignment_id} not started: worker is {lease['refused']}")
                 return
+            if lease is not None and not lease.get("shards"):
+                # Lease mode, no shards free yet (the other workers hold them all).
+                # Do not run — without shards the pipeline would fall back to the
+                # static hash split and duplicate cameras. The balance loop relaunches
+                # this assignment as soon as a fair share frees up.
+                self._lease_waiting.add(assignment_id)
+                logger.info(f"⏳ Assignment {assignment_id}: no camera shards free yet — waiting for a rebalance")
+                return
+            self._lease_waiting.discard(assignment_id)
 
             result = await script_runner.execute_script(assignment, lease=lease)
 
@@ -559,6 +589,7 @@ class Poller:
         except (TypeError, ValueError, IndexError):
             logger.warning(f"leases: cannot resolve a backend id for {assignment_id}; running unleased")
             return None
+        self._lease_keys[target] = (assignment_id, assignment)
         try:
             return await lease_client.claim(
                 target,
@@ -575,6 +606,10 @@ class Poller:
         from app.leases import lease_client
         if not lease_client.is_enabled():
             return
+        # Restarting after a rebalance, or waiting for shards: keep what we hold
+        # (and keep watching) — the next run uses exactly these shards.
+        if assignment_id in self._lease_relaunching or assignment_id in self._lease_waiting:
+            return
         for real_id in self.group_members.get(assignment_id, [assignment_id]):
             try:
                 await lease_client.release(int(real_id))
@@ -582,6 +617,33 @@ class Poller:
                 continue
             except Exception as exc:
                 logger.warning(f"leases: release failed for {real_id}: {exc}")
+
+    async def _on_lease_change(self, backend_id):
+        """The balance loop changed this worker's shards for an assignment: restart
+        it with the new set (or start it, if it was waiting for shards)."""
+        entry = self._lease_keys.get(int(backend_id))
+        if not entry:
+            return
+        key, assignment = entry
+        from app.leases import lease_client
+        held = lease_client.owned(int(backend_id))
+        if key in self.running_scripts:
+            logger.info(f"[lease] {key}: shards changed — restarting with {len((held or {}).get('shards') or ())} shard(s)")
+            self._lease_relaunching.add(key)
+            try:
+                await script_runner.cancel(key)
+                for _ in range(60):                  # wait for the old run's finally
+                    if key not in self.running_scripts:
+                        break
+                    await asyncio.sleep(0.5)
+            finally:
+                self._lease_relaunching.discard(key)
+            if not held:
+                return                               # shed everything (drained): stay stopped
+        elif not held or key not in self._lease_waiting:
+            return
+        self._lease_waiting.discard(key)
+        asyncio.create_task(self.run_assignment(assignment))
 
     async def update_assignment_status(self, assignment_id, status, data=None):
         if data is None:

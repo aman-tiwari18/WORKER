@@ -20,6 +20,19 @@ def _run_agent():
     from app.lifecycle import lifecycle_reconciler
     from app.logger import logger
 
+    # Prometheus: a read-only /metrics (GPU stats) on METRICS_PORT when set. The
+    # Fleet page's /fleet/prometheus/sd lists it as a scrape target, so a new
+    # server is monitored without editing prometheus.yml. Not an API: scrape only.
+    metrics_port = int(os.getenv("METRICS_PORT", "0") or 0)
+    if metrics_port:
+        try:
+            from prometheus_client import start_http_server
+            from app.metrics import registry
+            start_http_server(metrics_port, registry=registry)
+            logger.info(f"Prometheus /metrics on :{metrics_port}")
+        except Exception as exc:  # metrics must never stop detection
+            logger.warning(f"Prometheus /metrics not started on :{metrics_port}: {exc}")
+
     async def _main():
         logger.info("Headless worker agent starting (poller + fleet registry + lifecycle; no HTTP API / socket.io)")
         # Register/heartbeat first so the backend sees the worker even if it has
