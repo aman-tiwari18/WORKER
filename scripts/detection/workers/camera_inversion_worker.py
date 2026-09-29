@@ -89,12 +89,11 @@ def _load_models():
     if _yolo_model is not None: return
 
     from ultralytics import YOLO
-    from model_config import INVERSION_MODEL_PATH
-
-    # YOLO — single source of truth in model_config.py (YOLO_INVERSION_MODEL env var)
-    yolo_path = INVERSION_MODEL_PATH
+    
+    # YOLO
+    yolo_path = os.path.join(DETECTION_ROOT, "models/yolo11n.pt")
     if not os.path.exists(yolo_path):
-        yolo_path = os.path.basename(yolo_path)  # fall back to ultralytics auto-download
+        yolo_path = "yolo11n.pt"
     _yolo_model = YOLO(yolo_path)
     if torch.cuda.is_available():
         _yolo_model.to('cuda')
@@ -119,52 +118,76 @@ def _load_models():
                 _classes.append(line.strip().split(" ")[0][3:])
 
 # ================= BATCH DETECTION =================
-# Orientation is decided from the burned-in OSD text (camera title / timestamp),
-# not scene content: scene models (YOLO count + Places365 confidence) flagged
-# upright cameras as inverted because the Places365 checkpoint is not shipped
-# and object counts are not orientation-specific. Text is only legible one way
-# up, so OCR score of the frame vs. its 180° rotation is a direct signal.
-# Cameras with no legible text yield no evidence and are never flagged.
-import re
-from collections import defaultdict, deque
-
-OCR_STRIP_FRAC      = float(os.environ.get("INVERSION_OCR_STRIP", "0.18"))   # top/bottom band scanned
-OCR_MIN_ROT_SCORE   = float(os.environ.get("INVERSION_OCR_MIN_SCORE", "8"))  # rotated text must be this legible
-OCR_RATIO           = float(os.environ.get("INVERSION_OCR_RATIO", "2.5"))    # ...and this many times better
-VOTE_WINDOW         = int(os.environ.get("INVERSION_VOTE_WINDOW", "5"))
-VOTE_MIN_HITS       = int(os.environ.get("INVERSION_VOTE_MIN_HITS", "2"))    # flagged frames needed in window
-
-_votes = defaultdict(lambda: deque(maxlen=VOTE_WINDOW))  # cam -> deque[bool|None]
-
-def _text_score(img):
-    """Legible-text score of the top+bottom bands (sum of len * conf for confident words)."""
-    import pytesseract
-    h = img.shape[0]
-    total = 0.0
-    for band in (img[: int(h * OCR_STRIP_FRAC)], img[int(h * (1 - OCR_STRIP_FRAC)):]):
-        g = cv2.cvtColor(band, cv2.COLOR_BGR2GRAY)
-        g = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        try:
-            d = pytesseract.image_to_data(g, config="--psm 11", output_type=pytesseract.Output.DICT, timeout=5)
-        except Exception:
-            continue
-        for t, c in zip(d["text"], d["conf"]):
-            t = re.sub(r"[^A-Za-z0-9]", "", t)
-            if len(t) >= 3 and float(c) >= 60:
-                total += len(t) * float(c) / 100.0
-    return total
-
 def _detect_orientation_batch(frames):
+    _load_models()
+    if not frames: return []
+
+    all_rotations = []
+    meta = []
+
+    for idx, frame in enumerate(frames):
+        rot_v = [
+            ("original", frame),
+            ("180", cv2.rotate(frame, cv2.ROTATE_180)),
+        ]
+        for name, img in rot_v:
+            all_rotations.append(img)
+            meta.append((idx, name, img))
+
+    # YOLO BATCH
+    results = _yolo_model(all_rotations, conf=0.35, verbose=False)
+    yolo_outs = []
+    for r in results:
+        boxes = r.boxes
+        count = len(boxes)
+        confs = [float(b.conf[0]) for b in boxes]
+        avg_conf = sum(confs)/len(confs) if confs else 0
+        yolo_outs.append((count, avg_conf))
+
+    # PLACES365 BATCH
+    tensors = [ _transform(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))) for f in all_rotations ]
+    batch_tensor = torch.stack(tensors)
+    if torch.cuda.is_available():
+        batch_tensor = batch_tensor.cuda()
+        
+    with torch.no_grad():
+        out = _places_model(batch_tensor)
+        probs = torch.nn.functional.softmax(out, dim=1)
+        scene_scores, _ = probs.topk(1)
+        scene_scores = scene_scores.squeeze(1).tolist()
+
+    # Free CUDA-resident intermediates before continuing
+    del batch_tensor, out, probs, tensors, results, all_rotations
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    scores_by_idx = {}
+    for (idx, name, img), (obj_count, obj_conf), scene_conf in zip(meta, yolo_outs, scene_scores):
+        score = obj_count * obj_conf + scene_conf
+        scores_by_idx.setdefault(idx, {})[name] = score
+
+    # Only call it "inverted" when the 180° candidate clearly beats the
+    # original — a marginal win is more likely model noise than a real
+    # upside-down feed, and used to produce false positives. Also require
+    # the winning score to clear an absolute floor, since two near-zero
+    # scores (e.g. on grainy/IR frames) can satisfy the relative margin
+    # on noise alone.
     outputs = []
-    for frame in frames:
-        orig = _text_score(frame)
-        rot = _text_score(cv2.rotate(frame, cv2.ROTATE_180))
-        is_inv = rot >= OCR_MIN_ROT_SCORE and rot >= orig * OCR_RATIO
+    for i in range(len(frames)):
+        scores = scores_by_idx.get(i, {})
+        orig_score = scores.get("original", 0.0)
+        rot_score = scores.get("180", 0.0)
+        is_inverted = (
+            rot_score > 0
+            and rot_score > orig_score * (1 + INVERSION_SCORE_MARGIN)
+            and rot_score >= INVERSION_MIN_ABS_SCORE
+        )
         outputs.append({
-            "orientation": "180" if is_inv else "original",
-            "orig_score": orig,
-            "rot_score": rot,
+            "orientation": "180" if is_inverted else "original",
+            "orig_score": orig_score,
+            "rot_score": rot_score,
         })
+
     return outputs
 
 # ================= GPU WORKER =================
@@ -173,7 +196,8 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
     """
     GPU batch worker — TRUE batch inference.
     """
-    logger.info("🚀 [Inversion] GPU worker started (OCR orientation, multi-frame vote)")
+    logger.info("🚀 [Inversion] GPU worker started (true batch mode)")
+    _load_models()
     
     last_save_time = {}
 
@@ -202,14 +226,11 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
                 logger.info(
                     f"[Inversion] scores cam={cam_id} ch={ch_no} "
                     f"orig={result['orig_score']:.3f} rot180={result['rot_score']:.3f} "
-                    f"min_rot={OCR_MIN_ROT_SCORE} ratio={OCR_RATIO} "
+                    f"margin={INVERSION_SCORE_MARGIN} min_abs={INVERSION_MIN_ABS_SCORE} "
                     f"-> {orientation}"
                 )
 
-                # Multi-frame vote: a single frame never flags a camera.
-                hist = _votes[cam_id]
-                hist.append(orientation != "original")
-                if sum(hist) < VOTE_MIN_HITS:
+                if orientation == "original":
                     continue
 
                 now = time.time()
@@ -230,7 +251,9 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
                 else:
                     fname = f"{script_name}_{cam_id}_{ch_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
                 
-                path = os.path.join(save_folder, fname)
+                # The queue entry serves both sources (HLS frames come from the unified
+                # HLS capture), so the folder follows the frame, not the worker.
+                path = os.path.join(HLS_SAVE_FOLDER if item.get("source_type") == "HLS" else save_folder, fname)
                 # Save the raw frame as received — not the 180°-rotated candidate —
                 # so the snapshot shows the camera's actual orientation as proof,
                 # instead of a software-flipped copy with an upside-down OSD.
@@ -298,8 +321,12 @@ def camera_inversion_worker(frame_queue):
                 frame        = packet.get("frame")
                 device_id    = str(packet.get("device_id", "unknown"))
                 camera_no    = str(packet.get("camera_no") or packet.get("ch_no") or "0")
+                exam_id      = str(packet.get("exam_id", "0"))
+                shift_id     = str(packet.get("shift_id") or os.environ.get("SHIFT_ID", "0"))
+                source_type  = packet.get("source_type") or "RTSP"
             else:
                 frame, device_id, camera_no, _, exam_id = packet[:5]
+                shift_id, source_type = os.environ.get("SHIFT_ID", "0"), "RTSP"
 
             if frame is None:
                 continue
@@ -310,8 +337,8 @@ def camera_inversion_worker(frame_queue):
                     "device_id":    device_id,
                     "ch_no":        camera_no,
                     "exam_id":      exam_id,
-                    "shift_id":     os.environ.get("SHIFT_ID", "0"),
-                    "source_type":  "RTSP",
+                    "shift_id":     shift_id,
+                    "source_type":  source_type,
                 }, timeout=0.1)
             except queue.Full:
                 pass

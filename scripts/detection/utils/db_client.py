@@ -452,6 +452,9 @@ def _ensure_status_column(conn):
         "ALTER TABLE camera_links_hls ADD COLUMN status VARCHAR(255) DEFAULT NULL",
         "ALTER TABLE camera_links_rtsp ADD COLUMN status VARCHAR(255) DEFAULT NULL",
         "ALTER TABLE camera_links_rtsp ADD COLUMN frame_path TEXT DEFAULT NULL",
+        # Proximity repeat counter (mirrors migration 042).
+        "ALTER TABLE camera_report_hls ADD COLUMN violation_count INT NULL DEFAULT NULL",
+        "ALTER TABLE camera_report_rtsp ADD COLUMN violation_count INT NULL DEFAULT NULL",
         # Per-run classification history tables (mirrors migration 024).
         # Created here as well so workers come up cleanly without a manual migration step.
         """CREATE TABLE IF NOT EXISTS camera_classification_hls (
@@ -1087,7 +1090,9 @@ def _extract_unique_id_from_image_name(image_name: str) -> Optional[str]:
     return None
 
 
-def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detection") -> bool:
+def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detection",
+                     person_count: int = None, threshold: int = None,
+                     violation_count: int = None) -> bool:
     """
     Central HLS detection reporter.
 
@@ -1099,6 +1104,11 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
         image_name: filename of the saved detection image (no path)
         folder    : detection sub-folder name used in the image URL and
                     stored as detection_type (e.g. "crowd_detection_threshold")
+        person_count: people detected in the frame. Optional — analytics that do
+                    not count people leave it NULL. Consumed by the SMS layer.
+        threshold : the per-TC-code limit this detection crossed. Optional.
+        violation_count: proximity repeat count (1 = first time this pair was seen
+                    on this camera, 2, 3, ... = seen again). Optional.
 
     Returns:
         True on success, False on any failure.
@@ -1180,16 +1190,18 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
                     INSERT INTO camera_report_hls (
                         exam_id, shift_id, city, center_name, camera_id,
                         camera_name, camera_category, tc_code, ch_code,
-                        state, camera_status, events, date_time,
-                        imageurl, detection_type, unique_id, gpu_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        state, camera_status, events, person_count, threshold,
+                        date_time, imageurl, detection_type, unique_id, gpu_id,
+                        violation_count
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), cam.get('shift_id'), cam.get('city'),
                         cam.get('centre_name'), report_camera_id, camera_name,
                         cam.get('camera_category'), cam.get('tc_code'), ch_code,
-                        cam.get('state'), camera_status, 1, date_time, image_url, folder,
-                        unique_id, _GPU_ID,
+                        cam.get('state'), camera_status, 1, person_count, threshold,
+                        date_time, image_url, folder,
+                        unique_id, _GPU_ID, violation_count,
                     ),
                 )
             conn.commit()
@@ -1217,7 +1229,9 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
 # 📝  RTSP DETECTION REPORTING
 # ============================================================
 
-def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: str = "crowd_detection") -> bool:
+def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: str = "crowd_detection",
+                      person_count: int = None, threshold: int = None,
+                      violation_count: int = None) -> bool:
     """
     Central RTSP detection reporter.
 
@@ -1230,6 +1244,10 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
         image_name: filename of the saved detection image (no path)
         folder    : detection sub-folder name used in the image URL and
                     stored as detection_type.
+        person_count: people detected in the frame. Optional — analytics that do
+                    not count people leave it NULL. Consumed by the SMS layer.
+        threshold : the per-TC-code limit this detection crossed. Optional.
+        violation_count: proximity repeat count (see report_to_db_hls). Optional.
 
     Returns:
         True on success, False on any failure.
@@ -1308,16 +1326,18 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
                     INSERT INTO camera_report_rtsp (
                         exam_id, shift_id, city, center_name, camera_id,
                         device_id, camera_no, camera_name, tc_code,
-                        state, camera_status, events, date_time,
-                        imageurl, detection_type, unique_id, gpu_id
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        state, camera_status, events, person_count, threshold,
+                        date_time, imageurl, detection_type, unique_id, gpu_id,
+                        violation_count
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), shift_id, cam.get('city'),
                         cam.get('centre_name'), f"{device_id}_{camera_no}", device_id, camera_no,
                         camera_name, cam.get('tc_code'), cam.get('state'),
-                        camera_status, 1, date_time, image_url, folder,
-                        unique_id, _GPU_ID,
+                        camera_status, 1, person_count, threshold,
+                        date_time, image_url, folder,
+                        unique_id, _GPU_ID, violation_count,
                     ),
                 )
             conn.commit()

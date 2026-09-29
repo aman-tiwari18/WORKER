@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from model_config import PERSON_MODEL_PATH as MODEL_PATH  # fine-tuned person+monitor (person = 0)
+# UNIFIED_PERSON_MODEL=finetuned -> the fine-tuned person+monitor model (person = class 0)
+from detection_models import person_model_path
+MODEL_PATH = person_model_path(os.path.join(BASE_DIR, "models", "yolov10m.pt"))
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/proximity_detection")
 
 # CAMERA CLASSIFICATION: Inside Lab
@@ -235,7 +237,11 @@ def detect_proximity_in_frame(frame, device_id="unknown", camera_no="unknown", s
     return frame, violation_detected, len(violations)
 
 def detect_proximity_batch(items, results=None):
-    """Run true batch inference."""
+    """Run true batch inference.
+
+    Returns one (annotated_frame, violation_detected, violation_count, violation_pairs)
+    per item; violation_pairs = [(box_a, box_b), ...] as [x1, y1, x2, y2] lists.
+    """
     if results is None:
         model = get_yolo_model()
         frames = [item['frame'].copy() for item in items]
@@ -300,6 +306,9 @@ def detect_proximity_batch(items, results=None):
         cv2.putText(frame, f"CH: {ch_no}", (20, 85),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        outputs.append((frame, violation_detected, len(violations)))
+        # Boxes of each violating pair — proximity_repeat compares them with the
+        # camera's previous report to count repeat violations.
+        violation_pairs = [(person_boxes[i].tolist(), person_boxes[j].tolist()) for i, j, _ in violations]
+        outputs.append((frame, violation_detected, len(violations), violation_pairs))
 
     return outputs

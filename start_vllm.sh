@@ -42,7 +42,12 @@ exec vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
     --max-num-seqs 12 \
     --dtype bfloat16 \
     --moe-backend triton \
-    --enforce-eager
+    --enforce-eager \
+    --safetensors-load-strategy=prefetch
+# --safetensors-load-strategy=prefetch: read the 58 GB of weights in bulk. On a local
+# EXT4 disk vLLM otherwise loads them on demand at ~130 MB/s (38 s per shard, ~8 min)
+# while the disk reads sequentially at ~1.1 GB/s; the slow load blew the classifier's
+# startup limit on worker-0 (29 Sep, 21 Jun).
 # --moe-backend triton: forces the pre-compiled Triton MoE kernel instead of
 # FlashInfer CUTLASS. The CUTLASS path JIT-compiles its kernel with nvcc, which
 # is not installed in this environment (caused "Could not find nvcc" crash

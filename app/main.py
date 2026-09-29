@@ -3,6 +3,8 @@ import asyncio
 import re
 import os
 import time
+import threading
+import heapq
 import shutil
 import openpyxl
 from openpyxl.styles import Font
@@ -395,7 +397,7 @@ def _enrich_detection_item_from_report(item: dict, conn=None) -> dict:
                 cur.execute(
                     f"""
                     SELECT cr.shift_id, cr.tc_code, cr.gpu_id, cr.pushed_to_client,
-                           cr.pushed_by, es.shift_name
+                           cr.pushed_by, cr.violation_count, es.shift_name
                     FROM {table} AS cr
                     LEFT JOIN exam_shifts AS es ON es.id = cr.shift_id
                     WHERE cr.unique_id = %s
@@ -424,6 +426,8 @@ def _enrich_detection_item_from_report(item: dict, conn=None) -> dict:
                 if row.get("pushed_by") is not None:
                     item["pushedBy"] = row.get("pushed_by")
                     item["pushed_by"] = row.get("pushed_by")
+                if row.get("violation_count") is not None:
+                    item["violation_count"] = row.get("violation_count")
                 break
     except Exception as e:
         logger.error(f"Detection report metadata lookup failed: {e}")
@@ -442,6 +446,7 @@ _RTSP_SCRIPT_PREFIXES = {
     "tampering", "violation", "entry_exit", "server_room", "blind_spot",
     "zero_person", "detection", "crowd_zero", "crowd_five", "blindspot",
     "crowd_biometric", "strongroom", "qp_box", "improper_furniture",
+    "monitor_tamper", "crowd_five_invigilator",
 }
 
 
@@ -495,11 +500,19 @@ def _extract_ch_no(camera_id: str) -> str:
     return m.group(1) if m else ""
 
 
-@lru_cache(maxsize=65536)
+_META_DT_RE = re.compile(r'(\d{8})_(\d{6})')
+_META_EXAM_RE = re.compile(r'_exam(\d+)', re.IGNORECASE)
+_META_SHIFT_RE = re.compile(r'_shift(\d+)', re.IGNORECASE)
+
+
+# Unbounded: one entry per detection file (~400k, ~150 MB). The old 65,536 cap was
+# far below the file count, so an all-dates listing evicted and re-parsed nearly
+# every filename on every request (~5 s). Filenames never change, so caching is safe.
+@lru_cache(maxsize=None)
 def _basic_detection_meta(filename: str) -> dict:
     """Extract cheap filter fields from filename without DB metadata lookups."""
-    stem = Path(filename).stem
-    dt_match = re.search(r'(\d{8})_(\d{6})', stem)
+    stem = os.path.splitext(filename.rsplit("/", 1)[-1])[0]
+    dt_match = _META_DT_RE.search(stem)
     date_iso = ""
     time_str = ""
     if dt_match:
@@ -508,17 +521,20 @@ def _basic_detection_meta(filename: str) -> dict:
         date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
     exam_id = None
-    exam_match = re.search(r'_exam(\d+)', stem, flags=re.IGNORECASE)
+    exam_match = _META_EXAM_RE.search(stem)
     if exam_match:
         exam_id = int(exam_match.group(1))
 
     shift_id = None
-    shift_match = re.search(r'_shift(\d+)', stem, flags=re.IGNORECASE)
+    shift_match = _META_SHIFT_RE.search(stem)
     if shift_match:
         _sid = int(shift_match.group(1))
         shift_id = _sid if _sid > 0 else None
 
-    return {"date": date_iso, "time": time_str, "exam_id": exam_id, "shift_id": shift_id}
+    uid = stem.split("_")[-1]
+    return {"date": date_iso, "time": time_str, "exam_id": exam_id, "shift_id": shift_id,
+            # listing fields: newest-first sort key, uid (skip check), numeric tie-break
+            "sort_key": date_iso + time_str, "uid": uid, "fid": _uid_feed_id(uid)}
 
 
 def _basic_detection_matches(
@@ -794,10 +810,15 @@ async def detection_watch_loop():
             known_detection_files = new_known
             known_detection_by_date = new_date_index
 
-            # O(1) today count via date index — no O(N) iteration.
+            # Today count via date index (O(today), not O(N)), minus operator skips
+            # so the live counts match what /detections lists.
             today_iso = datetime.now().date().isoformat()
+            skipped_uids = await asyncio.to_thread(_get_skipped_uids)
             counts = {
-                k: len(known_detection_by_date.get(k, {}).get(today_iso, set()))
+                k: sum(
+                    1 for tp in known_detection_by_date.get(k, {}).get(today_iso, set())
+                    if os.path.splitext(os.path.basename(tp))[0].split("_")[-1] not in skipped_uids
+                ) if skipped_uids else len(known_detection_by_date.get(k, {}).get(today_iso, set()))
                 for k in DETECTION_FOLDERS
             }
             await sio.emit("detection:counts", counts)
@@ -837,6 +858,19 @@ async def lifespan(app: FastAPI):
     # Run initial file scan in thread — 90k files takes ~0.5s synchronously.
     known_detection_files = await asyncio.to_thread(list_detection_files)
     known_detection_by_date = _build_date_index(known_detection_files)
+
+    # Pre-parse every filename into _basic_detection_meta's cache in the background,
+    # so the first all-dates /detections request after a restart isn't the one
+    # paying for ~400k filename parses.
+    def _warm_detection_meta(snapshot):
+        t0 = time.time()
+        for paths in snapshot.values():
+            for tagged_path in paths:
+                _basic_detection_meta(tagged_path.split(":", 1)[-1])
+        logger.info(f"[detections] filename meta cache warmed: {_basic_detection_meta.cache_info().currsize} files in {time.time() - t0:.1f}s")
+    asyncio.create_task(asyncio.to_thread(_warm_detection_meta, known_detection_files))
+    # Same for the operator gpu map of old untagged files (~8 s of DB lookups).
+    asyncio.create_task(asyncio.to_thread(_untagged_gpu_map, known_detection_files))
     
     # Background log cleanup task
     async def cleanup_loop():
@@ -1381,6 +1415,8 @@ DETECTION_FOLDERS = {
     "strongroom":       "strongroom_detection",
     "qp_box":           "qp_box_missing",
     "furniture":        "improper_furniture_detection",
+    "monitor_tamper":   "monitor_tamper_detection",
+    "crowd_five_invigilator": "crowd_five_invigilator_detection",
     "vision":           "scene_classification",
 }
 
@@ -1401,8 +1437,137 @@ DETECTION_LABELS = {
     "strongroom":       "Strong Room Movement",
     "qp_box":           "QP Box Detection",
     "furniture":        "Improper Furniture",
+    "monitor_tamper":   "Monitor Tampering",
+    "crowd_five_invigilator": "Crowd < 5 + Invigilator Static",
     "vision":           "Scene Classification",
 }
+
+# ── Feed order for the live / queued-review detection pages ──────────────────
+# Both pages anchor their paged view at one detection's feed position and send
+# it back as `until` (+ `until_source`, `until_id`), so pages 2, 3… stay put
+# while new detections wait behind the "N new" pill. Ties within one second
+# break on source (hls < rtsp) then row id, matching the frontend's order.
+_FEED_SOURCE_RANK = {"hls": 0, "rtsp": 1}
+
+
+def _parse_feed_until(until):
+    """Frontend anchor timestamp -> naive local datetime, or None if absent/invalid."""
+    if not until:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(until).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    return dt
+
+
+def _feed_iso(value):
+    """DB datetime -> naive ISO string the frontend echoes back as `until`."""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%dT%H:%M:%S")
+    return str(value) if value else None
+
+
+def _uid_feed_id(uid):
+    """Stable numeric tie-break for file-based detections (they have no row id).
+    First 48 bits of the uuid — fits a JS Number, so the frontend's `until_id`
+    round-trips exactly. Non-hex uids fall back to crc32."""
+    if not uid:
+        return 0
+    try:
+        return int(uid.replace("-", "")[:12], 16)
+    except ValueError:
+        import zlib
+        return zlib.crc32(uid.encode())
+
+
+# Operator "Skip" decisions (camera_report_*.skipped). Loaded once from the DB,
+# then kept current by the skip/undo endpoints — this single process is the only
+# writer, so no periodic rescan of the report tables is needed.
+_skipped_uids = set()
+_skipped_uids_loaded = False
+
+
+# Operator gpu sharding for detection files saved before the _gpu{N} filename token
+# existed (CTGD / NEET, May 2026): their gpu comes from the camera_report row instead.
+# uid -> gpu_id (None = no gpu recorded anywhere). Built once from the file index
+# (old files never change; every new file carries the token) and rebuilt at most
+# every _UNTAGGED_GPU_TTL_S in case untagged files are added.
+_ANY_GPU_TOKEN = re.compile(r'_gpu\d+[_.]', re.IGNORECASE)
+_UNTAGGED_GPU_TTL_S = 1800
+_untagged_gpu = {"map": None, "built_at": 0.0}
+_untagged_gpu_lock = threading.Lock()
+
+
+def _untagged_gpu_map(snapshot):
+    now = time.time()
+    if _untagged_gpu["map"] is not None:
+        if now - _untagged_gpu["built_at"] >= _UNTAGGED_GPU_TTL_S and not _untagged_gpu_lock.locked():
+            # Stale: refresh in the background and keep serving the current map, so
+            # no operator request waits on the ~280-query rebuild.
+            _untagged_gpu["built_at"] = now
+            threading.Thread(target=_build_untagged_gpu_map, args=(known_detection_files, True), daemon=True).start()
+        return _untagged_gpu["map"]
+    return _build_untagged_gpu_map(snapshot)
+
+
+def _build_untagged_gpu_map(snapshot, force=False):
+    now = time.time()
+    with _untagged_gpu_lock:
+        if not force and _untagged_gpu["map"] is not None and now - _untagged_gpu["built_at"] < _UNTAGGED_GPU_TTL_S:
+            return _untagged_gpu["map"]
+        uids = set()
+        for paths in snapshot.values():
+            for tagged_path in paths:
+                base = tagged_path.rsplit("/", 1)[-1]
+                if not _ANY_GPU_TOKEN.search(base):
+                    uids.add(os.path.splitext(base)[0].split("_")[-1])
+        mapping = dict.fromkeys(uids)
+        try:
+            conn = _get_connection()
+            try:
+                with conn.cursor() as cur:
+                    ids = list(uids)
+                    for table in ("camera_report_rtsp", "camera_report_hls"):
+                        for i in range(0, len(ids), 1000):
+                            chunk = ids[i:i + 1000]
+                            cur.execute(
+                                f"SELECT unique_id, gpu_id FROM {table} USE INDEX (idx_unique_id) "
+                                f"WHERE gpu_id IS NOT NULL AND unique_id IN ({','.join(['%s'] * len(chunk))})",
+                                tuple(chunk))
+                            for r in cur.fetchall():
+                                mapping[r["unique_id"]] = int(r["gpu_id"])
+            finally:
+                conn.close()
+            _untagged_gpu["map"], _untagged_gpu["built_at"] = mapping, now
+            logger.info(f"[detections] untagged-file gpu map: {len(mapping)} files, "
+                        f"{sum(v is not None for v in mapping.values())} with a DB gpu_id")
+        except Exception as e:
+            logger.error(f"[detections] untagged-file gpu map failed: {e}")
+            return _untagged_gpu["map"] or {}
+        return mapping
+
+
+def _get_skipped_uids():
+    global _skipped_uids_loaded
+    if _skipped_uids_loaded:
+        return _skipped_uids
+    try:
+        conn = _get_connection()
+        try:
+            with conn.cursor() as cur:
+                for table in ("camera_report_hls", "camera_report_rtsp"):
+                    cur.execute(f"SELECT unique_id FROM {table} WHERE skipped = 1")
+                    _skipped_uids.update(r["unique_id"] for r in cur.fetchall() if r.get("unique_id"))
+        finally:
+            conn.close()
+        _skipped_uids_loaded = True
+    except Exception as e:
+        logger.error(f"Failed to load skipped detection uids: {e}")
+    return _skipped_uids
+
 
 def parse_detection_filename(
     filename: str,
@@ -1569,6 +1734,14 @@ def parse_detection_filename(
         except Exception:
             detected_at_ms = now_ms  # Fallback to current time
 
+    # Feed-order key: the filename's own capture time (same clock it was written in).
+    created_at_iso = None
+    if date_str and time_str:
+        try:
+            created_at_iso = datetime.strptime(date_str + time_str, "%Y%m%d%H%M%S").strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            created_at_iso = None
+
     image_rel = quote(str(file_obj.as_posix()), safe="/")
     issue_label_map = {
         "no_targets": "No Targets",
@@ -1620,7 +1793,9 @@ def parse_detection_filename(
         "image_url":   image_url,
         "exam_id":     exam_id,
         "uid":         uid,
+        "id":          _uid_feed_id(uid),
         "gpu_id":      gpu_id_fn,
+        "created_at":  created_at_iso,
     }
 
 
@@ -1638,6 +1813,9 @@ def list_detections(
     gpu_id: Optional[int] = None,      # operator sharding: restrict to this worker's gpu
     page: int = 1,
     limit: int = 50,
+    until: Optional[str] = None,       # queued-review anchor (see _FEED_SOURCE_RANK)
+    until_source: Optional[str] = None,
+    until_id: Optional[int] = None,
 ):
     selected_types = set(type.split(',')) if type else set()
     check_types = selected_types if selected_types else set(DETECTION_FOLDERS.keys())
@@ -1660,7 +1838,9 @@ def list_detections(
     # When a date filter is provided and the index is populated we iterate only
     # the O(k) bucket for that date instead of the full O(N) snapshot.
     all_counts = {k: 0 for k in DETECTION_FOLDERS}
-    candidates = []  # (sort_key, type_key, relative_path, origin)
+    candidates = []  # (sort_key, type_key, relative_path, origin, feed_id)
+    skipped_uids = _get_skipped_uids()
+    untagged_gpu = None   # loaded on the first untagged file an operator request hits
 
     for type_key in DETECTION_FOLDERS:
         # Use date index for O(k) lookup; fall back to full snapshot when the
@@ -1682,13 +1862,19 @@ def list_detections(
             if source == "hls" and origin != "hls":
                 continue
 
-            # Operator gpu sharding: skip files that don't carry this gpu's token.
-            # Files without any _gpu token are old/untagged → only shown when
-            # no gpu filter is active (i.e. admin/client sees everything).
+            # Operator gpu sharding: a file with a _gpu token is shown only to that
+            # gpu's operators. Old untagged files use the gpu_id on their DB row, and
+            # if none was recorded (no way to shard them) every operator sees them.
             if _gpu_filter_pat is not None:
                 basename_for_gpu = relative_path.split("/")[-1] if "/" in relative_path else relative_path
                 if not _gpu_filter_pat.search(basename_for_gpu):
-                    continue
+                    if _ANY_GPU_TOKEN.search(basename_for_gpu):
+                        continue
+                    if untagged_gpu is None:
+                        untagged_gpu = _untagged_gpu_map(snapshot)
+                    db_gpu = untagged_gpu.get(os.path.splitext(basename_for_gpu)[0].split("_")[-1])
+                    if db_gpu is not None and db_gpu != int(gpu_id):
+                        continue
 
             # Date is pre-filtered by the index; only run the regex for the
             # remaining filters to avoid redundant filename parsing.
@@ -1698,22 +1884,51 @@ def list_detections(
             ):
                 continue
 
+            basic = _basic_detection_meta(relative_path)
+            # Operator-skipped detections are reviewed-and-dismissed: hidden from
+            # the list and the counts (uid = last "_" segment of the filename stem).
+            if skipped_uids and basic["uid"] in skipped_uids:
+                continue
+
             all_counts[type_key] += 1
 
             if type_key in check_types:
-                basic = _basic_detection_meta(relative_path)
-                sort_key = (basic.get("date") or "") + (basic.get("time") or "")
-                candidates.append((sort_key, type_key, relative_path, origin))
+                candidates.append((basic["sort_key"], type_key, relative_path, origin, basic["fid"]))
 
-    # Sort newest first (YYYYMMDDHHMMSS lexicographic == chronological)
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    # Pagination anchor: only detections at-or-before it are paged; newer ones
+    # wait behind the "N new" pill. Sidebar counts above stay live. Position is
+    # (second, source rank, feed_id) — feed_id is the uid-derived tie-break the
+    # item carries as `id`, so same-second ties split exactly like the frontend.
+    until_dt = _parse_feed_until(until)
+    if until_dt is not None:
+        until_pos = (until_dt.strftime("%Y%m%d%H%M%S"),
+                     _FEED_SOURCE_RANK.get(until_source, 0), until_id or 0)
+
+        def _at_or_before(c):
+            # sort_key is "YYYY-MM-DD" + "HHMMSS"; drop the dashes to compare.
+            if until_id is None:
+                # Old-style anchor (no id): whole second on the paged side.
+                return (c[0].replace("-", ""), _FEED_SOURCE_RANK.get(c[3], 0)) <= until_pos[:2]
+            return (c[0].replace("-", ""), _FEED_SOURCE_RANK.get(c[3], 0), c[4]) <= until_pos
+
+        candidates = [c for c in candidates if _at_or_before(c)]
+
+    # Newest first (YYYYMMDDHHMMSS lexicographic == chronological), then source, then feed_id.
     start_idx = (page - 1) * limit
+    _order = lambda x: (x[0], _FEED_SOURCE_RANK.get(x[3], 0), x[4])
+    total_candidates = len(candidates)
+    if not needs_search and start_idx + limit < total_candidates // 4:
+        # Only this page is parsed below, so pick just the top start_idx+limit
+        # (O(n log k)) instead of sorting every file on disk (O(n log n)).
+        candidates = heapq.nlargest(start_idx + limit, candidates, key=_order)
+    else:
+        candidates.sort(key=_order, reverse=True)
 
     if needs_search:
         # Search path: parse all filtered candidates, apply text filter, paginate.
         rows = []
         q = search.lower()
-        for _, type_key, relative_path, origin in candidates:
+        for _, type_key, relative_path, origin, _fid in candidates:
             base_dir = RTSP_RESULTS_DIR if origin == "rtsp" else RESULTS_DIR
             file_path = base_dir / DETECTION_FOLDERS[type_key] / relative_path
             item = parse_detection_filename(
@@ -1742,10 +1957,10 @@ def list_detections(
         paginated = rows[start_idx: start_idx + limit]
     else:
         # Fast path: only parse the `limit` items on this page.
-        total = len(candidates)
+        total = total_candidates
         page_candidates = candidates[start_idx: start_idx + limit]
         paginated = []
-        for _, type_key, relative_path, origin in page_candidates:
+        for _, type_key, relative_path, origin, _fid in page_candidates:
             base_dir = RTSP_RESULTS_DIR if origin == "rtsp" else RESULTS_DIR
             file_path = base_dir / DETECTION_FOLDERS[type_key] / relative_path
             item = parse_detection_filename(
@@ -1769,7 +1984,8 @@ def list_detections(
                     cur.execute(
                         f"""
                         SELECT cr.unique_id, cr.pushed_to_client, cr.gpu_id,
-                               cr.shift_id, cr.tc_code, cr.sms_sent, es.shift_name
+                               cr.shift_id, cr.tc_code, cr.sms_sent, cr.violation_count,
+                               es.shift_name
                         FROM camera_report_hls AS cr USE INDEX (idx_unique_id)
                         LEFT JOIN exam_shifts AS es ON es.id = cr.shift_id
                         WHERE cr.unique_id IN ({fmt})
@@ -1792,6 +2008,8 @@ def list_detections(
                                 meta["tcCode"] = row.get("tc_code")
                             if row.get("sms_sent") is not None:
                                 meta["sms_sent"] = row.get("sms_sent")
+                            if row.get("violation_count") is not None:
+                                meta["violation_count"] = row.get("violation_count")
                 except Exception as e:
                     logger.error(f"HLS pushed uids fetch failed: {e}")
 
@@ -1799,7 +2017,8 @@ def list_detections(
                     cur.execute(
                         f"""
                         SELECT cr.unique_id, cr.pushed_to_client, cr.gpu_id,
-                               cr.shift_id, cr.tc_code, cr.sms_sent, es.shift_name
+                               cr.shift_id, cr.tc_code, cr.sms_sent, cr.violation_count,
+                               es.shift_name
                         FROM camera_report_rtsp AS cr USE INDEX (idx_unique_id)
                         LEFT JOIN exam_shifts AS es ON es.id = cr.shift_id
                         WHERE cr.unique_id IN ({fmt})
@@ -1822,6 +2041,8 @@ def list_detections(
                                 meta["tcCode"] = row.get("tc_code")
                             if row.get("sms_sent") is not None:
                                 meta["sms_sent"] = row.get("sms_sent")
+                            if row.get("violation_count") is not None:
+                                meta["violation_count"] = row.get("violation_count")
                 except Exception as e:
                     logger.error(f"RTSP pushed uids fetch failed: {e}")
             conn.close()
@@ -1846,6 +2067,9 @@ def list_detections(
         if meta.get("tcCode"):
             item["tcCode"] = meta.get("tcCode")
             item["tc_code"] = meta.get("tcCode")
+        # Proximity repeat count ("Proximity Violation N" on the card).
+        if meta.get("violation_count") is not None:
+            item["violation_count"] = meta.get("violation_count")
 
     # Resolve shift names for the page (covers filename-derived shift_ids whose
     # camera_report row had a NULL shift_id) so the cards always show the shift.
@@ -1886,6 +2110,52 @@ def _resolve_detection_source_path(source: str, type_key: str, relative_path: st
         raise HTTPException(status_code=404, detail=f"Source file not found: {relative_path}")
 
     return abs_path
+
+
+class DetectionSkipRequest(BaseModel):
+    uid: str
+
+
+def _set_detection_skipped(uid: str, skipped: bool) -> int:
+    """Persist an operator skip (or its undo) on whichever report table holds the uid."""
+    conn = _get_connection()
+    updated = 0
+    try:
+        with conn.cursor() as cur:
+            for table in ("camera_report_hls", "camera_report_rtsp"):
+                if skipped:
+                    cur.execute(f"UPDATE {table} SET skipped = 1, skipped_at = NOW() WHERE unique_id = %s", (uid,))
+                else:
+                    cur.execute(f"UPDATE {table} SET skipped = 0, skipped_at = NULL WHERE unique_id = %s", (uid,))
+                updated += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return updated
+
+
+@app.post("/detections/skip")
+async def skip_detection(payload: DetectionSkipRequest):
+    """Operator reviewed this detection and chose not to push it — hide it for good."""
+    try:
+        updated = await asyncio.to_thread(_set_detection_skipped, payload.uid, True)
+    except Exception as e:
+        logger.error(f"[skip_detection] {payload.uid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to skip detection")
+    (await asyncio.to_thread(_get_skipped_uids)).add(payload.uid)
+    return {"success": True, "uid": payload.uid, "updated": updated}
+
+
+@app.post("/detections/skip/undo")
+async def unskip_detection(payload: DetectionSkipRequest):
+    """Reverse a skip (mis-click recovery)."""
+    try:
+        updated = await asyncio.to_thread(_set_detection_skipped, payload.uid, False)
+    except Exception as e:
+        logger.error(f"[unskip_detection] {payload.uid}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to undo skip")
+    (await asyncio.to_thread(_get_skipped_uids)).discard(payload.uid)
+    return {"success": True, "uid": payload.uid, "updated": updated}
 
 
 class ClientDetectionCopyItem(BaseModel):
@@ -1969,15 +2239,17 @@ async def copy_client_detections(payload: ClientDetectionCopyRequest):
                         failed.append({"uid": item.uid, "error": f"uid {item.uid} not found"})
                         continue
 
+                    pushed_at_dt = datetime.now().replace(microsecond=0)
                     cur.execute(
                         f"""
                         UPDATE {table_name}
                         SET pushed_to_client = 1,
                             pushed_by = %s,
+                            pushed_at = %s,
                             unique_id = COALESCE(NULLIF(unique_id, ''), %s)
                         WHERE id = %s
                         """,
-                        (pushed_by, item_uid, row.get("id")),
+                        (pushed_by, pushed_at_dt, item_uid, row.get("id")),
                     )
                     if not row.get("unique_id"):
                         row["unique_id"] = item_uid
@@ -2017,9 +2289,13 @@ async def copy_client_detections(payload: ClientDetectionCopyRequest):
                         # SMS now fires when the client ACCEPTS (not on push).
                         "sms_sent": 0,
                         "accepted": 0,
+                        "violation_count": row.get("violation_count"),
                         "pushedBy": pushed_by,
                         "pushed_by": pushed_by,
                         "pushedByName": pushed_by_name,
+                        # Client feed position (see _FEED_SOURCE_RANK).
+                        "pushed_at": _feed_iso(pushed_at_dt),
+                        "created_at": _feed_iso(row.get("created_at")),
                     })
                     copied.append(copied_item)
                     
@@ -2110,6 +2386,9 @@ def list_client_detections(
     user_role: Optional[str] = None,
     user_id: Optional[int] = None,
     user_company: Optional[str] = None,
+    until: Optional[str] = None,       # queued-review anchor (see _FEED_SOURCE_RANK)
+    until_source: Optional[str] = None,
+    until_id: Optional[int] = None,
 ):
     all_counts = {k: 0 for k in DETECTION_FOLDERS}
 
@@ -2190,6 +2469,25 @@ def list_client_detections(
             where_data, params_data = _build_where(include_type=True)
             where_cnt,  params_cnt  = _build_where(include_type=False)
 
+            # The client feed is ordered by when a detection was PUSHED (an
+            # operator can push an hours-old one and it belongs at the top).
+            # The anchor bounds the total and page rows, never the sidebar counts.
+            feed_at = "COALESCE(pushed_at, created_at)"
+            until_dt = _parse_feed_until(until)
+            until_str = until_dt.strftime("%Y-%m-%d %H:%M:%S") if until_dt else None
+            anchor_rank = _FEED_SOURCE_RANK.get(until_source)
+
+            def _paged_where(table):
+                if not until_str:
+                    return where_data, list(params_data)
+                my_rank = _FEED_SOURCE_RANK["rtsp" if table.endswith("rtsp") else "hls"]
+                if anchor_rank is None or until_id is None or my_rank < anchor_rank:
+                    return f"{where_data} AND {feed_at} <= %s", list(params_data) + [until_str]
+                if my_rank > anchor_rank:
+                    return f"{where_data} AND {feed_at} < %s", list(params_data) + [until_str]
+                return (f"{where_data} AND ({feed_at} < %s OR ({feed_at} = %s AND id <= %s))",
+                        list(params_data) + [until_str, until_str, int(until_id)])
+
             active_tables = []
             for table in ("camera_report_hls", "camera_report_rtsp"):
                 if source == "rtsp" and table == "camera_report_hls":
@@ -2202,8 +2500,9 @@ def list_client_detections(
             total = 0
             for table in active_tables:
                 try:
-                    cur.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE {where_data}",
-                                tuple(params_data) if params_data else None)
+                    w, p = _paged_where(table)
+                    cur.execute(f"SELECT COUNT(*) AS c FROM {table} WHERE {w}",
+                                tuple(p) if p else None)
                     total += int((cur.fetchone() or {}).get("c") or 0)
                 except Exception as e:
                     logger.error(f"Client detections count failed ({table}): {e}")
@@ -2228,16 +2527,19 @@ def list_client_detections(
             db_rows: List[dict] = []
             for table in active_tables:
                 try:
-                    cur.execute(f"SELECT * FROM {table} WHERE {where_data} "
-                                f"ORDER BY created_at DESC LIMIT {int(need)}",
-                                tuple(params_data) if params_data else None)
+                    w, p = _paged_where(table)
+                    cur.execute(f"SELECT *, {feed_at} AS feed_at FROM {table} WHERE {w} "
+                                f"ORDER BY feed_at DESC, id DESC LIMIT {int(need)}",
+                                tuple(p) if p else None)
                     for r in cur.fetchall():
                         r["_source"] = "rtsp" if table.endswith("rtsp") else "hls"
                         db_rows.append(r)
                 except Exception as e:
                     logger.error(f"Client detections fetch failed ({table}): {e}")
 
-            db_rows.sort(key=lambda x: str(x.get("created_at", "")), reverse=True)
+            db_rows.sort(key=lambda x: (str(x.get("feed_at") or ""),
+                                        _FEED_SOURCE_RANK.get(x.get("_source"), 0),
+                                        int(x.get("id") or 0)), reverse=True)
             start_idx = (page - 1) * limit
             page_rows = db_rows[start_idx: start_idx + limit]
 
@@ -2289,9 +2591,14 @@ def list_client_detections(
                     # Client "Accept" state (cctv_backend sets accepted_by_client).
                     "accepted":    1 if row.get("accepted_by_client") == 1 else 0,
                     "accepted_at": _epoch_ms(row.get("accepted_at")),
+                    "violation_count": row.get("violation_count"),
                     "_mtime":      _epoch_ms(row.get("created_at")) or 0,
                     "updatedAt":   _epoch_ms(row.get("updated_at")),
                     "updated_at":  _epoch_ms(row.get("updated_at")),
+                    # Feed position for the queued-review page (see _FEED_SOURCE_RANK).
+                    "id":          row.get("id"),
+                    "pushed_at":   _feed_iso(row.get("feed_at")),
+                    "created_at":  _feed_iso(row.get("created_at")),
                 })
                 rows.append(item)
 

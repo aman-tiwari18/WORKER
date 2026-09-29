@@ -135,7 +135,9 @@ def _process_packet(item, save_folder):
             else:
                 fname = f"{script_name}_{device_id}_{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
             
-            path = os.path.join(save_folder, fname)
+            # The queue entry serves both sources (HLS frames come from the unified
+            # HLS capture), so the folder follows the frame, not the worker.
+            path = os.path.join(HLS_SAVE_FOLDER if source_type == "HLS" else save_folder, fname)
             cv2.imwrite(path, frame)
             logger.warning(f"[Tampering] 🚨 {status} | {device_id} → {path}")
             

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from model_config import DETECTION_MODEL_PATH as MODEL_PATH
+MODEL_PATH = os.path.join(BASE_DIR, "models", "yolov10m.pt")
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/improper_furniture_detection")
 
 CONF_THRESHOLD = float(os.environ.get("FURNITURE_CONF", "0.35"))

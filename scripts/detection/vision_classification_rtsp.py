@@ -2288,11 +2288,12 @@ def _ensure_vllm_running():
     )
     _VLLM_PROC = proc
 
-    # Poll for up to 90 iterations × 2s = 3 minutes max.
-    # The 30B MoE model on H200 typically loads in 30-90 seconds.
-    # If it hasn't started by 3 minutes, it's deadlocked (RPC timeout,
-    # CUDA driver contention, etc.) — kill it and abort.
-    _MAX_STARTUP_POLLS = 90
+    # Poll for up to VLLM_STARTUP_TIMEOUT_S (default 600 s = 10 min), 2 s per poll.
+    # The 30B MoE model loads in ~1-2 min when its weights stream from disk, but a
+    # cold start that reads them on demand took ~8 min on worker-0 (38 s/shard), and
+    # the old 3-minute limit killed healthy loads as if they were deadlocked. A real
+    # hang (RPC timeout, CUDA driver contention) still gets killed, just later.
+    _MAX_STARTUP_POLLS = max(1, int(os.getenv("VLLM_STARTUP_TIMEOUT_S", "600")) // 2)
     for i in range(_MAX_STARTUP_POLLS):
         try:
             if requests.get("http://localhost:8001/health", timeout=2).status_code == 200:

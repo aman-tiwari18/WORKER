@@ -51,6 +51,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir uv && \
     uv pip install --system "vllm==0.20.2" openai huggingface_hub
 
+# monitor_tamper's RF-DETR model (scripts/detection/detection_models.py). rfdetr needs
+# transformers >=5.1,<6 and vLLM 0.20.2 accepts >=5.5.1, so pin the version the
+# monorepo runs both on (transformers 5.8.0 + rfdetr 1.11.0). Installed after vLLM so
+# its resolver cannot move transformers back.
+RUN uv pip install --system "rfdetr==1.11.0" "transformers==5.8.0"
+
 # Copy application code
 COPY . .
 

@@ -11,7 +11,8 @@
   "_comment_bundled": "Fine-tuned models committed in models_bundled/ (not hosted anywhere): copied, never downloaded. Replace the file AND its sha256 here together. Strip training state first (ultralytics.utils.torch_utils.strip_optimizer) so each file stays well under GitHub's 100 MB limit.",
   "bundled_dir": "models_bundled",
   "bundled": {
-    "monitor_person_model.pt": "c1ac4b2f96a63f4712c0b1e856db82b837513fab46d4c10a9e28604d685883b7",
-    "phone_model.pt": "0c64db9bccb66b0a251e9a8f9e9dd239613116d34d5d96ee777803d73457950f"
-  }
+    "monitor_person_yolo26m.pt": "c1ac4b2f96a63f4712c0b1e856db82b837513fab46d4c10a9e28604d685883b7",
+    "best_mobile_model.pt": "6f16d6d920feab02eef7f739a22ef56d0fea110499692cc8092684fe0d3786fa"
+  },
+  "_comment_rfdetr": "monitor_person_rfdetr.pth (monitor_tamper, 135 MB) is over GitHub's 100 MB limit, so it is NOT bundled: copy it into each host's ./models/ (it is in /data/cctv_dev/cctv/script-server/scripts/detection/models/ on the H200 host). monitor_tamper logs 'unavailable' without it."
 }

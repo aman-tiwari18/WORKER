@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 # ================= CONFIG ==================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-from model_config import PHONE_MODEL_PATH as MODEL_PATH  # fine-tuned phone model (class "mobile")
+# Dedicated fine-tuned phone model (YOLO26m, single class 0 = "mobile", trained at 960).
+# It is NOT the shared COCO yolov10m, so phone always runs its own inference.
+MODEL_PATH = os.path.join(BASE_DIR, "models", "best_mobile_model.pt")
+MODEL_IMGSZ = 960
+PHONE_CLASS_NAMES = {"mobile"}
 SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 
 # CAMERA CLASSIFICATION: Inside Lab, Inside Server Room
@@ -29,8 +33,6 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 90))        # Seconds between saves (1.5 min — per detection frequency spec)
 CONF_THRESHOLD = 0.25     # Confidence for phone detection
-# "mobile" = fine-tuned phone_model.pt; "cell phone" = stock COCO model (fallback)
-PHONE_CLASS_NAMES = {"mobile", "cell phone"}
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -101,7 +103,7 @@ yolo_model = None
 _model_lock = threading.Lock()
 
 def get_yolo_model():
-    """Return a shared YOLO model instance."""
+    """Return the phone model instance (loaded once per process)."""
     global yolo_model
     if yolo_model is None:
         with _model_lock:
@@ -123,7 +125,7 @@ _state_lock = threading.Lock()
 def detect_phone_in_frame(frame, device_id="unknown", camera_no="unknown", script_name="phone"):
     """Standalone detection for a single frame."""
     model = get_yolo_model()
-    results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+    results = model(frame, conf=CONF_THRESHOLD, imgsz=MODEL_IMGSZ, verbose=False)[0]
 
     names = results.names
     phone_boxes = [
@@ -173,12 +175,16 @@ def detect_phone_in_frame(frame, device_id="unknown", camera_no="unknown", scrip
 
     return frame, phone_detected, phone_count
 
+def run_phone_model(frames):
+    """Batched inference with the phone model. Used by the unified detector, whose
+    shared yolov10m results have no "mobile" class and can't be reused here."""
+    return get_yolo_model()(frames, conf=CONF_THRESHOLD, imgsz=MODEL_IMGSZ, verbose=False)
+
+
 def detect_phone_batch(items, results=None):
-    """Run true batch inference."""
+    """Run true batch inference. `results` must come from run_phone_model."""
     if results is None:
-        model = get_yolo_model()
-        frames = [item['frame'].copy() for item in items]
-        results = model(frames, conf=CONF_THRESHOLD, verbose=False)
+        results = run_phone_model([item['frame'].copy() for item in items])
 
     outputs = []
     for item, result in zip(items, results):

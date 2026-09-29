@@ -12,9 +12,10 @@ data:
   FLEET_HEARTBEAT_INTERVAL_S: "10"
   IS_MAIN_WORKER: "1"
   TZ: Asia/Kolkata
-  YOLO_PERSON_MODEL: monitor_person_model.pt   # fine-tuned, baked into the image (models_bundled/)
-  YOLO_PHONE_MODEL: phone_model.pt              # fine-tuned, baked into the image (models_bundled/)
+  YOLO_PERSON_MODEL: monitor_person_yolo26m.pt   # fine-tuned, baked into the image (models_bundled/)
+  YOLO_PHONE_MODEL: best_mobile_model.pt              # fine-tuned, baked into the image (models_bundled/)
   YOLO_DETECTION_MODEL: yolo26m.pt
+  UNIFIED_PERSON_MODEL: finetuned               # detection_models.py: person analytics use the fine-tuned model
   YOLO_INVERSION_MODEL: yolo26n.pt
   POLL_INTERVAL_MS: "30000"
   MAIN_BACKEND_URL: http://backend.cctv.svc.cluster.local:4000/prod_cctv/api   # overlays override

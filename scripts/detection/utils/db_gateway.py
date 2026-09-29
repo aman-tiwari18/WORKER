@@ -253,7 +253,8 @@ def _embed(image_rel_path, folder, hls):
         logger.debug(f"[gateway] EXIF embed skipped: {e}")
 
 
-def report_to_db_hls(ch_code, image_name, folder="crowd_detection"):
+def report_to_db_hls(ch_code, image_name, folder="crowd_detection",
+                     person_count=None, threshold=None, violation_count=None):
     exam_id = os.environ.get("EXAM_ID")
     if not exam_id:
         logger.error("[gateway] EXAM_ID not set; cannot report HLS detection")
@@ -261,14 +262,16 @@ def report_to_db_hls(ch_code, image_name, folder="crowd_detection"):
     _embed(image_name, folder, hls=True)
     payload = {"link_type": "hls", "ch_code": ch_code, "image_name": image_name, "folder": folder,
                "exam_id": exam_id, "shift_id": os.environ.get("SHIFT_ID"), "gpu_id": _gpu_id(),
-               "unique_id": _extract_unique_id(image_name)}
+               "unique_id": _extract_unique_id(image_name),
+               "person_count": person_count, "threshold": threshold, "violation_count": violation_count}
     if _post_ingest(payload):
         return True
     _buffer(payload)
     return True  # accepted for delivery (buffered) — never block the detector
 
 
-def report_to_db_rtsp(device_id, camera_no, image_name, folder="crowd_detection"):
+def report_to_db_rtsp(device_id, camera_no, image_name, folder="crowd_detection",
+                      person_count=None, threshold=None, violation_count=None):
     exam_id = os.environ.get("EXAM_ID")
     if not exam_id:
         logger.error("[gateway] EXAM_ID not set; cannot report RTSP detection")
@@ -281,7 +284,8 @@ def report_to_db_rtsp(device_id, camera_no, image_name, folder="crowd_detection"
     _embed(image_name, folder, hls=False)
     payload = {"link_type": "rtsp", "device_id": device_id, "camera_no": camera_no, "image_name": image_name,
                "folder": folder, "exam_id": exam_id, "shift_id": os.environ.get("SHIFT_ID"),
-               "gpu_id": _gpu_id(), "unique_id": _extract_unique_id(image_name)}
+               "gpu_id": _gpu_id(), "unique_id": _extract_unique_id(image_name),
+               "person_count": person_count, "threshold": threshold, "violation_count": violation_count}
     if _post_ingest(payload):
         return True
     _buffer(payload)

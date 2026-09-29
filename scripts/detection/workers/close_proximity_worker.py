@@ -24,6 +24,7 @@ if DETECTION_ROOT not in sys.path:
 
 # Import core detection module
 import close_proximity as proximity_core
+from proximity_repeat import next_violation_count
 
 # ================= GPU MEMORY GUARD =================
 from workers.gpu_memory_guard import apply_gpu_memory_limit
@@ -120,7 +121,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
             item.pop('frame', None)
 
         # Process results
-        for item, (annotated_frame, detected, violation_count) in zip(batch, batch_results):
+        for item, (annotated_frame, detected, violation_count, violation_pairs) in zip(batch, batch_results):
             state = item.get('state', {})
 
             if not detected:
@@ -156,9 +157,13 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
             else:
                 fname = f"{script_name}_{dev_id}_{ch_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
 
+            # Same pair at the same spot as this camera's earlier report → repeat count 2, 3, ...
+            camera_key = f"hls_ch{ch_no}" if item.get("source_type") == "HLS" else f"rtsp_{dev_id}_{ch_no}"
+            repeat_count = next_violation_count(camera_key, violation_pairs, exam_id, shift_id)
+
             path = os.path.join(save_folder, fname)
             cv2.imwrite(path, annotated_frame)
-            logger.warning(f"[Proximity] 🚨 SAVED violations={violation_count} → {path}")
+            logger.warning(f"[Proximity] 🚨 SAVED violations={violation_count} repeat={repeat_count} → {path}")
 
             # Report to database
             if item.get("source_type") == "HLS":
@@ -167,7 +172,8 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
                     report_to_db_hls(
                         ch_code=str(ch_no),
                         image_name=fname,
-                        folder="proximity_detection"
+                        folder="proximity_detection",
+                        violation_count=repeat_count,
                     )
                 except Exception as e:
                     logger.error(f"[Proximity] HLS DB Reporting Error: {e}")
@@ -178,7 +184,8 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
                         device_id=str(dev_id),
                         camera_no=str(ch_no),
                         image_name=fname,
-                        folder="proximity_detection"
+                        folder="proximity_detection",
+                        violation_count=repeat_count,
                     )
                 except Exception as e:
                     logger.error(f"[Proximity] RTSP DB Reporting Error: {e}")

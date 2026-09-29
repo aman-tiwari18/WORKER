@@ -43,7 +43,7 @@ SCRIPT_CLASSIFICATION_MAP = {
 
     # 3. Crowd — >10 people at entry gate -> Outside / Entry Exit
     "crowd":           ["entry", "outside area", "outdoor scene", "parking lot"],
-    "crowd_biometric": ["entry", "outside area", "outdoor scene", "parking lot", "biometric"],
+    "crowd_biometric": ["computer lab", "inside classroom"],
 
     # 4. Invigilator not moving in exam room -> Inside Lab
     "invigilator":     ["computer lab", "inside classroom"],
@@ -81,6 +81,12 @@ SCRIPT_CLASSIFICATION_MAP = {
 
     # Broken / overturned / missing furniture -> Inside Lab
     "furniture":       ["computer lab", "inside classroom"],
+
+    # 1-4 seated candidates AND invigilator standing still 7 min -> Inside Lab
+    "crowd_five_invigilator": ["computer lab", "inside classroom"],
+
+    # Monitor moved / lifted / carried away -> Computer Lab (rooms with monitors)
+    "monitor_tamper":  ["computer lab"],
 }
 
 # The "Camera Type" dropdown on the Add Script dialog offers the SOP group names

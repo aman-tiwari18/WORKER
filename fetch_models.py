@@ -11,7 +11,7 @@ are copied from there instead of downloaded — they are not hosted anywhere.
 """
 import hashlib, json, os, shutil, sys, urllib.request
 
-REQUIRED = {"yolo26m.pt", "yolo26n.pt", "monitor_person_model.pt", "phone_model.pt"}
+REQUIRED = {"yolo26m.pt", "yolo26n.pt", "monitor_person_yolo26m.pt", "best_mobile_model.pt"}
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 

@@ -25,17 +25,6 @@ Additive proof-of-concept. The existing per-script workers in `workers/` are lef
 intact. Crowd is implemented as the reference evaluator; other analytics follow the
 same pattern (refactor each `detect_*_batch` to accept a precomputed `results`).
 
-MODELS (Sep 2026)
------------------
-"Once per frame" is now once per frame *per model*. Three detectors, see
-model_config.py; each analytic reads boxes from one of them (ANALYTIC_MODEL):
-  person  monitor_person_model.pt  every person-based analytic (default)
-  phone   phone_model.pt           phone
-  coco    yolo26m.pt               furniture (chair / table / bench)
-  (qp_box runs its own COCO YOLO + colour check and ignores shared boxes)
-A model only runs on the frames of cameras that have an analytic needing it,
-so a camera without phone/furniture costs one inference, as before.
-
 INTEGRATION (not wired yet — flip after evaluators exist for all needed scripts):
   In master_pipeline.run_rtsp_pipeline, instead of one queue+worker per script_code,
   create ONE queue + one `unified_worker` process, and have producers push packets
@@ -64,45 +53,60 @@ from ultralytics import YOLO
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# Shared models — each loaded ONCE, shared by every analytic that reads it
+# Models — each analytic reads the boxes of exactly one model
 # ============================================================
-from model_config import DETECTION_MODEL_PATH, PERSON_MODEL_PATH, PHONE_MODEL_PATH
+from detection_models import BACKENDS
+
 CONF_THRESHOLD = 0.45          # base detector confidence; per-rule filters tighten further
 
-MODEL_PATHS = {
-    "person": PERSON_MODEL_PATH,     # fine-tuned: 0 person, 1 monitor
-    "phone":  PHONE_MODEL_PATH,      # fine-tuned: 0 mobile
-    "coco":   DETECTION_MODEL_PATH,  # stock COCO-80
-}
-# analytic -> model whose boxes its rule reads; anything not listed reads "person".
-# None = the analytic runs its own detector and ignores the shared result.
-ANALYTIC_MODEL = {
-    "phone":     "phone",
-    "furniture": "coco",
-    "qp_box":    None,
+# Analytics that only look at person boxes (class 0). They can read either
+# yolov10m (COCO) or the fine-tuned person+monitor model, whose person is also class 0.
+PERSON_ANALYTICS = {
+    "crowd", "crowd_zero", "crowd_five", "crowd_biometric", "proximity", "intruder",
+    "entry_exit", "server", "invigilator", "strongroom", "blind_spot",
+    "crowd_five_invigilator",
 }
 
-_models = {}
-_model_lock = threading.Lock()
+
+def _env_choice(name, default, allowed):
+    value = os.environ.get(name, default).strip().lower()
+    if value not in allowed:
+        logger.warning(f"[Unified] {name}={value!r} is not one of {allowed}; using {default!r}")
+        return default
+    return value
+
+
+# Per-worker switches. The person default keeps the behaviour from before the
+# fine-tuned models, so nothing changes on a worker until it is set. monitor_tamper
+# defaults to RF-DETR, the model shipped with monitor_alerts_deploy_v2.
+PERSON_MODEL = _env_choice("UNIFIED_PERSON_MODEL", "yolov10m", ("yolov10m", "finetuned"))
+MONITOR_MODEL = _env_choice("UNIFIED_MONITOR_MODEL", "rfdetr", ("rfdetr", "yolo26m"))
 
 
 def model_for(script):
-    return ANALYTIC_MODEL.get(script, "person")
+    """The one model whose boxes this analytic reads. There is no fallback: if that
+    model isn't loaded, the analytic doesn't run (and says so in the log) rather than
+    quietly reading a different model's boxes."""
+    if script == "phone":
+        return "mobile"
+    if script == "monitor_tamper":
+        return "person_monitor_rfdetr" if MONITOR_MODEL == "rfdetr" else "person_monitor_yolo26m"
+    if script in PERSON_ANALYTICS and PERSON_MODEL == "finetuned":
+        return "person_monitor_yolo26m"
+    return "yolov10m"
 
 
-def get_shared_model(key="person"):
-    model = _models.get(key)
-    if model is None:
-        with _model_lock:
-            model = _models.get(key)
-            if model is None:
-                logger.info(f"[Unified] Loading shared '{key}' model {MODEL_PATHS[key]}")
-                model = YOLO(MODEL_PATHS[key])
-                if torch.cuda.is_available():
-                    model.to("cuda")
-                    logger.info(f"[Unified] '{key}' model on CUDA")
-                _models[key] = model
-    return model
+# Throttle for the "model not loaded, analytic skipped" error (model -> last log time).
+_SKIP_LOG_EVERY_S = 60.0
+_last_skip_log = {}
+
+
+def _log_skipped(model, scripts):
+    now = time.time()
+    if now - _last_skip_log.get(model, 0) >= _SKIP_LOG_EVERY_S:
+        _last_skip_log[model] = now
+        logger.error(f"[Unified] {model} is not loaded — NOT running {sorted(scripts)} "
+                     f"(load is retried in the background)")
 
 
 # ============================================================
@@ -133,10 +137,17 @@ _COOLDOWN_DEFAULTS = {
     "blind_spot": 180,
     "furniture":  300,
     "invigilator": 420,
+    "crowd_five_invigilator": 420,
+    "monitor_tamper": 15,   # monitor_alerts_deploy_v2; incident grouping stops repeats
 }
 _GLOBAL_COOLDOWN = os.environ.get("COOLDOWN_TIME")
+# Analytics that group repeat alerts into incidents themselves and must NOT inherit the
+# generic COOLDOWN_TIME (a merged group's representative Frequency, e.g. 120 s): only their
+# own COOLDOWN_TIME_<KEY> or the default above applies.
+_OWN_COOLDOWN_ONLY = {"monitor_tamper"}
 COOLDOWNS = {
-    key: int(os.environ.get(f"COOLDOWN_TIME_{key.upper()}", _GLOBAL_COOLDOWN or default))
+    key: int(os.environ.get(f"COOLDOWN_TIME_{key.upper()}",
+                            default if key in _OWN_COOLDOWN_ONLY else (_GLOBAL_COOLDOWN or default)))
     for key, default in _COOLDOWN_DEFAULTS.items()
 }
 
@@ -162,7 +173,7 @@ def class_from_result(result, class_ids, conf=CONF_THRESHOLD):
 # Reporting helper (shared by all evaluators)
 # ============================================================
 def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
-                     exam_id, shift_id, source_type="RTSP"):
+                     exam_id, shift_id, source_type="RTSP", violation_count=None):
     """Save the annotated detection and report it, using the schema-correct identifier:
        - RTSP: device_id + camera_no  (filename `{dev}_{camera_no}`, report_to_db_rtsp)
        - HLS : ch_code (= camera_no)  (filename `ch{ch_code}`,        report_to_db_hls)
@@ -183,11 +194,13 @@ def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
     try:
         if str(source_type).upper() == "HLS":
             from utils.db_client import report_to_db_hls
-            report_to_db_hls(ch_code=str(camera_no), image_name=fname, folder=folder)
+            report_to_db_hls(ch_code=str(camera_no), image_name=fname, folder=folder,
+                             violation_count=violation_count)
         else:
             from utils.db_client import report_to_db_rtsp
             report_to_db_rtsp(device_id=str(device_id), camera_no=str(camera_no),
-                              image_name=fname, folder=folder)
+                              image_name=fname, folder=folder,
+                              violation_count=violation_count)
     except Exception as e:
         logger.error(f"[Unified] DB report error ({script_name}): {e}")
     logger.warning(f"[Unified] 🚨 {script_name} saved → {path}")
@@ -233,6 +246,8 @@ ANALYTIC_SPEC = {
     "blind_spot":     ("blind_spot_det",      "detect_blind_spot_batch",      "blind_spot_detection"),
     "crowd_biometric":("Crowd_det_biometric", "detect_crowd_biometric_batch", "crowd_detection_biometric"),
     "furniture":      ("improper_furniture_det", "detect_improper_furniture_batch", "improper_furniture_detection"),
+    "crowd_five_invigilator": ("crowd_five_invigilator_det", "detect_crowd_five_invigilator_batch",
+                               "crowd_five_invigilator_detection"),
     # NOTE: 'tamper' and 'inversion' are classical-CV checks (no YOLO boxes) and stay
     # as their own workers — they don't consume the shared detector output.
 }
@@ -257,36 +272,173 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             return
         if not _passed_gate(state, script_code, time.time()):
             return
+        violation_count = None
+        if script_code == "proximity" and len(out) > 3:
+            # Same pair at the same spot as this camera's earlier report → 2, 3, ...
+            # Keys match workers/close_proximity_worker.py so both paths share counts.
+            from proximity_repeat import next_violation_count
+            is_hls = str(item.get("source_type", "RTSP")).upper() == "HLS"
+            camera_key = (f"hls_ch{item['camera_no']}" if is_hls
+                          else f"rtsp_{item['device_id']}_{item['camera_no']}")
+            violation_count = next_violation_count(
+                camera_key, out[3], item.get("exam_id", "0"), item.get("shift_id", "0"))
         _save_and_report(
             annotated, folder=folder, script_name=script_code,
             device_id=item["device_id"], camera_no=item["camera_no"],
             exam_id=item.get("exam_id", "0"), shift_id=item.get("shift_id", "0"),
             source_type=item.get("source_type", "RTSP"),
+            violation_count=violation_count,
         )
 
     return _eval
 
+
+def _make_stateful_evaluator(module_name, folder, script_code):
+    """For analytics that track each camera over time and decide themselves when to
+    alert (own cooldown and incident grouping): no consecutive-hit gate.
+    module.evaluate(result, frame, state, t, camera_id, cooldown_s, session) and
+    module.flush(state, now) return [(annotated_frame, event_type)] to report; flush
+    reports alerts the module held back (e.g. waiting for evidence frames), and is
+    called by the worker about once a second and with now=None at shutdown."""
+    _cache = {}
+
+    def _module():
+        mod = _cache.get("mod")
+        if mod is None:
+            mod = _cache["mod"] = importlib.import_module(module_name)
+        return mod
+
+    def _report(state, alerts):
+        for annotated, _event_type in alerts:
+            _save_and_report(annotated, folder=folder, script_name=script_code, **state["report_to"])
+
+    def _eval(result, item, state):
+        exam_id, shift_id = item.get("exam_id", "0"), item.get("shift_id", "0")
+        state["report_to"] = dict(device_id=item["device_id"], camera_no=item["camera_no"],
+                                  exam_id=exam_id, shift_id=shift_id,
+                                  source_type=item.get("source_type", "RTSP"))
+        camera_id = f"{item['device_id']}_{item['camera_no']}"
+        # Saved per-camera state is only trusted within the same exam shift.
+        session = None if str(exam_id) == "0" and str(shift_id) == "0" else f"exam{exam_id}_shift{shift_id}"
+        _report(state, _module().evaluate(result, item["frame"], state, item.get("captured_at") or time.time(),
+                                          camera_id, COOLDOWNS.get(script_code, 120), session))
+
+    def _flush(state, now):
+        if "report_to" in state:
+            _report(state, _module().flush(state, now))
+
+    _eval.flush = _flush
+    return _eval
+
+
+# script_code -> (module, report_folder); see _make_stateful_evaluator.
+STATEFUL_SPEC = {
+    "monitor_tamper": ("monitor_tamper_det", "monitor_tamper_detection"),
+}
 
 # Registry: script_code -> evaluator (all analytics, driven by the shared inference).
 EVALUATORS = {
     code: _make_evaluator(mod, fn, folder, code)
     for code, (mod, fn, folder) in ANALYTIC_SPEC.items()
 }
+EVALUATORS.update({
+    code: _make_stateful_evaluator(mod, folder, code)
+    for code, (mod, folder) in STATEFUL_SPEC.items()
+})
 
 
 # ============================================================
-# Unified worker — ONE inference per batch, dispatched per camera/script
+# Unified worker — each model runs ONCE per batch, dispatched per camera/script
 # ============================================================
-def unified_worker(frame_queue):
+STATS_EVERY_S = float(os.environ.get("UNIFIED_STATS_EVERY_S", "300"))
+FLUSH_EVERY_S = 1.0  # how often stateful analytics may report alerts they held back
+
+
+def _flush_stateful(states, now):
+    """Report held alerts of every stateful analytic (now=None: all of them)."""
+    for (dev, cam_no, script), state in states.items():
+        flush = getattr(EVALUATORS.get(script), "flush", None)
+        if flush is None:
+            continue
+        try:
+            flush(state, now)
+        except Exception as e:
+            logger.error(f"[Unified] flush '{script}' error ({dev}_{cam_no}): {e}")
+
+
+def _plan_batch(batch):
+    """Map each (frame, analytic) to its model. Analytics whose model isn't loaded are
+    skipped for this batch. Returns ({model: [frame idx]}, {(idx, script): model})."""
+    need, assign, skipped = {}, {}, {}
+    for idx, pkt in enumerate(batch):
+        for script in pkt.get("enabled_scripts", []):
+            if script not in EVALUATORS:
+                continue  # not yet converted to the unified path
+            model = model_for(script)
+            if not BACKENDS[model].ready():
+                skipped.setdefault(model, set()).add(script)
+                continue
+            assign[(idx, script)] = model
+            need.setdefault(model, set()).add(idx)
+    for model, scripts in skipped.items():
+        _log_skipped(model, scripts)
+    return {m: sorted(idxs) for m, idxs in need.items()}, assign
+
+
+def _run_passes(need, frames, pool, stats):
+    """Run every needed model in parallel over just the frames that need it.
+    Returns ({(model, idx): result}, [models that failed])."""
+    def run(model):
+        t = time.time()
+        res = BACKENDS[model].predict([frames[i] for i in need[model]])
+        st = stats.setdefault(model, [0, 0, 0.0])
+        st[0] += 1; st[1] += len(need[model]); st[2] += time.time() - t
+        return res
+
+    futures = {model: pool.submit(run, model) for model in need}
+    out, failed = {}, []
+    for model, fut in futures.items():
+        try:
+            for i, r in zip(need[model], fut.result()):
+                out[(model, i)] = r
+        except Exception as e:
+            logger.error(f"[Unified] {model} inference error ({len(need[model])} frames): {e}")
+            failed.append(model)
+    return out, failed
+
+
+def _person_view(result):
+    """Person analytics see the fine-tuned model's boxes at the same confidence floor
+    they had with yolov10m (that pass runs lower for the monitor analytic)."""
+    return result[result.boxes.conf >= CONF_THRESHOLD]
+
+
+def unified_worker(frame_queue, scripts=None):
     """
     RTSP worker entry (drop-in replacement for the N per-script workers).
 
     Expects packets (dict) carrying:
         frame, device_id, ch_no, camera_id_pk, exam_id, shift_id,
         enabled_scripts: list[str]   # the analytics this camera should run
+
+    `scripts` = every analytic in this run. Only the models those analytics read are
+    loaded, before the first frame (None = load each model the first time a frame needs it).
     """
-    logger.info("🟢 [Unified] worker started")
-    get_shared_model()  # warm up
+    from concurrent.futures import ThreadPoolExecutor
+
+    logger.info(f"🟢 [Unified] worker started (person model: {PERSON_MODEL}, monitor model: {MONITOR_MODEL})")
+    by_model = {}
+    for s in scripts or []:
+        if s in EVALUATORS:
+            by_model.setdefault(model_for(s), []).append(s)
+    for name, users in sorted(by_model.items()):
+        if BACKENDS[name].load_now():
+            logger.info(f"[Unified] {name} loaded for {sorted(users)}")
+        else:
+            logger.error(f"[Unified] {name} FAILED to load — {sorted(users)} will not run until it does")
+    pool = ThreadPoolExecutor(max_workers=len(BACKENDS), thread_name_prefix="unified-model")
+    stats, last_stats = {}, time.time()
+    last_flush = time.time()
     # per-(camera, script) cooldown/consec state
     states = {}
 
@@ -294,6 +446,12 @@ def unified_worker(frame_queue):
         return states.setdefault((dev, ch, script), {})
 
     while True:
+        # Also runs while no frames arrive, so a held alert is not stuck waiting for
+        # its camera's next frame.
+        if time.time() - last_flush >= FLUSH_EVERY_S:
+            last_flush = time.time()
+            _flush_stateful(states, last_flush)
+
         batch = []
         try:
             pkt = frame_queue.get(timeout=0.1)
@@ -315,26 +473,16 @@ def unified_worker(frame_queue):
             except queue_module.Empty:
                 time.sleep(0.002)
 
-        # ---- ONE inference per model, only on the frames whose analytics need it ----
-        results = [{} for _ in batch]           # per packet: model key -> result
-        need = {}                               # model key -> packet indexes
-        for i, p in enumerate(batch):
-            for script in p.get("enabled_scripts", []):
-                key = model_for(script)
-                if key is not None and script in EVALUATORS:
-                    need.setdefault(key, set()).add(i)
-        for key, idx in need.items():
-            idx = sorted(idx)
-            try:
-                out = get_shared_model(key)([batch[i]["frame"] for i in idx], conf=CONF_THRESHOLD, verbose=False)
-            except Exception as e:
-                logger.error(f"[Unified] '{key}' inference error: {e}")
-                continue                        # its analytics skip this batch; the others still run
-            for i, r in zip(idx, out):
-                results[i][key] = r
+        # ---- each needed model runs once, in parallel, over only its frames ----
+        frames = [p["frame"] for p in batch]
+        need, assign = _plan_batch(batch)
+        # A model whose pass errored gives its analytics no result for this batch (logged
+        # in _run_passes); they are skipped below, never re-run on another model.
+        out, _failed = _run_passes(need, frames, pool, stats)
 
         # ---- dispatch boxes to each camera's enabled analytics ----
-        for pkt, per_model in zip(batch, results):
+        person_views = {}
+        for idx, pkt in enumerate(batch):
             dev = pkt.get("device_id", "unknown")
             # RTSP: camera_no is the camera number; HLS: it's the ch_code.
             cam_no = pkt.get("camera_no") or pkt.get("ch_no") or "1"
@@ -354,24 +502,40 @@ def unified_worker(frame_queue):
                 # on ANY single person. The per-script workers pass it, so the
                 # unified path has to as well.
                 "tc_code":     pkt.get("tc_code", ""),
+                # Set by the producers; stateful analytics time their rules on it.
+                "captured_at": pkt.get("captured_at"),
             }
             for script in pkt.get("enabled_scripts", []):
-                fn = EVALUATORS.get(script)
-                if fn is None:
-                    continue  # not yet converted to the unified path
-                key = model_for(script)
-                if key is not None and key not in per_model:
-                    continue  # that model's inference failed for this batch
-                result = per_model.get(key)
+                model = assign.get((idx, script))
+                result = out.get((model, idx)) if model else None
+                if result is None:
+                    continue  # no model output for this frame (loading / failed)
                 try:
-                    fn(result, item, state_for(dev, cam_no, script))
+                    if model == "person_monitor_yolo26m" and script in PERSON_ANALYTICS:
+                        if idx not in person_views:
+                            person_views[idx] = _person_view(result)
+                        result = person_views[idx]
+                    EVALUATORS[script](result, item, state_for(dev, cam_no, script))
                 except Exception as e:
                     logger.error(f"[Unified] evaluator '{script}' error ({dev}_{cam_no}): {e}")
 
         for p in batch:
             p.pop("frame", None)
 
+        if time.time() - last_stats >= STATS_EVERY_S:
+            elapsed = time.time() - last_stats
+            parts = [f"{m}: {n} passes, {f} frames, {1000 * sec / max(n, 1):.0f} ms/pass, "
+                     f"GPU busy {100 * sec / elapsed:.0f}%" for m, (n, f, sec) in sorted(stats.items())]
+            try:
+                backlog = frame_queue.qsize()
+            except Exception:
+                backlog = "?"
+            logger.info(f"[Unified] last {elapsed:.0f}s — queue backlog {backlog} — " + "; ".join(parts))
+            stats.clear(); last_stats = time.time()
+
         if stop:
             break
 
+    _flush_stateful(states, None)
+    pool.shutdown(wait=False)
     logger.info("🔴 [Unified] worker stopped")

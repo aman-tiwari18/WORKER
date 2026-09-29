@@ -89,8 +89,8 @@ def _finetuned(env_name, default_file):
     return DETECTION_MODEL_PATH
 
 
-PERSON_MODEL_PATH = _finetuned("YOLO_PERSON_MODEL", "monitor_person_model.pt")
-PHONE_MODEL_PATH = _finetuned("YOLO_PHONE_MODEL", "phone_model.pt")
+PERSON_MODEL_PATH = _finetuned("YOLO_PERSON_MODEL", "monitor_person_yolo26m.pt")
+PHONE_MODEL_PATH = _finetuned("YOLO_PHONE_MODEL", "best_mobile_model.pt")
 
 INVERSION_MODEL_PATH = os.path.join(
     _MODELS_DIR, os.environ.get("YOLO_INVERSION_MODEL", "yolo26n.pt")

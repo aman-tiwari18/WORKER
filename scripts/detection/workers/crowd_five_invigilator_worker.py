@@ -1,0 +1,328 @@
+"""
+Crowd < 5 + Invigilator Static Worker — supports both RTSP (via master_pipeline producer)
+and HLS (via its own internal OpenCV reader).
+
+All per-camera rule state (invigilator position JSON, seated-count window, frame hash)
+lives in crowd_five_invigilator_det; this worker only batches frames and applies the
+per-camera cooldown at save time.
+"""
+
+import queue
+import time
+import os
+_DET_GPU_ID = int(os.environ["WORKER_INDEX"]) if os.environ.get("WORKER_INDEX", "").strip().isdigit() else int("".join(c for c in os.environ.get("WORKER_ID", "main").split("-")[-1] if c.isdigit()) or "0")
+import logging
+import threading
+import signal
+import cv2
+import torch
+
+# Ensure detection root is on path for imports
+import sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DETECTION_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+if DETECTION_ROOT not in sys.path:
+    sys.path.insert(0, DETECTION_ROOT)
+
+# Import core detection module
+import crowd_five_invigilator_det as cfi_core
+
+# ================= GPU MEMORY GUARD =================
+from workers.gpu_memory_guard import apply_gpu_memory_limit
+apply_gpu_memory_limit()  # cap per-process VRAM before any CUDA alloc
+
+# ================= GRACEFUL STOP FLAG =================
+_STOP_EVENT = threading.Event()
+
+def _handle_stop(sig, frame):
+    _STOP_EVENT.set()
+
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGINT,  _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+
+# ================= LOGGING =================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+import uuid
+
+# ================= CONFIG ==================
+FOLDER           = "crowd_five_invigilator_detection"
+RTSP_SAVE_FOLDER = os.path.join(DETECTION_ROOT, "results", FOLDER)
+HLS_SAVE_FOLDER  = os.path.join(DETECTION_ROOT, "results/tcs_detections", FOLDER)
+
+os.makedirs(RTSP_SAVE_FOLDER, exist_ok=True)
+os.makedirs(HLS_SAVE_FOLDER,  exist_ok=True)
+
+# GPU Queue Config
+GPU_BATCH_SIZE      = 16
+GPU_QUEUE_SIZE      = 32
+BATCH_WAIT_TIMEOUT  = 0.2
+HLS_SAMPLE_EVERY    = 5
+
+_gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
+
+# =====================================================
+# 🚀 GPU BATCH WORKER
+# =====================================================
+def _gpu_batch_worker(stop_event, save_folder, cooldown_time=420):
+    cooldown_time = int(os.environ.get("COOLDOWN_TIME", cooldown_time))
+    """GPU batch worker — TRUE batch inference."""
+    logger.info("🚀 [CrowdFiveInvig] GPU worker started (true batch mode)")
+
+    try:
+        cfi_core.get_yolo_model()
+    except Exception:
+        logger.exception("[CrowdFiveInvig] YOLO model warmup failed")
+        stop_event.set()
+        return
+    log_counter = 0
+
+    while not stop_event.is_set():
+        batch = []
+        try:
+            batch.append(_gpu_queue.get(timeout=0.1))
+        except queue.Empty:
+            continue
+
+        # Fill batch
+        deadline = time.time() + BATCH_WAIT_TIMEOUT
+        while len(batch) < GPU_BATCH_SIZE and time.time() < deadline:
+            try:
+                batch.append(_gpu_queue.get_nowait())
+            except queue.Empty:
+                time.sleep(0.002)
+
+        inference_items = [
+            {
+                'frame':     item['frame'],
+                'ch_no':     item['ch_no'],
+                'device_id': item.get('device_id') or item.get('camera_id'),  # tracker key
+            }
+            for item in batch
+        ]
+
+        try:
+            batch_results = cfi_core.detect_crowd_five_invigilator_batch(inference_items)
+        except Exception as e:
+            logger.error(f"[CrowdFiveInvig] Batch inference error: {e}")
+            for item in batch:
+                item.pop('frame', None)
+            del batch
+            continue
+        finally:
+            inference_items = []
+
+        for item in batch:
+            item.pop('frame', None)
+
+        for item, (annotated_frame, detected, seated, _telemetry) in zip(batch, batch_results):
+            if not detected:
+                del annotated_frame
+                continue
+
+            state = item.get('state', {})
+            now = time.time()
+            if now - state.get("last_save", 0) < cooldown_time:
+                del annotated_frame
+                continue
+
+            state["last_save"] = now
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            uid = str(uuid.uuid4())
+
+            dev_id = item.get("device_id") or item.get("camera_id")
+            ch_no = item.get("ch_no")
+            exam_id = item.get("exam_id") or "0"
+            shift_id = item.get("shift_id") or os.environ.get("SHIFT_ID", "0")
+            script_name = item.get("script_name", "crowd_five_invigilator")
+
+            if item.get("source_type") == "HLS":
+                fname = f"{script_name}_ch{ch_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
+            else:
+                fname = f"{script_name}_{dev_id}_{ch_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
+
+            path = os.path.join(save_folder, fname)
+            cv2.imwrite(path, annotated_frame)
+            logger.warning(f"[CrowdFiveInvig] 🚨 SAVED seated={seated:.1f} + invigilator static → {path}")
+
+            # Report to database
+            if item.get("source_type") == "HLS":
+                try:
+                    from utils.db_client import report_to_db_hls
+                    report_to_db_hls(ch_code=str(ch_no), image_name=fname, folder=FOLDER)
+                except Exception as e:
+                    logger.error(f"[CrowdFiveInvig] HLS DB Reporting Error: {e}")
+            else:  # RTSP
+                try:
+                    from utils.db_client import report_to_db_rtsp
+                    report_to_db_rtsp(device_id=str(dev_id), camera_no=str(ch_no),
+                                      image_name=fname, folder=FOLDER)
+                except Exception as e:
+                    logger.error(f"[CrowdFiveInvig] RTSP DB Reporting Error: {e}")
+
+            del annotated_frame
+
+        del batch
+        # Periodically flush CUDA cache to avoid memory fragmentation
+        log_counter += 1
+        if log_counter % 50 == 0:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.debug(f"[Worker] GPU batch #{log_counter} processed")
+
+    logger.info("🔴 [CrowdFiveInvig] GPU worker stopped")
+
+# =====================================================
+# 📡 RTSP PATH (called by master_pipeline)
+# =====================================================
+def crowd_five_invigilator_worker(frame_queue):
+    """RTSP Worker entry point."""
+    logger.info("🟢 [CrowdFiveInvig] RTSP worker started")
+    stop_event = threading.Event()
+
+    gpu_t = threading.Thread(
+        target=_gpu_batch_worker,
+        args=(stop_event, RTSP_SAVE_FOLDER),
+        daemon=True
+    )
+    gpu_t.start()
+
+    camera_states = {}
+
+    try:
+        while True:
+            packet = frame_queue.get()
+            if packet is None:
+                break
+
+            if isinstance(packet, dict):
+                frame        = packet.get("frame")
+                device_id    = str(packet.get("device_id", "unknown"))
+                camera_no    = str(packet.get("camera_no") or packet.get("ch_no") or "0")
+                exam_id      = str(packet.get("exam_id", "0"))
+            else:
+                frame, device_id, camera_no, _, exam_id = packet[:5]
+
+            if frame is None:
+                continue
+
+            cam_key = (device_id, camera_no)
+            if cam_key not in camera_states:
+                camera_states[cam_key] = {"last_save": 0}
+
+            try:
+                _gpu_queue.put({
+                    "frame":        frame.copy(),
+                    "device_id":    device_id,
+                    "camera_no":    camera_no,
+                    "ch_no":        camera_no,
+                    "exam_id":      exam_id,
+                    "shift_id":     os.environ.get("SHIFT_ID", "0"),
+                    "script_name":  "crowd_five_invigilator",
+                    "source_type":  "RTSP",
+                    "state":        camera_states[cam_key],
+                }, timeout=0.1)
+            except queue.Full:
+                pass
+            finally:
+                del frame
+    finally:
+        stop_event.set()
+        gpu_t.join(timeout=5)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+# =====================================================
+# 📡 HLS PATH
+# =====================================================
+def _hls_camera_thread(cfg, stop_event, state=None):
+    """HLS Camera reader thread."""
+    from tcs_hls_utils import extract_hls_streaming_url, test_hls_stream, open_hls_stream
+
+    camera_id   = cfg['camera_id']
+    script_name = cfg.get('script_code', 'crowd_five_invigilator')
+    ch_no       = cfg.get('ch_no') or cfg.get('camera_no') or camera_id
+    exam_id     = cfg.get('exam_id', '0')
+    shift_id    = cfg.get('shift_id', '0')
+    initial_url = cfg.get('cctv_url') or cfg.get('stream_url') or cfg.get('url', '')
+
+    hls = extract_hls_streaming_url(initial_url)
+    if not hls or not test_hls_stream(hls):
+        return
+
+    cap = open_hls_stream(hls)
+    if cap is None:
+        return
+
+    frame_count = 0
+    if state is None:
+        state = {"last_save": 0}
+
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        if frame_count % HLS_SAMPLE_EVERY != 0:
+            continue
+
+        if frame is None or frame.size == 0:
+            continue
+
+        try:
+            _gpu_queue.put_nowait({
+                "frame":       frame.copy(),
+                "camera_id":   camera_id,
+                "ch_no":       ch_no,
+                "exam_id":     exam_id,
+                "shift_id":    shift_id,
+                "script_name": script_name,
+                "source_type": "HLS",
+                "state":       state,
+            })
+        except queue.Full:
+            pass
+        finally:
+            del frame
+
+    cap.release()
+
+def crowd_five_invigilator_worker_hls(camera_configs, stop_event=None):
+    """HLS worker entry point."""
+    if isinstance(camera_configs, dict):
+        camera_configs = [camera_configs]
+
+    if stop_event is None:
+        stop_event = _STOP_EVENT
+
+    # Scene filtering — must mirror camera_loader.py SCRIPT_CLASSIFICATION_MAP["crowd_five_invigilator"]
+    valid_configs = []
+    for cfg in camera_configs:
+        cls_val = str(cfg.get('classification', '')).lower()
+        if not cls_val or any(s in cls_val for s in (
+            'computer lab', 'inside lab', 'exam lab', 'lab',
+            'inside classroom', 'inside_classroom', 'classroom'
+        )):
+            valid_configs.append(cfg)
+
+    if not valid_configs:
+        return
+
+    gpu_t = threading.Thread(
+        target=_gpu_batch_worker,
+        args=(stop_event, HLS_SAVE_FOLDER),
+        daemon=True
+    )
+    gpu_t.start()
+
+    from workers.hls_scheduler import run_hls_cameras
+    run_hls_cameras(valid_configs, stop_event, _hls_camera_thread, label="CrowdFiveInvig")
+    stop_event.set()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
