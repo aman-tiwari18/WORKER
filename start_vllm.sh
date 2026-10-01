@@ -22,7 +22,9 @@ export VLLM_USE_V1=0
 # needs longer to warm up than the 7B, so bumping the timeout further.
 export VLLM_RPC_TIMEOUT=120
 mkdir -p "$HF_HOME"
-source /data/cctv_dev/cctv/script-server/venv/bin/activate
+# Host venv of the old setup; absent (and not needed) inside the worker image.
+VENV=/data/cctv_dev/cctv/script-server/venv/bin/activate
+[ -f "$VENV" ] && source "$VENV"
 
 echo "Starting vLLM server on port 8001..."
 echo "Model: Qwen/Qwen3-VL-30B-A3B-Instruct"

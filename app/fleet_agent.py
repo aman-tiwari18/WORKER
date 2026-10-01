@@ -55,6 +55,9 @@ def _capabilities() -> dict:
         # Prometheus scrape target (Fleet /prometheus/sd): host LAN IP + port
         "metrics_port": int(os.getenv("METRICS_PORT", "0") or 0) or None,
         "vision": os.getenv("ENABLE_VISION", "1").strip().lower() in ("1", "true", "yes"),
+        # "remote" = outside the LAN (Fleet bootstrap --remote): metrics are pushed by the
+        # edge-agent and relayed by the backend instead of being scraped directly.
+        "network": os.getenv("FLEET_NETWORK", "lan").strip().lower() or "lan",
         "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES", ""),
         "max_concurrent": os.getenv("MAX_CONCURRENT", ""),
     }
