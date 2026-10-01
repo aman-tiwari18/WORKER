@@ -11,11 +11,9 @@ services:
     restart: unless-stopped
     shm_size: '8gb'
     env_file: .env
-    # The published ghcr image's entrypoint gated on MySQL; backend mode needs no
-    # DB, so run the agent directly. (Newer images skip the gate when
-    # DB_ACCESS_MODE=backend, so this override is just belt-and-suspenders.)
-    entrypoint: ["python", "run.py"]
-    command: []
+    # Image entrypoint (docker-entrypoint.sh): skips the MySQL gate when
+    # DB_ACCESS_MODE=backend and seeds ./models from the image (fine-tuned
+    # monitor_person_yolo26m.pt / best_mobile_model.pt) — do not override it.
     environment:
       IS_MAIN_WORKER: "1"           # single-worker stack: write RUNNING/COMPLETED so the Executions tab is correct
       # Base CUDA image has no tzdata and defaults to UTC, so log lines read
