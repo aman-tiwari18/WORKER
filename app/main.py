@@ -810,15 +810,11 @@ async def detection_watch_loop():
             known_detection_files = new_known
             known_detection_by_date = new_date_index
 
-            # Today count via date index (O(today), not O(N)), minus operator skips
-            # so the live counts match what /detections lists.
+            # Today count via date index (O(today), not O(N)). Skipped detections
+            # are counted too, matching /detections, which lists every detection.
             today_iso = datetime.now().date().isoformat()
-            skipped_uids = await asyncio.to_thread(_get_skipped_uids)
             counts = {
-                k: sum(
-                    1 for tp in known_detection_by_date.get(k, {}).get(today_iso, set())
-                    if os.path.splitext(os.path.basename(tp))[0].split("_")[-1] not in skipped_uids
-                ) if skipped_uids else len(known_detection_by_date.get(k, {}).get(today_iso, set()))
+                k: len(known_detection_by_date.get(k, {}).get(today_iso, set()))
                 for k in DETECTION_FOLDERS
             }
             await sio.emit("detection:counts", counts)
@@ -1569,6 +1565,53 @@ def _get_skipped_uids():
     return _skipped_uids
 
 
+# Region filter (admin/client/operator Detections page + Cameras tab). Region
+# only exists on camera_links_rtsp (added 2026-09-30), so this covers RTSP
+# detections only — HLS items have no region and are excluded when a region
+# filter is active. Cached with a short TTL since /detections is polled often.
+_region_cache: dict = {"map": {}, "regions": [], "ts": 0.0}
+_REGION_CACHE_TTL = 60.0
+
+
+def _get_region_map():
+    """({device_id}_{camera_no} -> region, sorted distinct regions), TTL-cached."""
+    now = time.time()
+    if now - _region_cache["ts"] < _REGION_CACHE_TTL and _region_cache["ts"] > 0:
+        return _region_cache["map"], _region_cache["regions"]
+    try:
+        conn = _get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT device_id, camera_no, region FROM camera_links_rtsp "
+                    "WHERE region IS NOT NULL AND region <> ''"
+                )
+                rows = cur.fetchall()
+        finally:
+            conn.close()
+        m, regions = {}, set()
+        for r in rows:
+            reg = str(r.get("region") or "").strip()
+            if not reg:
+                continue
+            key = f"{str(r.get('device_id') or '').strip()}_{str(r.get('camera_no') or '').strip()}"
+            m[key] = reg
+            regions.add(reg)
+        _region_cache["map"] = m
+        _region_cache["regions"] = sorted(regions)
+        _region_cache["ts"] = now
+    except Exception as e:
+        logger.error(f"Failed to load region map: {e}")
+    return _region_cache["map"], _region_cache["regions"]
+
+
+@app.get("/detections/regions")
+async def get_detection_regions():
+    """Distinct regions (RTSP camera_links_rtsp) for the Detections page filter dropdown."""
+    _, regions = await asyncio.to_thread(_get_region_map)
+    return {"success": True, "data": regions}
+
+
 def parse_detection_filename(
     filename: str,
     type_key: str,
@@ -1810,6 +1853,7 @@ def list_detections(
     end_time: Optional[str] = None,
     exam_id: Optional[str] = None,
     shift_id: Optional[str] = None,
+    region: Optional[str] = None,      # RTSP-only (camera_links_rtsp.region); see _get_region_map
     gpu_id: Optional[int] = None,      # operator sharding: restrict to this worker's gpu
     page: int = 1,
     limit: int = 50,
@@ -1832,6 +1876,11 @@ def list_detections(
     # Take stable references to avoid races with the background watcher.
     snapshot = known_detection_files
     date_index = known_detection_by_date
+
+    region = (region or "").strip()
+    region_map = {}
+    if region:
+        region_map, _ = _get_region_map()
 
     # Single pass: compute counts for ALL types (for the sidebar / header pill)
     # AND build the candidate list for the requested type(s) only.
@@ -1876,6 +1925,14 @@ def list_detections(
                     if db_gpu is not None and db_gpu != int(gpu_id):
                         continue
 
+            # Region filter (RTSP only — no region on HLS cameras). Cheap: just
+            # splits the filename stem, no DB hit (region_map is preloaded above).
+            if region:
+                stem_for_region = os.path.splitext(relative_path.split("/")[-1])[0]
+                split = _split_rtsp_stem(stem_for_region)
+                if not split or region_map.get(f"{split[1]}_{split[2]}") != region:
+                    continue
+
             # Date is pre-filtered by the index; only run the regex for the
             # remaining filters to avoid redundant filename parsing.
             check_date = None if using_date_index else date
@@ -1885,10 +1942,8 @@ def list_detections(
                 continue
 
             basic = _basic_detection_meta(relative_path)
-            # Operator-skipped detections are reviewed-and-dismissed: hidden from
-            # the list and the counts (uid = last "_" segment of the filename stem).
-            if skipped_uids and basic["uid"] in skipped_uids:
-                continue
+            # Operator-skipped detections stay in the admin list and counts —
+            # every detection is shown, flagged `skipped` below, never hidden.
 
             all_counts[type_key] += 1
 
@@ -2053,7 +2108,15 @@ def list_detections(
         uid = item.get("uid")
         meta = uid_db_meta.get(uid, {})
         item["pushed_to_client"] = 1 if uid in pushed_uids else 0
+        item["skipped"] = 1 if uid in skipped_uids else 0
         item["sms_sent"] = 1 if meta.get("sms_sent") == 1 else 0
+        if not region_map and item.get("device_id"):
+            # Item display doesn't require the `region` query filter to be active —
+            # load the map lazily (still TTL-cached) so cards can show region too.
+            region_map, _ = _get_region_map()
+        reg = region_map.get(f"{item.get('device_id')}_{item.get('camera_no')}")
+        if reg:
+            item["region"] = reg
         # Filename gpu_id is primary (e.g. _gpu4_ token); only fall back to the
         # DB column when the filename had no _gpu token (older detections).
         db_gpu = meta.get("gpu_id")
@@ -2389,12 +2452,15 @@ def list_client_detections(
     until: Optional[str] = None,       # queued-review anchor (see _FEED_SOURCE_RANK)
     until_source: Optional[str] = None,
     until_id: Optional[int] = None,
+    region: Optional[str] = None,      # RTSP-only (camera_links_rtsp.region)
 ):
     all_counts = {k: 0 for k in DETECTION_FOLDERS}
 
     # Shift filter = that shift's time window folded into start/end (robust on
     # historical rows whose stored shift_id is NULL).
     start_time, end_time = _apply_shift_window(shift_id, start_time, end_time)
+
+    region = (region or "").strip()
 
     conn = _get_connection()
     try:
@@ -2464,6 +2530,29 @@ def list_client_detections(
                 if include_type and sql_folder_names:
                     ph = ','.join(['%s'] * len(sql_folder_names))
                     conds.append(f"detection_type IN ({ph})"); params.extend(sql_folder_names)
+                # Region has no HLS equivalent — dropping camera_report_hls from
+                # active_tables below (when region is set) is what actually excludes
+                # HLS rows; this subquery only needs to run for the RTSP table.
+                if region:
+                    # camera_report_rtsp and camera_links_rtsp have different default
+                    # collations (utf8mb4_0900_ai_ci vs utf8mb4_unicode_ci) — bare
+                    # columns need an explicit COLLATE to compare. The table name is
+                    # hardcoded (not an alias) because this is only ever reached for
+                    # the RTSP table — region has no HLS equivalent, so
+                    # camera_report_hls is dropped from active_tables below whenever
+                    # region is set. An unqualified `device_id` here would resolve to
+                    # the subquery's own camera_links_rtsp column, making EXISTS
+                    # trivially true for every row instead of correlating to the
+                    # outer one — silently returning everything unfiltered.
+                    conds.append(
+                        "EXISTS (SELECT 1 FROM camera_links_rtsp l "
+                        "WHERE l.device_id COLLATE utf8mb4_unicode_ci = "
+                        "camera_report_rtsp.device_id COLLATE utf8mb4_unicode_ci "
+                        "AND l.camera_no COLLATE utf8mb4_unicode_ci = "
+                        "camera_report_rtsp.camera_no COLLATE utf8mb4_unicode_ci "
+                        "AND l.region = %s)"
+                    )
+                    params.append(region)
                 return " AND ".join(conds), params
 
             where_data, params_data = _build_where(include_type=True)
@@ -2493,6 +2582,11 @@ def list_client_detections(
                 if source == "rtsp" and table == "camera_report_hls":
                     continue
                 if source == "hls" and table == "camera_report_rtsp":
+                    continue
+                # No region data on HLS cameras — a region filter can never match
+                # camera_report_hls, and its rows have no device_id/camera_no
+                # columns for the subquery above to run against.
+                if region and table == "camera_report_hls":
                     continue
                 active_tables.append(table)
 
@@ -2706,7 +2800,9 @@ def get_operator_gpu_ids(user_id) -> list:
 @sio.event
 async def connect(sid, environ, auth):
     """Role-based rooms:
-       - operator  → join only gpu:{id} rooms for their assigned gpu_ids
+       - operator with an assigned gpu → join only gpu:{id} rooms for their gpu_ids
+       - operator with no gpu assigned → the 'all' room, like admin: their
+         detections list is unfiltered too, so live updates must match it
        - admin/client/unauthenticated → join the 'all' room (every detection)
     """
     auth = auth or {}
@@ -2720,7 +2816,8 @@ async def connect(sid, environ, auth):
             await sio.enter_room(sid, f"gpu:{g}")
             joined.append(f"gpu:{g}")
         if not joined:
-            logger.warning(f"Operator user_id={user_id} has no gpu assignment — will receive no live detections")
+            await sio.enter_room(sid, "all")
+            joined.append("all")
     else:
         # admin / client / unauthenticated → see everything
         await sio.enter_room(sid, "all")

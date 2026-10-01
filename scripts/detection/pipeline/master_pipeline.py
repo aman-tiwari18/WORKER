@@ -254,6 +254,24 @@ _ACTIVE_CHILD_LOCK = threading.Lock()
 DSS_USER = os.environ.get("CAMVIEW_AUTH_USER", "system")
 DSS_PASS = os.environ.get("CAMVIEW_AUTH_PASS", "")
 
+# Camview DVRs allow ONE active session per username: every new login kills the
+# previous token. So all tokens come from the token coordination server on
+# worker-0 (camview_token_server.py) — one session per DVR for the whole fleet,
+# kept alive there — exactly like vision_classification_rtsp.py. Detection used
+# to log in directly from every worker/process (and re-login every 5 min), so
+# each login killed the session the others were streaming with.
+# Set CAMVIEW_TOKEN_SERVER="" to fall back to direct login (single-host only).
+_WORKER_ID = os.environ.get("WORKER_ID", "worker-0")
+CAMVIEW_TOKEN_SERVER = os.environ.get(
+    "CAMVIEW_TOKEN_SERVER",
+    "http://localhost:8090" if _WORKER_ID in ("worker-0", "") else "http://192.168.19.30:8090",
+).rstrip("/")
+# How long a process reuses a token from the server before asking again. Short, so a
+# re-login on the server reaches every worker within seconds (a 401 refreshes at once).
+TOKEN_SERVER_LOCAL_TTL = float(os.environ.get("TOKEN_SERVER_LOCAL_TTL", "20"))
+# After the server reports a DVR as unavailable (auth failed / locked), don't ask again for this long.
+TOKEN_SERVER_FAIL_TTL = float(os.environ.get("TOKEN_SERVER_FAIL_TTL", "30"))
+
 # ================= CRITICAL FIX: Shared disk-based token cache =================
 TOKEN_CACHE_FILE = os.path.join(PROJECT_ROOT, "server_tokens.json")
 TOKEN_LOCK_FILE = f"{TOKEN_CACHE_FILE}.lock"
@@ -572,7 +590,97 @@ def _record_auth_result(server_address, token):
     _with_file_lock(_do)
 
 
+_ts_tokens = {}        # server -> (token or None, fetched_at)  — token-server mode cache
+_ts_locks = {}         # server -> Lock (one in-flight fetch per server per process)
+_ts_locks_meta = threading.Lock()
+_warn_last = {}        # key -> last warning time (rate-limited logging)
+
+
+def _warn_rl(key, msg, every=60):
+    """logger.warning at most once per `every` seconds per key (the RR loop retries constantly)."""
+    now = time.time()
+    if now - _warn_last.get(key, 0) >= every:
+        _warn_last[key] = now
+        logger.warning(msg)
+
+
+def _ts_lock(server_address):
+    with _ts_locks_meta:
+        lock = _ts_locks.get(server_address)
+        if lock is None:
+            lock = _ts_locks[server_address] = threading.Lock()
+        return lock
+
+
+def _get_token_from_server(server_address, force=False):
+    """Token for a DVR from the coordination server (cached here TOKEN_SERVER_LOCAL_TTL s).
+    None = no usable token right now (DVR locked/unreachable, or server down)."""
+    with _ts_lock(server_address):
+        tok, ts = _ts_tokens.get(server_address, (None, 0))
+        age = time.time() - ts
+        if not force:
+            if tok and age < TOKEN_SERVER_LOCAL_TTL:
+                return tok
+            if not tok and ts and age < TOKEN_SERVER_FAIL_TTL:
+                return None
+        try:
+            r = requests.get(f"{CAMVIEW_TOKEN_SERVER}/token",
+                             params={"server": server_address, **({"force": "1"} if force else {})},
+                             timeout=90)
+            tok = r.json().get("token") if r.status_code == 200 else None
+            if not tok:
+                _warn_rl(f"ts:{server_address}",
+                         f"Token server has no token for {server_address} (HTTP {r.status_code}) — DVR auth failed or locked")
+        except Exception as e:
+            tok = None
+            _warn_rl(f"ts:{server_address}", f"Token server {CAMVIEW_TOKEN_SERVER} unreachable for {server_address}: {e}")
+        _ts_tokens[server_address] = (tok, time.time())
+        return tok
+
+
+def invalidate_server_token(server_address, token):
+    """The DVR rejected `token` (HTTP 401). Drop it everywhere it could be reused, so the
+    very next get_server_token() returns the current/new session instead of the dead one.
+    Only drops it if it is still the cached token — a newer one is left alone."""
+    if not token:
+        return
+    if CAMVIEW_TOKEN_SERVER:
+        with _ts_lock(server_address):
+            if _ts_tokens.get(server_address, (None, 0))[0] == token:
+                _ts_tokens.pop(server_address, None)
+        try:
+            # The server evicts only if `token` is still its current one (no re-login storm).
+            requests.post(f"{CAMVIEW_TOKEN_SERVER}/evict",
+                          json={"server": server_address, "token": token}, timeout=5)
+        except Exception:
+            pass
+        return
+    with _local_lock:
+        if _server_tokens_local.get(server_address) == token:
+            _server_tokens_local.pop(server_address, None)
+            _server_token_timestamps_local.pop(server_address, None)
+
+    def _do():  # also the shared disk cache, or other processes keep handing it out
+        _load_token_cache()
+        if _server_tokens_local.get(server_address) == token:
+            _server_tokens_local.pop(server_address, None)
+            _server_token_timestamps_local.pop(server_address, None)
+            _save_token_cache()
+    try:
+        _with_file_lock(_do)
+    except Exception as e:
+        logger.error(f"Failed to invalidate token cache for {server_address}: {e}")
+
+
 def get_server_token(server_address):
+    """Current DSS session token for a DVR server — call it every time a token is needed
+    (it is cached; never hold on to a token across visits: sessions get replaced)."""
+    if CAMVIEW_TOKEN_SERVER:
+        return _get_token_from_server(server_address)
+    return _get_server_token_direct(server_address)
+
+
+def _get_server_token_direct(server_address):
     """
     Token management with claim-and-release file locking.
 
@@ -708,6 +816,19 @@ def extract_host_port(url):
     return host, port
 
 
+def _camera_classes_from_env(script_code):
+    """Camera types chosen on this analytic's assignment: JSON list in
+    CAMERA_CLASSIFICATIONS_<ANALYTIC> (see script_runner.py). [] = use defaults."""
+    raw = os.environ.get(f"CAMERA_CLASSIFICATIONS_{str(script_code).upper()}", "").strip()
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+    except ValueError:
+        val = [raw]
+    return [str(v).strip() for v in val if str(v).strip()] if isinstance(val, list) else []
+
+
 def authenticate_and_get_token(server):
     """Backwards compatibility wrapper."""
     return get_server_token(server)
@@ -759,13 +880,12 @@ def get_rtsp_from_dss(device_id, camera_no, token, server):
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=10)
         
         if r.status_code == 401:
-            logger.debug(f"Token expired for {server}, clearing cache")
-            with _local_lock:
-                _server_tokens_local.pop(server, None)
+            _warn_rl(f"401:{server}", f"DSS session token rejected by {server} (401) — refreshing token")
+            invalidate_server_token(server, token)
             return None
 
         if r.status_code != 200:
-            logger.debug(f"StartVideo failed with status {r.status_code}")
+            _warn_rl(f"sv:{server}:{r.status_code}", f"StartVideo on {server} failed: HTTP {r.status_code}")
             return None
 
         data = r.json()
@@ -970,13 +1090,10 @@ def rtsp_producer(cam_configs, queues, pre_fetched_token=None, enabled_scripts=N
         stream_token = None
         
         if use_dss:
-            # FIXED: Always get a fresh token before connecting. 
-            # Pre-fetched token is used as fallback, but may be stale.
-            token = pre_fetched_token
-            if token:
-                logger.debug(f"Using pre-fetched token for {label}")
-            else:
-                token = get_server_token(server)
+            # Always the CURRENT session token (cached in get_server_token). Never the
+            # pre-fetched one: once the DVR session is replaced it stays dead, and a
+            # producer reconnecting with it failed for the rest of the shift.
+            token = get_server_token(server)
             
             if not token:
                 logger.error(f"Auth failed (server might be locked) → {label}, retry in 30s")
@@ -1189,6 +1306,9 @@ def run_rtsp_pipeline(camera_group, max_concurrent=MAX_CONCURRENT, unified=None)
         if server and not str(c.get("cctv_url", "")).startswith("rtsp://"):
             unique_servers.add(server)
     
+    # Warm-up / reachability check only: producers and round-robin visits call
+    # get_server_token() themselves each time, so a session replaced mid-shift is
+    # picked up — tokens in this map are NOT reused for streaming.
     server_tokens_map = {}
     for server in unique_servers:
         if STOP:
@@ -1387,14 +1507,21 @@ def get_rtsp_cached(label, device_id, camera_no, token, server):
     if STARTVIDEO_CACHE_TTL > 0:
         with _startvideo_cache_lock:
             hit = _startvideo_cache.get(label)
-        if hit and (time.time() - hit[2]) < STARTVIDEO_CACHE_TTL:
+        # Only reuse a StartVideo made with the current session token — its stream
+        # token dies with the session it came from.
+        if hit and hit[3] == token and (time.time() - hit[2]) < STARTVIDEO_CACHE_TTL:
             return hit[0], hit[1]
     result = get_rtsp_from_dss(device_id, camera_no, token, server)
     if result and STARTVIDEO_CACHE_TTL > 0:
         urls, stream_token = result
         with _startvideo_cache_lock:
-            _startvideo_cache[label] = (urls, stream_token, time.time())
+            _startvideo_cache[label] = (urls, stream_token, time.time(), token)
     return result
+
+
+def drop_rtsp_cache(label):
+    with _startvideo_cache_lock:
+        _startvideo_cache.pop(label, None)
 
 
 def _rr_resolve(first):
@@ -1451,7 +1578,9 @@ def _rr_capture_once(label, configs, enabled_scripts, server_tokens_map, unified
     try:
         stream_urls = []
         if use_dss:
-            token = server_tokens_map.get(server) or get_server_token(server)
+            # Current token on every visit (was: the token pre-fetched at pipeline
+            # start, reused for the whole shift → every visit failed once it died).
+            token = get_server_token(server)
             if not token:
                 return False
             result = get_rtsp_cached(label, device_id, camera_no, token, server)
@@ -1495,6 +1624,8 @@ def _rr_capture_once(label, configs, enabled_scripts, server_tokens_map, unified
             cap.release()
             if grabbed:
                 return True  # success on this URL; done for this visit
+        if use_dss:
+            drop_rtsp_cache(label)  # cached stream URLs didn't open — StartVideo afresh next visit
         return False
     finally:
         sem.release()
@@ -1987,6 +2118,13 @@ def main():
                 "link_type":   link_type,
                 "script_code": script_code,
             }
+            # The assignment's "Camera Type" selection for THIS analytic (set by
+            # script_runner.py as CAMERA_CLASSIFICATIONS_<ANALYTIC>); none = the
+            # analytic's built-in default camera types.
+            custom_cls = _camera_classes_from_env(script_code)
+            if custom_cls:
+                execution["camera_classifications"] = custom_cls
+                logger.info(f"[CameraLoader] {script_code}: camera types from the assignment = {custom_cls}")
             cameras = load_cameras_for_execution(execution)
             if cameras: 
                 results.append((execution, cameras))

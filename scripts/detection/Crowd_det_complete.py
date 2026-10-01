@@ -29,8 +29,13 @@ if BASE_DIR not in sys.path:
 # - Outdoor Scene / Outside Area / Biometric Area
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))       # Seconds between saves (2 min — per detection frequency spec)
-MIN_PERSONS = 10          # Crowd violation when persons > 10 (strictly greater)
+MIN_PERSONS = 10          # Crowd violation when STANDING persons >= 10
 CONF_THRESHOLD = 0.45     # Confidence for person detection
+
+# Standing-only — seated persons are NOT counted. Same bbox rule as
+# invigilator_tracking (seated boxes sit at h/w ~1.2-2.5; standing ~3-4).
+STANDING_MIN_HEIGHT   = 100   # px; below this is far-away YOLO noise
+STANDING_ASPECT_RATIO = 2.5   # h/w >= 2.5 → standing
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -58,39 +63,60 @@ _state_lock = threading.Lock()
 # =====================================================
 # CORE DETECTION LOGIC
 # =====================================================
+def _split_standing_seated(boxes):
+    """Return (standing, seated) lists of (x1, y1, x2, y2, conf) person boxes."""
+    standing, seated = [], []
+    for box in boxes:
+        if int(box.cls[0]) != 0:
+            continue
+        conf = float(box.conf[0])
+        if conf < CONF_THRESHOLD:
+            continue
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        w, h = x2 - x1, y2 - y1
+        if w <= 0 or h <= 0:
+            continue
+        if h >= STANDING_MIN_HEIGHT and (h / w) >= STANDING_ASPECT_RATIO:
+            standing.append((x1, y1, x2, y2, conf))
+        else:
+            seated.append((x1, y1, x2, y2, conf))
+    return standing, seated
+
+
+def _annotate(frame, standing, seated, crowd_detected, footer):
+    """Draw standing (red, counted) and seated (thin green, ignored) boxes + status overlay."""
+    for x1, y1, x2, y2, conf in seated:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+        cv2.putText(frame, f"S {conf:.2f}", (x1, max(y1 - 8, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+    for x1, y1, x2, y2, conf in standing:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(frame, f"P {conf:.2f}", (x1, max(y1 - 8, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    standing_count = len(standing)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (10, 10), (440, 100), (0, 0, 0), -1)
+    cv2.addWeighted(frame, 0.7, overlay, 0.3, 0, frame)
+    status_color = (0, 0, 255) if crowd_detected else (0, 255, 0)
+    status_text = f"CROWD DETECTED! ({standing_count})" if crowd_detected else "All Clear"
+    cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+    cv2.putText(frame, f"Standing: {standing_count} (seated {len(seated)}) / Min: {MIN_PERSONS}", (20, 62),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.putText(frame, footer, (20, 87),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+
 def detect_crowd_in_frame(frame, device_id="unknown", camera_no="unknown", script_name="crowd"):
     """Standalone detection for a single frame."""
     model = get_yolo_model()
     results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
 
-    person_detections = [
-        box for box in results.boxes
-        if int(box.cls[0]) == 0 and box.conf[0] >= CONF_THRESHOLD
-    ]
+    standing, seated = _split_standing_seated(results.boxes)
+    person_count = len(standing)
+    crowd_detected = person_count >= MIN_PERSONS
 
-    person_count = len(person_detections)
-
-    crowd_detected = person_count > MIN_PERSONS
-
-    # Draw detections
-    for box in person_detections:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        conf = float(box.conf[0])
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(frame, f"P {conf:.2f}", (x1, max(y1 - 8, 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-    # Status overlay
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (420, 100), (0, 0, 0), -1)
-    cv2.addWeighted(frame, 0.7, overlay, 0.3, 0, frame)
-    status_color = (0, 0, 255) if crowd_detected else (0, 255, 0)
-    status_text = f"CROWD DETECTED! ({person_count})" if crowd_detected else "All Clear"
-    cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-    cv2.putText(frame, f"Persons: {person_count} / Threshold: {MIN_PERSONS}", (20, 62),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-    cv2.putText(frame, f"{device_id} - Cam {camera_no}", (20, 87),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    _annotate(frame, standing, seated, crowd_detected, f"{device_id} - Cam {camera_no}")
 
     key = f"{device_id}_{camera_no}"
     now = time.time()
@@ -134,33 +160,12 @@ def detect_crowd_batch(items, results=None):
     outputs = []
     for item, result in zip(items, results):
         frame = item['frame'].copy()
-        person_boxes = [
-            box for box in result.boxes
-            if int(box.cls[0]) == 0 and float(box.conf[0]) >= CONF_THRESHOLD
-        ]
-        person_count = len(person_boxes)
-        crowd_detected = person_count > MIN_PERSONS
-
-        for box in person_boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = float(box.conf[0])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(frame, f"P {conf:.2f}", (x1, max(y1 - 8, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        standing, seated = _split_standing_seated(result.boxes)
+        person_count = len(standing)
+        crowd_detected = person_count >= MIN_PERSONS
 
         ch_no = item.get('ch_no', item.get('camera_id', 'unknown'))
-
-        # Status overlay
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (420, 100), (0, 0, 0), -1)
-        cv2.addWeighted(frame, 0.7, overlay, 0.3, 0, frame)
-        status_color = (0, 0, 255) if crowd_detected else (0, 255, 0)
-        status_text = f"CROWD DETECTED! ({person_count})" if crowd_detected else "All Clear"
-        cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
-        cv2.putText(frame, f"Persons: {person_count} / Threshold: {MIN_PERSONS}", (20, 62),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(frame, f"CH: {ch_no}", (20, 87),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        _annotate(frame, standing, seated, crowd_detected, f"CH: {ch_no}")
 
         outputs.append((frame, crowd_detected, person_count))
 

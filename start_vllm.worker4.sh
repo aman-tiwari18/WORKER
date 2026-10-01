@@ -12,7 +12,9 @@ mkdir -p /app/data/hf_cache
 mkdir -p /app/scripts/logs
 
 # Kill orphaned vLLM GPU subprocesses from previous crashed/killed instances.
-pkill -9 -f "spawn_main.*--multiprocessing-fork" 2>/dev/null || true
+# Only true orphans (parent died, reparented to PID 1) — a running detection
+# pipeline's own spawn workers (unified detector, producers) must survive.
+ps -eo pid=,ppid=,args= | awk '$2 == 1 && /spawn_main/ && /--multiprocessing-fork/ {print $1}' | xargs -r kill -9 2>/dev/null || true
 sleep 1
 
 echo "Starting vLLM server on port 8001..."

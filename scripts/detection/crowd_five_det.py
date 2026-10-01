@@ -25,9 +25,9 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/crowd_detection_threshold")
 # CAMERA CLASSIFICATION: Inside Lab
 # This detection runs on cameras classified as:
 # - Computer Lab / Inside Lab / Exam Lab / Inside Classroom
-# Detects when less than 5 STANDING persons are present in the room
-# (0 < smoothed_count < 5). Seated persons are not counted (G4b). Zero is
-# not a violation here — the empty-room case belongs to crowd_zero.
+# Detects when less than 5 persons are present in the room — seated AND
+# standing are both counted (0 < smoothed_count < 5). Zero is not a violation
+# here — the empty-room case belongs to crowd_zero.
 
 # --- Threshold ---
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 120))              # G9: seconds between saves per camera
@@ -42,15 +42,10 @@ MIN_BOX_AREA_RATIO = 0.0006      # >= 0.06% of frame area
 MIN_BOX_AREA_ABS   = 600         # ... AND >= 600 px² absolute (rejects sub-resolution shadow noise)
 MAX_BOX_AREA_RATIO = 0.45        # Reject single boxes > 45% of frame (operator at lens, not candidate)
 
-# G4: Aspect-ratio sanity. Goal: reject obviously-not-a-person shapes.
+# G4: Aspect-ratio sanity. Looser than invigilator's standing-only gate — seated
+# candidates are counted here too. Goal: reject obviously-not-a-person shapes.
 ASPECT_W_OVER_H_MAX = 1.20       # Reject very horizontal boxes (furniture mis-classified)
 ASPECT_W_OVER_H_MIN = 0.25       # Reject impossibly thin verticals
-
-# G4b: Standing-only — seated persons are NOT counted. Same bbox rule as
-# invigilator_tracking (seated torso-above-desk boxes sit at h/w ~1.2-1.7,
-# upright seated students up to ~2.5; standing persons ~3-4).
-STANDING_MIN_HEIGHT   = 100      # px; below this is far-away YOLO noise
-STANDING_ASPECT_RATIO = 2.5      # h/w >= 2.5 → standing
 
 # G5: Edge handling — partial person at frame border counts as EDGE_WEIGHT (not 1.0)
 # so a person walking in/out isn't over-credited and the count is stable at doorways.
@@ -145,15 +140,11 @@ def _edge_weight(xyxy, frame_w, frame_h):
 
 
 def _box_weight(xyxy, frame_w, frame_h):
-    """G3 + G4 + G4b + G5: returns weighted contribution (0.0 reject, EDGE_WEIGHT edge, 1.0 full)."""
+    """G3 + G4 + G5: returns weighted contribution (0.0 reject, EDGE_WEIGHT edge, 1.0 full).
+    Every person counts — seated or standing."""
     reason = _shape_reject(xyxy, frame_w, frame_h)
     if reason is not None:
         return 0.0, reason
-    # G4b: standing only — seated persons are not counted
-    x1, y1, x2, y2 = xyxy
-    h = y2 - y1
-    if h < STANDING_MIN_HEIGHT or (h / (x2 - x1)) < STANDING_ASPECT_RATIO:
-        return 0.0, 'sitting_reject'
     weight = _edge_weight(xyxy, frame_w, frame_h)
     return weight, ('edge' if weight < 1.0 else None)
 
@@ -191,7 +182,7 @@ def _iomin_dedup(detections):
 
 
 def _apply_gate_chain(yolo_boxes, frame_w, frame_h, telemetry):
-    """Walk G2 → G3 → G4 → G4b → G5 → G6 over YOLO boxes for one frame.
+    """Walk G2 → G3 → G4 → G5 → G6 over YOLO boxes for one frame.
 
     Returns (kept_detections, effective_count) where kept_detections is a list of
     (xyxy_tuple, conf, weight). effective_count is a float (sum of weights).
@@ -245,9 +236,9 @@ def _draw_overlay(frame, candidates, effective_count, label_lines):
 def _status_for(effective_count):
     """Pick overlay status text + color for the given effective_count."""
     if effective_count == 0:
-        return "NO STANDING PERSON", (0, 165, 255)
+        return "NO PERSON DETECTED", (0, 165, 255)
     if 0 < effective_count < MAX_PERSONS:
-        return "LOW STANDING COUNT!", (0, 0, 255)
+        return "LOW PERSON COUNT!", (0, 0, 255)
     return "All Clear", (0, 255, 0)
 
 
@@ -273,7 +264,7 @@ def detect_crowd_five_in_frame(frame, device_id="unknown", camera_no="unknown", 
     status_text, status_color = _status_for(effective_count)
     _draw_overlay(frame, candidates, effective_count, [
         (status_text, status_color, 0.8),
-        (f"Standing: {effective_count:.1f}  (raw {len(candidates)}) / Min: {MAX_PERSONS}", (255, 255, 255), 0.6),
+        (f"Persons: {effective_count:.1f}  (raw {len(candidates)}) / Min: {MAX_PERSONS}", (255, 255, 255), 0.6),
         (f"{device_id} - Cam {camera_no}", (255, 255, 255), 0.6),
     ])
 
@@ -331,7 +322,7 @@ def detect_crowd_five_batch(items, results=None):
         status_text, status_color = _status_for(effective_count)
         _draw_overlay(frame, candidates, effective_count, [
             (status_text, status_color, 0.8),
-            (f"Standing: {effective_count:.1f}  (raw {len(candidates)}) / Min: {MAX_PERSONS}", (255, 255, 255), 0.6),
+            (f"Persons: {effective_count:.1f}  (raw {len(candidates)}) / Min: {MAX_PERSONS}", (255, 255, 255), 0.6),
             (f"CH: {ch_no}", (255, 255, 255), 0.6),
         ])
 

@@ -757,10 +757,11 @@ CATEGORIES = [
     "Parking Lot",
     "Entry",
     "Computer Lab",
+    "Biometric Area",
 ]
 
 VLM_PROMPT = f"""You are an expert CCTV scene classifier for an Indian exam-center
-deployment. You MUST classify every image into EXACTLY ONE of these six
+deployment. You MUST classify every image into EXACTLY ONE of these seven
 categories (return the category name verbatim, case-sensitive):
 
 {', '.join(CATEGORIES)}.
@@ -774,9 +775,15 @@ parentheses):
 - "Server Room": a small back-office or technical room dominated by server
   racks, switches, network cabinets, UPS units, blinking LEDs, patch panels,
   or a single admin desk with one workstation and equipment. (UPS room,
-  hub room, store room, observer/control/office room, biometric room)
+  hub room, store room, observer/control/office room)
+- "Biometric Area": the candidate registration / verification point — a
+  table or counter with fingerprint scanners, iris or face-capture devices,
+  webcams, a laptop or tablet used for attendance, or candidates queuing or
+  standing one by one at such a desk. Choose this over "Entry" or
+  "Server Room" whenever a registration/biometric desk is the main subject,
+  even if it sits near a doorway or in a small room.
 - "Entry": a building entrance — main doors, gates, reception desk,
-  signboards, security check or biometric counter facing the doorway.
+  signboards, security check facing the doorway (no biometric desk).
 - "Outside Area": building surroundings or interior circulation — corridors,
   hallways, washroom pathways, lobbies, staircases, boundary walls,
   external building view.
@@ -785,7 +792,7 @@ parentheses):
   roads with no building context.
 
 Decision policy — read carefully:
-1. You MUST commit to one of the six categories above whenever any scene
+1. You MUST commit to one of the seven categories above whenever any scene
    structure is visible. Pick the single closest match even if the image is
    dim, blurry, low-contrast, has a timestamp/date overlay, or shows an
    unfamiliar angle. These are NOT reasons to say Uncertain.
@@ -796,7 +803,7 @@ Decision policy — read carefully:
 3. Do not invent categories. Do not return Markdown, prose, or code fences.
 
 Output format — return ONLY this JSON object on a single line:
-{{"category": "<one of the six categories above, or Uncertain>", "reason": "<one short sentence citing the strongest visual evidence>"}}"""
+{{"category": "<one of the seven categories above, or Uncertain>", "reason": "<one short sentence citing the strongest visual evidence>"}}"""
 
 
 # ===========================================================================
@@ -2243,13 +2250,33 @@ def _shutdown_vllm(reason: str) -> None:
     # pkill is also run at vLLM startup, but if no next job runs, orphans
     # stay forever — reap them here at shutdown instead.
     try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "spawn_main.*--multiprocessing-fork"],
-            check=False, timeout=5,
-        )
-        logger.info("orphan reaper: dispatched SIGKILL to lingering spawn_main subprocesses")
+        _reap_orphan_spawn_workers()
+        logger.info("orphan reaper: dispatched SIGKILL to orphaned spawn_main subprocesses")
     except Exception as e:
         logger.debug(f"orphan reaper failed: {e}")
+
+
+def _reap_orphan_spawn_workers():
+    """SIGKILL leftover multiprocessing spawn workers whose parent has died
+    (reparented to PID 1) — e.g. vLLM workers that survived their server.
+    A running pipeline's own spawn children (the unified detector, producers)
+    still have a live parent, so they are left alone. A plain
+    `pkill -f spawn_main.*--multiprocessing-fork` killed those too, stopping
+    every detection that happened to be running when classification ended."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], check=False, timeout=5,
+                             stdout=subprocess.PIPE, text=True).stdout
+    except Exception as e:
+        logger.debug(f"orphan reaper ps failed: {e}")
+        return
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if (len(parts) == 3 and parts[1] == "1"
+                and "spawn_main" in parts[2] and "--multiprocessing-fork" in parts[2]):
+            try:
+                os.kill(int(parts[0]), signal.SIGKILL)
+            except Exception:
+                pass
 
 
 def _handle_shutdown_signal(signum, frame):

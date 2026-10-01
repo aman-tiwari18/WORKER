@@ -1280,13 +1280,33 @@ def _shutdown_vllm(reason: str) -> None:
     # vLLM's tensor-parallel workers are Python multiprocessing.spawn children
     # that sometimes survive SIGKILL on the parent and keep holding GPU/RAM.
     try:
-        subprocess.run(
-            ["pkill", "-9", "-f", "spawn_main.*--multiprocessing-fork"],
-            check=False, timeout=5,
-        )
-        logger.info("orphan reaper: dispatched SIGKILL to lingering spawn_main subprocesses")
+        _reap_orphan_spawn_workers()
+        logger.info("orphan reaper: dispatched SIGKILL to orphaned spawn_main subprocesses")
     except Exception as e:
         logger.debug(f"orphan reaper failed: {e}")
+
+
+def _reap_orphan_spawn_workers():
+    """SIGKILL leftover multiprocessing spawn workers whose parent has died
+    (reparented to PID 1) — e.g. vLLM workers that survived their server.
+    A running pipeline's own spawn children (the unified detector, producers)
+    still have a live parent, so they are left alone. A plain
+    `pkill -f spawn_main.*--multiprocessing-fork` killed those too, stopping
+    every detection that happened to be running when classification ended."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], check=False, timeout=5,
+                             stdout=subprocess.PIPE, text=True).stdout
+    except Exception as e:
+        logger.debug(f"orphan reaper ps failed: {e}")
+        return
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if (len(parts) == 3 and parts[1] == "1"
+                and "spawn_main" in parts[2] and "--multiprocessing-fork" in parts[2]):
+            try:
+                os.kill(int(parts[0]), signal.SIGKILL)
+            except Exception:
+                pass
 
 
 def _handle_shutdown_signal(signum, frame):

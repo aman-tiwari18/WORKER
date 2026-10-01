@@ -31,14 +31,16 @@ echo "First run downloads ~62GB; warm start loads from cache."
 
 # Kill orphaned vLLM GPU subprocesses left by previous crashed/killed vLLM instances.
 # These spawn_main processes hold CUDA contexts and block GPU initialization.
-pkill -9 -f "spawn_main.*--multiprocessing-fork" 2>/dev/null || true
+# Only true orphans (parent died, reparented to PID 1) — a running detection
+# pipeline's own spawn workers (unified detector, producers) must survive.
+ps -eo pid=,ppid=,args= | awk '$2 == 1 && /spawn_main/ && /--multiprocessing-fork/ {print $1}' | xargs -r kill -9 2>/dev/null || true
 sleep 1
 
 exec vllm serve Qwen/Qwen3-VL-30B-A3B-Instruct \
     --port 8001 \
     --host 0.0.0.0 \
     --max-model-len 8192 \
-    --gpu-memory-utilization 0.55 \
+    --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.55} \
     --max-num-seqs 12 \
     --dtype bfloat16 \
     --moe-backend triton \

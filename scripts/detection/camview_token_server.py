@@ -14,11 +14,11 @@ at a time and all workers share the same session token.
 Usage (on worker-0):
     python3 camview_token_server.py [--port 8090]
 
-Workers 1–3 set env var:
-    CAMVIEW_TOKEN_SERVER=http://192.168.19.30:8090
+Clients (all workers, worker-0 included via localhost): vision_classification_rtsp.py
+and pipeline/master_pipeline.py (detection) — both fetch GET /token and report dead
+tokens via POST /evict {"server", "token"}. Override with CAMVIEW_TOKEN_SERVER.
 
-The vision_classification_rtsp.py script checks for CAMVIEW_TOKEN_SERVER
-and delegates auth to this server instead of authenticating directly.
+Supervised by pm2 (process "camview-token-server") so it restarts if it dies.
 """
 
 import argparse
@@ -40,6 +40,14 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Credentials live in script-server/.env; load it here so the server runs the same
+# however it is launched (pm2, shell). Already-set env vars win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
+except ImportError:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - [TokenServer] %(message)s",
@@ -53,6 +61,10 @@ _AUTH_USER    = os.getenv("CAMVIEW_AUTH_USER", "system")
 _AUTH_PASS    = os.getenv("CAMVIEW_AUTH_PASS", "Sasd@12345")
 _TIMEOUT_API  = int(os.getenv("VISION_TIMEOUT_API", "6"))
 _KEEPALIVE_S  = 22   # keepalive interval in seconds
+# A token is handed out while its session is provably alive: fresh from login, or
+# accepted by a keepalive within this window. No fixed max age — re-logging in on a
+# healthy session would kill the token every worker is streaming with right now.
+_ALIVE_WINDOW_S = int(os.getenv("CAMVIEW_ALIVE_WINDOW", str(_KEEPALIVE_S * 4)))
 _AUTH_BACKOFF = int(os.getenv("CAMVIEW_AUTH_BACKOFF", "400"))  # seconds before retrying a failed auth (>300s DVR lockout window)
 
 # Per-server password overrides: CAMVIEW_AUTH_PASS_d15=<password> → d15.camview.io
@@ -64,6 +76,7 @@ _PER_SERVER_PASS: dict = {
 
 _tokens:        dict = {}   # server → token string
 _timestamps:    dict = {}   # server → float (epoch)
+_alive_ts:      dict = {}   # server → float (epoch of last keepalive the DVR accepted)
 _fail_times:    dict = {}   # server → float (epoch of last auth failure, negative cache)
 _server_locks:  dict = {}   # server → Lock
 _meta_lock      = threading.Lock()
@@ -171,14 +184,27 @@ def _start_keepalive(server: str, token: str) -> None:
             if not current or current != token:
                 return  # token was replaced or evicted
             try:
-                requests.put(
+                r = requests.put(
                     f"https://{server}/admin/API/accounts/keepalive",
                     headers={"Content-Type": "application/json", "X-Subject-Token": token},
                     json={}, timeout=5, verify=False,
                 )
+            except Exception as e:
+                logger.debug(f"Keepalive error for {server}: {e}")
+                continue
+            if r.status_code == 200:
+                with _meta_lock:
+                    if _tokens.get(server) == token:
+                        _alive_ts[server] = time.time()
                 logger.debug(f"Keepalive OK: {server}")
-            except Exception:
-                pass
+            elif r.status_code == 401:
+                # Session is gone on the DVR (replaced / expired). Drop it so the next
+                # /token request logs in again instead of handing out a dead token.
+                logger.warning(f"Keepalive rejected by {server} (401) — session lost, token dropped")
+                evict_token(server, token)
+                return
+            else:
+                logger.warning(f"Keepalive for {server} returned HTTP {r.status_code}")
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()
@@ -200,8 +226,10 @@ def get_token(server: str, force: bool = False) -> Optional[str]:
                 ts       = _timestamps.get(server, 0)
                 fail_ts  = _fail_times.get(server, 0)
 
-            # Return cached token while still fresh
-            if tok and now - ts < 3600:
+            # Return the cached token while its session is known alive
+            with _meta_lock:
+                alive = max(ts, _alive_ts.get(server, 0))
+            if tok and now - alive < _ALIVE_WINDOW_S:
                 return tok
 
             # Negative cache: don't retry a recently-failed server
@@ -215,24 +243,34 @@ def get_token(server: str, force: bool = False) -> Optional[str]:
             if token:
                 _tokens[server]     = token
                 _timestamps[server] = now
+                _alive_ts[server]   = now
                 _fail_times.pop(server, None)   # clear any prior failure
                 _start_keepalive(server, token)
             else:
                 _tokens.pop(server, None)
                 _timestamps.pop(server, None)
+                _alive_ts.pop(server, None)
                 _fail_times[server] = now       # record failure time for backoff
         return token
 
 
-def evict_token(server: str) -> None:
-    """Evict a stale token (called when a worker gets a 401 from StartVideo)."""
-    lock = _get_lock(server)
-    with lock:
-        with _meta_lock:
-            old = _tokens.pop(server, None)
-            _timestamps.pop(server, None)
-        if old:
-            logger.info(f"Token evicted for {server} (reported 401 by worker)")
+def evict_token(server: str, token: Optional[str] = None) -> bool:
+    """Evict a stale token (a worker got a 401 from StartVideo, or keepalive was rejected).
+
+    With `token`, evict only if it is still the current one: many workers report the
+    same dead token at once, and each report must not throw away the fresh session
+    the first report already caused (that login storm is what locks DVR accounts).
+    Without `token` (older callers) the current token is evicted unconditionally.
+    Does not take the per-server auth lock, so it never waits behind a slow login."""
+    with _meta_lock:
+        current = _tokens.get(server)
+        if not current or (token is not None and token != current):
+            return False
+        _tokens.pop(server, None)
+        _timestamps.pop(server, None)
+        _alive_ts.pop(server, None)
+    logger.info(f"Token evicted for {server} (session reported dead)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +305,15 @@ class _Handler(BaseHTTPRequestHandler):
                     for s, ts in _fail_times.items()
                     if now - ts < _AUTH_BACKOFF
                 }
+                sessions = {
+                    s: {"age_s": round(now - _timestamps.get(s, now)),
+                        "last_alive_s": round(now - max(_timestamps.get(s, 0), _alive_ts.get(s, 0)))}
+                    for s in _tokens
+                }
             self._send_json(200, {
                 "status":     "ok",
                 "servers":    list(_tokens.keys()),
+                "sessions":   sessions,
                 "in_backoff": in_backoff,
             })
             return
@@ -299,8 +343,8 @@ class _Handler(BaseHTTPRequestHandler):
             if not server:
                 self._send_json(400, {"error": "missing server in body"})
                 return
-            evict_token(server)
-            self._send_json(200, {"ok": True})
+            evicted = evict_token(server, body.get("token") or None)
+            self._send_json(200, {"ok": True, "evicted": evicted})
             return
 
         self._send_json(404, {"error": "not found"})

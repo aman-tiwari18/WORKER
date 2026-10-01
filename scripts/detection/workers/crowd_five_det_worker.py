@@ -245,7 +245,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
             path = os.path.join(save_folder, fname)
             cv2.imwrite(path, annotated_frame)
             logger.warning(
-                f"[CrowdFive] 🚨 SAVED low-standing smoothed={smoothed:.1f} → {path}"
+                f"[CrowdFive] 🚨 SAVED low-persons smoothed={smoothed:.1f} → {path}"
             )
 
             # Report to database

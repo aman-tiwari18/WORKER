@@ -267,6 +267,30 @@ class ScriptRunner:
             except (TypeError, ValueError):
                 continue
 
+        # The assignment's "Camera Type" selection (camera_classifications). One env
+        # var per analytic — CAMERA_CLASSIFICATIONS_<ANALYTIC> = JSON list — keyed by the
+        # same name master_pipeline receives on --analytics, so each analytic of a
+        # merged group keeps its OWN camera types. Unset/empty = that analytic's
+        # built-in default camera types (SCRIPT_CLASSIFICATION_MAP in camera_loader).
+        # The backend already sends this field; it just never reached the pipeline.
+        cls_by_script = dict(execution.get("_cls_by_script") or {})
+        if not cls_by_script:
+            own = meta.get("camera_classifications") or execution.get("camera_classifications")
+            if own:
+                cls_by_script[script_code] = own
+        for _code, _cls in cls_by_script.items():
+            _arg = self.ANALYTICS_ARG_OVERRIDES.get(_code, _code)
+            if not _arg:
+                continue
+            if isinstance(_cls, str):
+                try:
+                    _cls = json.loads(_cls)
+                except ValueError:
+                    _cls = [_cls]
+            _cls = [str(c).strip() for c in (_cls or []) if str(c).strip()]
+            if _cls:
+                env[f"CAMERA_CLASSIFICATIONS_{str(_arg).upper()}"] = json.dumps(_cls)
+
         # Both the regular vision classification (vision → rtsp/hls script) and the
         # NEET classification (vision_neet) consume the assignment via this payload.
         # vision_neet was previously excluded, so the NEET script launched with no

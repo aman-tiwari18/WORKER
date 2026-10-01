@@ -52,6 +52,13 @@ from ultralytics import YOLO
 
 logger = logging.getLogger(__name__)
 
+# Optional per-process VRAM cap for hosts whose GPU is shared with other workloads
+# (e.g. worker-4). Unset = no cap, the behaviour every other worker keeps.
+_VRAM_FRACTION = os.environ.get("UNIFIED_GPU_MEMORY_FRACTION", "").strip()
+if _VRAM_FRACTION and torch.cuda.is_available():
+    torch.cuda.set_per_process_memory_fraction(float(_VRAM_FRACTION))
+    logger.info(f"[Unified] per-process VRAM cap: {float(_VRAM_FRACTION):.0%} of GPU")
+
 # ============================================================
 # Models — each analytic reads the boxes of exactly one model
 # ============================================================

@@ -2562,11 +2562,11 @@ def _shutdown_vllm(reason: str) -> None:
     # /app root is baked into the image, not bind-mounted). Kills the vLLM
     # server, its EngineCore, and the tensor-parallel spawn_main workers that
     # survive a parent SIGKILL and otherwise leak GPU + container RAM.
-    for _pat in ("spawn_main.*--multiprocessing-fork", "vllm serve Qwen"):
-        try:
-            subprocess.run(["pkill", "-9", "-f", _pat], check=False, timeout=5)
-        except Exception as e:
-            logger.debug(f"reaper pkill {_pat!r} failed: {e}")
+    _reap_orphan_spawn_workers()
+    try:
+        subprocess.run(["pkill", "-9", "-f", "vllm serve Qwen"], check=False, timeout=5)
+    except Exception as e:
+        logger.debug(f"reaper pkill vllm serve failed: {e}")
     # The GPU-holding process is named (comm) "VLLM::EngineCore" — truncated by
     # the kernel to "VLLM::EngineCor" (15 chars) and its CMDLINE is "python -c …"
     # (so `pkill -f VLLM::EngineCore` NEVER matches and the engine orphans, holding
@@ -2611,6 +2611,29 @@ def _shutdown_vllm(reason: str) -> None:
             logger.warning(f"host-level stop_vllm.sh failed: {e}")
 
 
+def _reap_orphan_spawn_workers():
+    """SIGKILL leftover multiprocessing spawn workers whose parent has died
+    (reparented to PID 1) — e.g. vLLM workers that survived their server.
+    A running pipeline's own spawn children (the unified detector, producers)
+    still have a live parent, so they are left alone. A plain
+    `pkill -f spawn_main.*--multiprocessing-fork` killed those too, stopping
+    every detection that happened to be running when classification ended."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,ppid=,args="], check=False, timeout=5,
+                             stdout=subprocess.PIPE, text=True).stdout
+    except Exception as e:
+        logger.debug(f"orphan reaper ps failed: {e}")
+        return
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if (len(parts) == 3 and parts[1] == "1"
+                and "spawn_main" in parts[2] and "--multiprocessing-fork" in parts[2]):
+            try:
+                os.kill(int(parts[0]), signal.SIGKILL)
+            except Exception:
+                pass
+
+
 def _arm_cleanup_watchdog(seconds: int = 90) -> None:
     """Guarantee the process dies (and releases its GPU) even if vLLM teardown
     wedges. vLLM shutdown occasionally hangs on a stuck CUDA context, leaving
@@ -2618,11 +2641,11 @@ def _arm_cleanup_watchdog(seconds: int = 90) -> None:
     stuck' symptom on the 8-GPU workers). A daemon timer force-kills vLLM and
     exits if cleanup overruns."""
     def _kill_and_exit():
-        for pat in ("vllm serve Qwen", "spawn_main.*--multiprocessing-fork"):
-            try:
-                subprocess.run(["pkill", "-9", "-f", pat], check=False, timeout=5)
-            except Exception:
-                pass
+        _reap_orphan_spawn_workers()
+        try:
+            subprocess.run(["pkill", "-9", "-f", "vllm serve Qwen"], check=False, timeout=5)
+        except Exception:
+            pass
         # EngineCore comm is "VLLM::EngineCor" (truncated) with a "python -c" cmdline,
         # so it must be matched by comm, not -f. Plus kill anything still on our GPU.
         try:

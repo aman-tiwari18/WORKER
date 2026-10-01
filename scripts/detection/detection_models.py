@@ -156,5 +156,5 @@ BACKENDS = {
     # (THRESHOLDS_RFDETR); the weaker boxes only feed its held-monitor fallback.
     "person_monitor_rfdetr": RFDetrBackend("person_monitor_rfdetr",
                                            os.path.join(MODELS_DIR, "monitor_person_rfdetr.pth"), conf=0.15),
-    "mobile": YoloBackend("mobile", os.path.join(MODELS_DIR, "best_mobile_model.pt"), conf=0.25, imgsz=960),
+    "mobile": YoloBackend("mobile", os.path.join(MODELS_DIR, "best_mobile_model.pt"), conf=0.78, imgsz=960),
 }

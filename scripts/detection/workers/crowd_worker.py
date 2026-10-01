@@ -157,7 +157,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
 
             path = os.path.join(save_folder, fname)
             cv2.imwrite(path, annotated_frame)
-            logger.warning(f"[Crowd] 🚨 SAVED persons={person_count} → {path}")
+            logger.warning(f"[Crowd] 🚨 SAVED standing={person_count} → {path}")
 
             # Report to database
             if item.get("source_type") == "HLS":

@@ -32,7 +32,9 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 # - Server Room / Inside Server Room
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 90))        # Seconds between saves (1.5 min — per detection frequency spec)
-CONF_THRESHOLD = 0.25     # Confidence for phone detection
+CONF_THRESHOLD = 0.78     # Confidence for phone detection (raised from 0.25 on 2026-10-01).
+                          # Keep in step with the 'mobile' backend conf in detection_models.py: the
+                          # model drops boxes below ITS conf first, so both must carry the same value.
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 

@@ -115,7 +115,8 @@ class Poller:
             key   = f"grp-{exam}-{shift}-{link}-{sched}-{end}"
             g = groups.get(key)
             if g is None:
-                g = groups[key] = {"rep": a, "members": [], "analytics": [], "freq_by_script": {}}
+                g = groups[key] = {"rep": a, "members": [], "analytics": [], "freq_by_script": {},
+                                   "cls_by_script": {}}
             g["members"].append(str(a["id"]))
             if code not in g["analytics"]:
                 g["analytics"].append(code)
@@ -128,6 +129,12 @@ class Poller:
             freq = meta.get("custom_frequency_minutes") or a.get("custom_frequency_minutes")
             if freq and code not in g["freq_by_script"]:
                 g["freq_by_script"][code] = freq
+            # Same for the assignment's "Camera Type" selection: each merged analytic
+            # runs on ITS OWN camera types (consumed as CAMERA_CLASSIFICATIONS_<SCRIPT>
+            # by script_runner.py), not whichever sibling happened to be first.
+            cls = meta.get("camera_classifications") or a.get("camera_classifications")
+            if cls and code not in g["cls_by_script"]:
+                g["cls_by_script"][code] = cls
         combined = []
         for key, g in groups.items():
             if len(g["members"]) == 1:
@@ -138,6 +145,7 @@ class Poller:
             rep["_member_ids"] = g["members"]
             rep["_analytics"]  = g["analytics"]
             rep["_freq_by_script"] = g["freq_by_script"]
+            rep["_cls_by_script"]  = g["cls_by_script"]
             combined.append(rep)
             logger.info(f"[group] {key}: {len(g['members'])} analytics → one master_pipeline ({g['analytics']})")
         return passthrough + combined
