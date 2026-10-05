@@ -264,6 +264,9 @@ For RTSP exams with an uploaded schedule, wherever a page shows a **specific dat
 | **Client API** `/api/v1/cameras` (and the camera-type master) | a camera whose centre has no exam right now (the current shift, or today when between shifts) is reported **Idle/Ready**, not live or "Other" |
 | **Schedule Analysis** page | chip under the shift tabs: "Shift 2 on 05 Oct: 33 centres running · 66 of 87 cameras", or "exam not running" (red). Uses `/exams/:id/slot-summary`. |
 
+| **Cameras tab** (RTSP) | The Shift + Date filters now work for RTSP exams: with both chosen, only the cameras of the centres scheduled then are listed and counted. A note explains it ("Showing only the cameras of the 34 centres scheduled on …"), or that no schedule is uploaded. Status sheets download the same filtered list. |
+| **Cameras tab → Classification Run** | The run's camera total is the cameras of the centres scheduled in that run's day + shift (before: every camera of the exam). Opening a run lists those cameras, plus any camera the run actually recorded. |
+
 Shared helpers are in `src/utils/examSchedule.js`: `scheduledExamIds`, `rtspScheduledCounts`, `rtspScheduledCountsPerShift`, `rtspRunsOnDateSql`, `scheduledTcCodesNow`. Exams without a schedule are untouched, and so is everything when migration 046 is missing.
 
 ## 12. Decisions
