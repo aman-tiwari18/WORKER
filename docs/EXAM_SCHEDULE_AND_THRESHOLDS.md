@@ -252,9 +252,22 @@ The frontend shows everything in the preview dialog. Confirm stays disabled whil
 
 ---
 
-## 11. Not covered yet / decisions
+## 11. Counts on the dashboards, the client API and Schedule Analysis
 
-- **Dashboard and Client-API camera counts** are exam-wide and do not yet subtract non-running centres per shift. The Schedule Analysis page does not yet show "N centres running"; the `/slot-summary` endpoint is ready for it.
+For RTSP exams with an uploaded schedule, wherever a page shows a **specific date or shift** the camera count includes only the centres scheduled then. Exam-wide totals with no date stay the full camera inventory.
+
+| Where | Change |
+|---|---|
+| Admin and client dashboard **overview** (`/dashboard/overview`, `/client-dashboard/overview`) | single day: cameras of centres scheduled that day (only the chosen shifts, if a shift filter is set). Date ranges keep the full inventory. |
+| Admin and client **live exams** table | each (exam, shift) row counts the cameras of the centres running in that shift today |
+| Client **camera accessibility** list + download | with `exam_date` (and `shift_id`), RTSP cameras are limited to centres scheduled then |
+| **Client API** `/api/v1/cameras` (and the camera-type master) | a camera whose centre has no exam right now (the current shift, or today when between shifts) is reported **Idle/Ready**, not live or "Other" |
+| **Schedule Analysis** page | chip under the shift tabs: "Shift 2 on 05 Oct: 33 centres running · 66 of 87 cameras", or "exam not running" (red). Uses `/exams/:id/slot-summary`. |
+
+Shared helpers are in `src/utils/examSchedule.js`: `scheduledExamIds`, `rtspScheduledCounts`, `rtspScheduledCountsPerShift`, `rtspRunsOnDateSql`, `scheduledTcCodesNow`. Exams without a schedule are untouched, and so is everything when migration 046 is missing.
+
+## 12. Decisions
+
 - **HLS classifier:** `update_hls_classification` still resets manual verification on every write. Only RTSP was changed, as requested.
 - **Uncertain verified by hand:** a camera a person verified as "Uncertain/Obstructed" stays skipped, because a person's decision wins.
 - **Mid-shift edits** apply on the next launch of that shift's job.
