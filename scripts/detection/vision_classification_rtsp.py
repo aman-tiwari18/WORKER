@@ -101,6 +101,10 @@ TIMEOUT_API:         int = int(os.getenv("VISION_TIMEOUT_API",  "10"))
 VLLM_URL:       str = os.getenv("VISION_VLLM_URL",             "http://localhost:8001/v1/chat/completions")
 VLLM_MODEL:     str = os.getenv("VISION_VLLM_MODEL",           "Qwen/Qwen3-VL-30B-A3B-Instruct")
 STOP_VLLM_ON_EXIT: bool = os.getenv("VISION_STOP_VLLM_ON_EXIT", "1") == "1"
+# RTSP: classify only cameras whose label is empty or "Uncertain…", and never one a person has
+# verified. CLASSIFY_ONLY_UNLABELED=0 classifies every reachable camera again (e.g. after the
+# cameras were re-installed) without touching code.
+CLASSIFY_ONLY_UNLABELED: bool = os.getenv("CLASSIFY_ONLY_UNLABELED", "1").strip().lower() not in ("0", "false", "no")
 
 DEFAULT_EXAM_ID:   int = 2
 DEFAULT_SHIFT_ID:  int = 7
@@ -1570,6 +1574,46 @@ async def _classify_frame_from_disk(
 # Bulk DB persist — one call after all tasks, not one per camera
 # ===========================================================================
 
+def _needs_classification(cam: dict) -> bool:
+    """
+    RTSP: does this reachable camera still need a label from vLLM?
+      - manually verified            -> never (a person's label wins)
+      - label empty / null           -> yes
+      - label starts with "uncertain" ("Uncertain", "Uncertain/Obstructed") -> yes
+      - any other label              -> no (already known; Pass-1 refreshed its status + frame)
+    CLASSIFY_ONLY_UNLABELED=0 -> every camera.
+    """
+    if not CLASSIFY_ONLY_UNLABELED:
+        return True
+    if str(cam.get("manually_verified") or "0").strip().lower() in ("1", "true"):
+        return False
+    label = str(cam.get("classification") or "").strip().lower()
+    return (not label) or label.startswith("uncertain")
+
+
+def _persist_history_for_kept(runtime: dict, kept: List[dict]) -> int:
+    """
+    Cameras that were reachable but NOT sent to vLLM keep their label; still add a
+    camera_classification_rtsp row (existing label + this shift + date + frame) so the
+    per-shift report and the Cameras-tab run picker see them as classified in this run.
+    Without these rows every such camera would read "Not Classified / Offline" for the shift.
+    """
+    inserted = 0
+    for r in kept:
+        cam = r.get("cam") or {}
+        label = str(cam.get("classification") or "").strip()
+        if not cam.get("id") or not label:
+            continue
+        try:
+            inserted += insert_rtsp_classification_history(
+                cam.get("id"), runtime.get("shift_id"), runtime.get("assignment_date"),
+                r.get("frame_path"), label,
+            )
+        except Exception as e:
+            logger.error(f"History insert failed for kept camera {r.get('camera_id')}: {e}")
+    return inserted
+
+
 def _bulk_persist(runtime: dict, classifications: List[dict]) -> int:
     updated = 0
     skipped = 0
@@ -1868,15 +1912,32 @@ async def run_assignment_mode() -> dict:
                 "persisted_classification_updates": 0,
             }
 
+        # ── Which reachable cameras need a label? (RTSP only; HLS classifies all) ──
+        if is_rtsp:
+            to_classify = [r for r in accessible if _needs_classification(r.get("cam") or {})]
+            kept        = [r for r in accessible if r not in to_classify]
+            logger.info(
+                f"Classification needed for {len(to_classify)} of {len(accessible)} reachable cameras "
+                f"({len(kept)} keep their label — verified, or already labelled)"
+                + ("" if CLASSIFY_ONLY_UNLABELED else " [CLASSIFY_ONLY_UNLABELED=0: all]")
+            )
+        else:
+            to_classify, kept = accessible, []
+
+        # vLLM is started only now, and only if something needs it: a worker with nothing
+        # to label never loads it (saves ~4 min and ~79 GB of GPU).
+        if is_rtsp and to_classify:
+            _ensure_vllm_running()
+
         # ── Pass-2 ────────────────────────────────────────────────────────
         # No DVR access in Pass-2 — frames were saved to disk in Pass-1.
         logger.info(
-            f"Pass-2 | {len(accessible)} cameras | "
+            f"Pass-2 | {len(to_classify)} cameras | "
             f"{MAX_WORKERS_VLM} concurrent vLLM"
         )
         p2_coros = [
             _classify_frame_from_disk(r, session, sem_vlm)
-            for r in accessible
+            for r in to_classify
         ]
         classifications: List[dict] = []
         p2_start = time.time()
@@ -1923,13 +1984,18 @@ async def run_assignment_mode() -> dict:
         )
         _bulk_persist_status(runtime, pass2_failed_statuses)
 
-    # Bulk persist — one round-trip at the end
+    # Bulk persist — one round-trip at the end. Only Pass-2 results are saved; an empty
+    # label never overwrites anything (see _bulk_persist).
     updated = _bulk_persist(runtime, classifications)
+    kept_history = _persist_history_for_kept(runtime, kept) if is_rtsp else 0
+    if is_rtsp:
+        logger.info(f"Kept existing labels for {len(kept)} cameras ({kept_history} history rows written)")
 
     return {
         "assignment_id":                    runtime["assignment_id"],
         "link_type":                        runtime["link_type"],
         "processed":                        len(classifications),
+        "kept_existing_labels":             len(kept),
         "failed":                           failed,
         "classifications":                  classifications,
         "persisted_classification_updates": updated,
@@ -2118,6 +2184,9 @@ Success Rate             : {accessible / max(len(_df), 1) * 100:.1f}%
 # ===========================================================================
 _VLLM_PROC: Optional[subprocess.Popen] = None
 _VLLM_CLEANUP_DONE = False
+# True once this process has started — or adopted — a vLLM server. A run that never needed one
+# (nothing to classify) must not kill a vLLM another process is using when it exits.
+_VLLM_TOUCHED = False
 
 
 def _find_vllm_pids() -> List[int]:
@@ -2185,6 +2254,9 @@ def _shutdown_vllm(reason: str) -> None:
     if _VLLM_CLEANUP_DONE:
         return
     _VLLM_CLEANUP_DONE = True
+    if not _VLLM_TOUCHED and _VLLM_PROC is None:
+        logger.info(f"vLLM was never started by this run ({reason}) — nothing to stop")
+        return
 
     pids = set()
     if _VLLM_PROC and _VLLM_PROC.poll() is None:
@@ -2286,7 +2358,10 @@ def _handle_shutdown_signal(signum, frame):
 
 
 def _ensure_vllm_running():
-    global _VLLM_PROC
+    global _VLLM_PROC, _VLLM_TOUCHED
+    if _VLLM_PROC is not None and _VLLM_PROC.poll() is None:
+        return _VLLM_PROC                      # already started by this run
+    _VLLM_TOUCHED = True
     try:
         if requests.get("http://localhost:8001/health", timeout=2).status_code == 200:
             if STOP_VLLM_ON_EXIT:
@@ -2358,7 +2433,10 @@ if __name__ == "__main__":
     logger.info("TCS Camera Classification — starting")
     logger.info("=" * 80)
     
-    vllm_proc = _ensure_vllm_running()
+    # RTSP assignment runs start vLLM lazily (run_assignment_mode, after Pass-1, only if some
+    # camera needs a label). HLS and the standalone mode still start it up front, as before.
+    _lazy_vllm = bool(VISION_ASSIGNMENT_PAYLOAD) and str(_parse_payload().get("link_type") or "").upper() == "RTSP"
+    vllm_proc = None if _lazy_vllm else _ensure_vllm_running()
     
     try:
         if VISION_ASSIGNMENT_PAYLOAD:

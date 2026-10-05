@@ -698,6 +698,63 @@ def update_hls_status(exam_id: int, shift_id: int, exam_date: str, ch_code: str,
 
 
 # ============================================================
+# 🗓  EXAM SCHEDULE (Exams page) — which RTSP centres run in this date + shift
+# ============================================================
+_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _run_slot():
+    """(date 'YYYY-MM-DD', shift_id) of this run from the launch env, or (None, None)."""
+    m = _DATE_PREFIX.match(os.environ.get("ASSIGNMENT_DATE", "").strip())
+    try:
+        shift_id = int(os.environ.get("SHIFT_ID", "").strip())
+    except ValueError:
+        shift_id = None
+    return (m.group(0) if m else None), shift_id
+
+
+def _rtsp_schedule_sql(date, shift_id):
+    """
+    SQL fragment + params restricting camera_links_rtsp (outer table, unaliased) to the
+    centres scheduled for date + shift. Same rule as the backend's rtspScheduleClause():
+    no uploaded schedule for the exam = no restriction.
+    """
+    if not date or shift_id is None:
+        return "", ()
+    sql = """
+          AND (NOT EXISTS (SELECT 1 FROM exam_slot_schedule ss0 WHERE ss0.exam_id = camera_links_rtsp.exam_id)
+               OR EXISTS (SELECT 1 FROM exam_slot_schedule ss WHERE ss.exam_id = camera_links_rtsp.exam_id
+                           AND ss.exam_date = %s AND ss.shift_id = %s AND ss.is_running = 1))
+          AND (NOT EXISTS (SELECT 1 FROM exam_centre_schedule cs0 WHERE cs0.exam_id = camera_links_rtsp.exam_id)
+               OR EXISTS (SELECT 1 FROM exam_centre_schedule cs WHERE cs.exam_id = camera_links_rtsp.exam_id
+                           AND cs.tc_code = camera_links_rtsp.tc_code
+                           AND cs.exam_date = %s AND cs.shift_id = %s AND cs.is_running = 1))
+    """
+    return sql, (date, shift_id, date, shift_id)
+
+
+def _fetch_rtsp(cur, base_sql: str, exam_id: int, order_by: str = "ORDER BY id"):
+    """
+    Run an RTSP camera SELECT (ending before ORDER BY) with the schedule restriction. If the
+    schedule tables do not exist yet (migration 046 not applied) fall back to the old,
+    unrestricted query — a missing migration must never stop detection.
+    """
+    date, shift_id = _run_slot()
+    sched_sql, sched_params = _rtsp_schedule_sql(date, shift_id)
+    if sched_sql:
+        try:
+            cur.execute(f"{base_sql} {sched_sql} {order_by}", (exam_id, *sched_params))
+            return cur.fetchall()
+        except pymysql.err.ProgrammingError as e:
+            if e.args and e.args[0] == 1146:       # table doesn't exist
+                logger.warning("[DB] exam schedule tables missing (migration 046) — no schedule filter applied")
+            else:
+                raise
+    cur.execute(f"{base_sql} {order_by}", (exam_id,))
+    return cur.fetchall()
+
+
+# ============================================================
 # 📡  RTSP CAMERAS
 # ============================================================
 def get_rtsp_cameras(exam_id: int) -> list:
@@ -713,22 +770,21 @@ def get_rtsp_cameras(exam_id: int) -> list:
         centre_name, city, state, tc_code
     """
     # Uses idx_exam_active_rtsp (exam_id, is_active) - perfect composite index
+    # manually_verified: the classifier never relabels a camera a person has verified.
     sql = """
         SELECT
             id, device_id, exam_id, centre_name, tc_code,
             camera_name, camera_no, city, state, cctv_url,
-            is_active, classification, status
+            is_active, classification, status, manually_verified
         FROM camera_links_rtsp USE INDEX (idx_exam_active_rtsp)
         WHERE exam_id  = %s
           AND is_active = 1
-        ORDER BY id
     """
     try:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (exam_id,))
-                rows = cur.fetchall()
+                rows = _fetch_rtsp(cur, sql, exam_id)
                 
                 # Apply camera distribution filter for horizontal scaling
                 try:
@@ -775,14 +831,12 @@ def get_rtsp_cameras_accessible(exam_id: int) -> list:
         WHERE exam_id  = %s
           AND is_active = 1
           AND status = 'Accessible'
-        ORDER BY id
     """
     try:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (exam_id,))
-                rows = cur.fetchall()
+                rows = _fetch_rtsp(cur, sql, exam_id)
                 
                 # Apply camera distribution filter for horizontal scaling
                 try:
@@ -836,13 +890,16 @@ def get_rtsp_camera_by_id(camera_id_pk: int) -> dict:
 
 def update_rtsp_classification(exam_id: int, device_id: str, camera_no: str, classification: str, status: str = None, frame_path: str = None) -> int:
     """Update classification, status, and frame_path in camera_links_rtsp for one camera.
-    Reclassification clears any prior manual verification (see update_hls_classification).
+    A manual verification is cleared only when the label actually CHANGES — rewriting the same
+    label (e.g. a status/frame refresh) keeps it. MySQL applies SET left to right, so the two
+    IF()s must come before `classification = %s`, or they would compare against the new value.
     """
     frame_path = _canonicalize_frame_path(frame_path)
     sql = """
         UPDATE camera_links_rtsp
-        SET classification = %s, status = %s, frame_path = %s,
-            manually_verified = 0, verified_by = NULL
+        SET manually_verified = IF(classification <=> %s, manually_verified, 0),
+            verified_by       = IF(classification <=> %s, verified_by, NULL),
+            classification = %s, status = %s, frame_path = %s
         WHERE exam_id = %s
           AND device_id = %s
           AND camera_no = %s
@@ -852,7 +909,7 @@ def update_rtsp_classification(exam_id: int, device_id: str, camera_no: str, cla
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (classification, status, frame_path, exam_id, device_id, camera_no))
+                cur.execute(sql, (classification, classification, classification, status, frame_path, exam_id, device_id, camera_no))
                 conn.commit()
                 return cur.rowcount
     except Exception as e:

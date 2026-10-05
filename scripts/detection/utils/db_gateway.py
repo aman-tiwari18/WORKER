@@ -85,12 +85,34 @@ def get_hls_cameras_accessible(exam_id, shift_id, exam_date):
                          "exam_date": exam_date, "accessible": 1}, True)
 
 
+_DATE_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _run_slot():
+    """(date 'YYYY-MM-DD', shift_id) of this run from the launch env, or (None, None)."""
+    m = _DATE_PREFIX.match(os.environ.get("ASSIGNMENT_DATE", "").strip())
+    try:
+        shift_id = int(os.environ.get("SHIFT_ID", "").strip())
+    except ValueError:
+        shift_id = None
+    return (m.group(0) if m else None), shift_id
+
+
+def _rtsp_params(exam_id, accessible):
+    """RTSP camera query; the backend applies the exam's centre schedule for date + shift."""
+    p = {"link_type": "rtsp", "exam_id": exam_id, "accessible": accessible}
+    date, shift_id = _run_slot()
+    if date and shift_id is not None:
+        p["exam_date"], p["shift_id"] = date, shift_id
+    return p
+
+
 def get_rtsp_cameras(exam_id):
-    return _get_cameras({"link_type": "rtsp", "exam_id": exam_id, "accessible": 0}, True)
+    return _get_cameras(_rtsp_params(exam_id, 0), True)
 
 
 def get_rtsp_cameras_accessible(exam_id):
-    return _get_cameras({"link_type": "rtsp", "exam_id": exam_id, "accessible": 1}, True)
+    return _get_cameras(_rtsp_params(exam_id, 1), True)
 
 
 def get_rtsp_camera_by_id(camera_id_pk):

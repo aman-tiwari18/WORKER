@@ -23,6 +23,10 @@ import re
 # ===== DEFAULT FALLBACK =====
 DEFAULT_MIN_PERSONS = 1   # Trigger on any person when TC code is unknown
 
+# Transition switch: SERVER_ROOM_LEGACY_FALLBACK=0 stops exams WITHOUT an uploaded sheet from
+# using the tables in this file (they then get no server-room alerts). Default 1 = unchanged.
+LEGACY_FALLBACK = os.environ.get("SERVER_ROOM_LEGACY_FALLBACK", "1").strip().lower() not in ("0", "false", "no")
+
 # ======= PER-TC-CODE THRESHOLDS (Maximum Server Room Threshold) =======
 # Source: serverroom Threshold_CTGD 2026 version 1.3.xlsx
 TC_CODE_THRESHOLDS = {
@@ -1582,6 +1586,21 @@ def get_min_persons(tc_code, exam_id=None, exam_date=None, shift_no=None):
     if not tc_code:
         return None
     key = str(tc_code).strip()
+
+    # 0. The sheet uploaded for this exam on the Exams page (server_room_thresholds table) —
+    #    authoritative when the exam has one: a centre missing from it returns None (skip), it
+    #    never falls through to another exam's numbers. The date + shift come from the run's
+    #    launch env. Only an exam WITHOUT an uploaded sheet uses the tables below.
+    if exam_id is not None:
+        try:
+            from server_room_thresholds_db import lookup as _uploaded_lookup
+            has_rows, limit = _uploaded_lookup(key, exam_id)
+            if has_rows:
+                return limit
+        except Exception:
+            pass                      # a threshold lookup must never break detection
+        if not LEGACY_FALLBACK:
+            return None               # no uploaded sheet and the legacy tables are switched off
 
     if exam_id is not None:
         eid = str(exam_id).strip()
