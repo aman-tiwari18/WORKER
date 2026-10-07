@@ -241,8 +241,8 @@ SESSION_RELOAD_S       = float(os.environ.get("SESSION_RELOAD_S", "10"))
 # each interval, so at any moment only a slice of them hands a frame on.
 SESSION_MIN_INTERVAL_S = float(os.environ.get("SESSION_MIN_INTERVAL_S", "10"))
 SESSION_MAX_INTERVAL_S = float(os.environ.get("SESSION_MAX_INTERVAL_S", "600"))
-SESSION_MONITOR_INTERVAL_S = float(os.environ.get("SESSION_MONITOR_INTERVAL_S", "30"))
-SESSION_TRACK_INTERVAL_S   = float(os.environ.get("SESSION_TRACK_INTERVAL_S", "120"))
+SESSION_MONITOR_INTERVAL_S = float(os.environ.get("SESSION_MONITOR_INTERVAL_S", "10"))
+SESSION_TRACK_INTERVAL_S   = float(os.environ.get("SESSION_TRACK_INTERVAL_S", "60"))
 SESSION_TRACKING = {"invigilator", "crowd_five_invigilator"}   # follow a camera for minutes; never held
 # A positive frame asks for the confirming frame this soon (the detector alerts on 2 hits in a row).
 SESSION_CONFIRM_S = float(os.environ.get("SESSION_CONFIRM_S", "10"))
@@ -250,10 +250,13 @@ SESSION_CONFIRM_S = float(os.environ.get("SESSION_CONFIRM_S", "10"))
 SESSION_ZERO_COOLDOWN_S = int(os.environ.get("SESSION_ZERO_COOLDOWN_S", "1800"))
 # Detector processes: person analytics split over this many (by camera), Phone and Monitor one each.
 SESSION_PERSON_PROCS = int(os.environ.get("SESSION_PERSON_PROCS", "2"))
+SESSION_MONITOR_PROCS = int(os.environ.get("SESSION_MONITOR_PROCS", "2"))
 SESSION_QUEUE_SIZE = int(os.environ.get("SESSION_QUEUE_SIZE", "96"))
 SESSION_MAX_FRAME_AGE_S = float(os.environ.get("SESSION_MAX_FRAME_AGE_S", "20"))
-# Phone frames are enlarged to this width in the detector (its model runs at 960 px); others are not.
-SESSION_PHONE_ZOOM_W = int(os.environ.get("SESSION_PHONE_ZOOM_W", "960") or 0)
+# Frames narrower than this are enlarged (aspect kept) in the detector, before the models: every
+# analytic's pixel limits (Invigilator/Crowd standing height >= 100 px, Zero Person/Proximity box
+# area >= 1500 px², ...) were tuned on 1280 px main-stream frames, and substreams are often 352 px.
+SESSION_ZOOM_W = int(os.environ.get("SESSION_ZOOM_W", "1280") or 0)
 # A camera's stream opens this long before its first window and closes this long after its last.
 SESSION_OPEN_LEAD_S  = float(os.environ.get("SESSION_OPEN_LEAD_S", "180"))
 SESSION_IDLE_CLOSE_S = float(os.environ.get("SESSION_IDLE_CLOSE_S", "120"))
@@ -1364,11 +1367,13 @@ def _session_script_index():
 def _session_interval(script, freq):
     """How often an analytic looks at one camera. The cameras are spread evenly over this
     interval (see _session_phase), so the load is flat instead of every camera at once.
-      - monitor_tamper: SESSION_MONITOR_INTERVAL_S (30 s). Its sparse rules reset after a 90 s
-        gap and want ~3 looks inside it (monitor_tamper_det.PROFILES["sparse"]).
+      - monitor_tamper: SESSION_MONITOR_INTERVAL_S (10 s). Its alerts need the monitor seen in
+        several frames while it is carried (held-monitor fallback, carry evidence); the old
+        continuous feed gave each camera a frame every ~1.5-10 s (exam 42, 7 Oct).
       - invigilator / crowd_five_invigilator: follow a person for 7 min with a checkpoint at least
         every 180 s (invigilator_tracking.MAX_CHECK_GAP_SEC): freq/3, at most SESSION_TRACK_INTERVAL_S
-        (120 s, so they share the frame of the 120 s analytics).
+        (60 s: the script's own checkpoint rate, so one lost frame does not reset the 7-min count;
+        every other look shares the frame of the 120 s analytics).
       - every other analytic: once per its alert frequency; a positive frame asks for the
         confirming frame SESSION_CONFIRM_S later (the detector needs 2 hits in a row), so an
         alert still comes once per frequency."""
@@ -1451,9 +1456,8 @@ class _CameraSchedule:
         self.phase = _session_phase(label)
 
     def load_factor(self, group):
-        load_i = self.fb["load_i"]            # {"person": [i...], "phone": i, "monitor": i}
-        i = load_i["person"][self.shard % len(load_i["person"])] if group == "person" else load_i.get(group)
-        return self.fb["load"][i] if i is not None else 1.0
+        li = self.fb["load_i"].get(group)     # {"person": [i...], "phone": [i], "monitor": [i...]}
+        return self.fb["load"][li[self.shard % len(li)]] if li else 1.0
 
     def plan(self, now):
         """({detector group: [scripts]}, {script: cooldown}) to serve with a frame taken now, or None."""
@@ -1496,7 +1500,7 @@ def session_producer(cfg, queues, session_file, slot, fb):
     """One camera of a shift session: keep its (sub)stream open while any analytic needs it,
     drain it continuously, and hand a frame on only when an analytic is due for this camera.
 
-    queues = {"person": [q, ...], "phone": q, "monitor": q, "side": {script: q}};
+    queues = {"person": [q, ...], "phone": [q], "monitor": [q, ...], "side": {script: q}};
     fb = shared arrays the detectors write: "confirm" (take a frame for this analytic at t),
     "hold" (alert saved: nothing before t) and "load" (per detector queue: stretch intervals
     by this factor while the detector is behind)."""
@@ -1515,8 +1519,7 @@ def session_producer(cfg, queues, session_file, slot, fb):
     use_dss      = bool(server and not str(direct_url).startswith("rtsp://"))
     label        = f"{device_id}_{camera_no}"
     conf_src     = _SessionConfig(session_file)
-    person_qs    = queues.get("person") or []
-    shard        = slot % max(len(person_qs), 1)
+    shard        = slot                    # each detector group takes slot % its number of processes
     failures     = 0
 
     sched        = _CameraSchedule(label, cls, conf_src, fb, slot, shard)
@@ -1581,15 +1584,16 @@ def session_producer(cfg, queues, session_file, slot, fb):
                                 except queue_module.Full:
                                     pass
                         continue
-                    q = person_qs[shard] if group == "person" and person_qs else queues.get(group)
-                    if q is None:
+                    gq = queues.get(group) or []
+                    if not gq:
                         continue
+                    q = gq[shard % len(gq)]               # a camera always goes to the same process
                     pkt = {"frame": frame, "device_id": device_id, "ch_no": camera_no, "camera_no": camera_no,
                            "camera_id_pk": camera_id_pk, "exam_id": exam_id, "shift_id": shift_id,
                            "tc_code": tc_code, "source_type": "RTSP", "enabled_scripts": scripts,
                            "captured_at": last_good, "slot": slot}
-                    if group == "phone" and SESSION_PHONE_ZOOM_W:
-                        pkt["zoom"] = SESSION_PHONE_ZOOM_W     # enlarged in the detector, Phone only
+                    if SESSION_ZOOM_W:
+                        pkt["zoom"] = SESSION_ZOOM_W            # enlarged in the detector, not on the queue
                     cds = {s_: cooldowns[s_] for s_ in scripts if s_ in cooldowns}
                     if cds:
                         pkt["cooldowns"] = cds
@@ -1644,20 +1648,21 @@ def run_rtsp_session(exam_id, shift_id):
 
     # ---- detector processes (started when their first analytic appears) and shared feedback ----
     idx = _session_script_index()
-    n_person = max(SESSION_PERSON_PROCS, 1)
-    q_names = [f"person-{k + 1}" for k in range(n_person)] + ["phone", "monitor"]
+    n_person, n_monitor = max(SESSION_PERSON_PROCS, 1), max(SESSION_MONITOR_PROCS, 1)
+    q_names = ([f"person-{k + 1}" for k in range(n_person)] + ["phone"]
+               + [f"monitor-{k + 1}" for k in range(n_monitor)])
     qs = {name: mp.Queue(maxsize=SESSION_QUEUE_SIZE) for name in q_names}
     fb = {
         "idx": idx,
         "confirm": mp.Array("d", SESSION_MAX_STREAMS * len(idx), lock=False),
         "hold": mp.Array("d", SESSION_MAX_STREAMS * len(idx), lock=False),
         "load": mp.Array("d", [1.0] * len(q_names), lock=False),
-        "load_i": {"person": list(range(n_person)), "phone": n_person, "monitor": n_person + 1},
+        "load_i": {g: [i for i, n in enumerate(q_names) if n.startswith(g)] for g in ("person", "phone", "monitor")},
     }
-    queues = {"person": [qs[f"person-{k + 1}"] for k in range(n_person)],
-              "phone": qs["phone"], "monitor": qs["monitor"],
+    queues = {g: [qs[n] for n in q_names if n.startswith(g)] for g in ("person", "phone", "monitor")}
+    queues.update({
               # every side queue exists from the start: producers keep the queues they were started with
-              "side": {s: mp.Queue(maxsize=QUEUE_SIZE * 2) for s in SESSION_SIDE_SCRIPTS}}
+              "side": {s: mp.Queue(maxsize=QUEUE_SIZE * 2) for s in SESSION_SIDE_SCRIPTS}})
     detectors, side_workers = {}, {}
 
     def scripts_of(conf, group):
@@ -1698,7 +1703,7 @@ def run_rtsp_session(exam_id, shift_id):
 
     logger.info(f"[session] exam {exam_id} shift {shift_id}: {len(pool)} accessible cameras; "
                 f"stream type {DSS_STREAM_TYPE} ({'substream' if DSS_STREAM_TYPE == '2' else 'main'}), "
-                f"Phone zoom {SESSION_PHONE_ZOOM_W or 'off'} px, {n_person} person detector(s), "
+                f"zoom {SESSION_ZOOM_W or 'off'} px, {n_person} person + {n_monitor} monitor detector(s), "
                 f"monitor every {SESSION_MONITOR_INTERVAL_S:g} s, invigilator every <= {SESSION_TRACK_INTERVAL_S:g} s, "
                 f"others once per their frequency (+confirm after {SESSION_CONFIRM_S:g} s), "
                 f"open {SESSION_OPEN_LEAD_S:g} s early, close {SESSION_IDLE_CLOSE_S:g} s after the last window")
