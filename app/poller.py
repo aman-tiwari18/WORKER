@@ -218,23 +218,22 @@ class Poller:
         os.makedirs(SESSION_DIR, exist_ok=True)
         rec["file"] = os.path.join(SESSION_DIR, f"{key}.json")
         analytics = {}
+        import json as _json
         for m in rec["members"].values():
             name = script_runner.ANALYTICS_ARG_OVERRIDES.get(m["code"], m["code"])
             if not name or not m.get("start") or not m.get("end"):
                 continue
-            a = analytics.setdefault(name, {"windows": [], "freq": None, "cls": None})
-            a["windows"].append([m["start"], m["end"]])
-            if m.get("freq") and not a["freq"]:
-                a["freq"] = m["freq"]
             cls = m.get("cls")
             if isinstance(cls, str):
                 try:
-                    import json as _json
                     cls = _json.loads(cls)
                 except Exception:
                     cls = [cls]
-            if cls and not a["cls"]:
-                a["cls"] = [str(c).strip() for c in cls if str(c).strip()]
+            cls = [str(c).strip() for c in (cls or []) if str(c).strip()] or None
+            # one entry per member window: the same analytic can run with different camera
+            # types / frequencies in different windows (e.g. Crowd on Lab AND on Outside)
+            a = analytics.setdefault(name, {"windows": []})
+            a["windows"].append({"start": m["start"], "end": m["end"], "freq": m.get("freq"), "cls": cls})
         tmp = rec["file"] + ".tmp"
         import json as _json
         with open(tmp, "w") as f:

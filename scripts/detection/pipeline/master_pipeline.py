@@ -1344,17 +1344,34 @@ def _session_interval(script, freq):
 
 
 def _session_due(classification, conf, next_due, now):
-    """The analytics that should look at this camera's frame NOW: inside one of their windows,
-    matching the camera type, and due. Returns (unified scripts, side scripts, cooldowns)."""
+    """The analytics that should look at this camera's frame NOW: one of their windows is open
+    AND that window's camera types match this camera, AND the analytic is due here.
+    Returns (unified scripts, side scripts, cooldowns)."""
     import random
     uni, side, cooldowns = [], [], {}
     for script, sc in conf.items():
-        wins = sc.get("windows") or []
-        if not any(w[0] <= now <= w[1] for w in wins if len(w) == 2):
+        freq, matched = None, False
+        for w in sc.get("windows") or []:
+            if isinstance(w, dict):
+                s0, e0, wf, wc = w.get("start"), w.get("end"), w.get("freq"), w.get("cls")
+            elif len(w) == 2:                      # older format: [start, end] + analytic-wide freq/cls
+                s0, e0, wf, wc = w[0], w[1], sc.get("freq"), sc.get("cls")
+            else:
+                continue
+            if s0 is None or e0 is None or not (s0 <= now <= e0):
+                continue
+            if not _camera_matches_script(classification, script, wc or None):
+                continue
+            matched = True
+            if wf:
+                try:
+                    f = float(wf)
+                    freq = f if freq is None else min(freq, f)
+                except (TypeError, ValueError):
+                    pass
+        if not matched:
             continue
-        if not _camera_matches_script(classification, script, sc.get("cls") or None):
-            continue
-        interval = _session_interval(script, sc.get("freq"))
+        interval = _session_interval(script, freq)
         due = next_due.get(script)
         if due is None:
             # first sight of this analytic on this camera: spread the cameras over one interval
@@ -1367,11 +1384,8 @@ def _session_due(classification, conf, next_due, now):
             side.append(script)
         elif script in UNIFIED_SCRIPTS:
             uni.append(script)
-            if sc.get("freq"):
-                try:
-                    cooldowns[script] = int(float(sc["freq"]))
-                except (TypeError, ValueError):
-                    pass
+            if freq:
+                cooldowns[script] = int(freq)
     return uni, side, cooldowns
 
 
@@ -1546,7 +1560,9 @@ def run_rtsp_session(cams):
     grace = float(os.environ.get("SESSION_END_GRACE_S", "60"))
     while not STOP and any(pp.is_alive() for pp in producers):
         time.sleep(1.0)
-        ends = [w[1] for sc in conf_watch.get().values() for w in (sc.get("windows") or []) if len(w) == 2]
+        ends = [(w.get("end") if isinstance(w, dict) else w[1]) for sc in conf_watch.get().values()
+                for w in (sc.get("windows") or []) if isinstance(w, dict) or len(w) == 2]
+        ends = [e for e in ends if e]
         if ends and time.time() > max(ends) + grace:
             logger.info("[session] every analytic window has ended — closing the session")
             break
@@ -1603,7 +1619,9 @@ def _session_cameras(exam_id, shift_id):
             "camera_no": cam_no, "ch_no": cam_no, "classification": cls, "link_type": "RTSP",
             "camera_name": r.get("camera_name"), "centre_name": r.get("centre_name"),
             "tc_code": r.get("tc_code"), "exam_id": exam_id, "shift_id": shift_id,
-            "_n": sum(1 for s, sc in conf.items() if _camera_matches_script(cls, s, sc.get("cls") or None)),
+            "_n": sum(1 for s, sc in conf.items()
+                      if any(_camera_matches_script(cls, s, (w.get("cls") if isinstance(w, dict) else sc.get("cls")) or None)
+                             for w in (sc.get("windows") or []))),
         })
     cams.sort(key=lambda c: -c["_n"])
     if len(cams) > SESSION_MAX_STREAMS:
