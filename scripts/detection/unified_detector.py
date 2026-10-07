@@ -465,7 +465,7 @@ def _person_view(result):
     return result[result.boxes.conf >= CONF_THRESHOLD]
 
 
-def unified_worker(frame_queue, scripts=None):
+def unified_worker(frame_queue, scripts=None, session=None):
     """
     RTSP worker entry (drop-in replacement for the N per-script workers).
 
@@ -475,19 +475,33 @@ def unified_worker(frame_queue, scripts=None):
 
     `scripts` = every analytic in this run. Only the models those analytics read are
     loaded, before the first frame (None = load each model the first time a frame needs it).
+
+    `session` (shift-session mode, master_pipeline.run_rtsp_session): this process's name and
+    the shared arrays the camera producers read. After each analytic's verdict the worker asks
+    for the confirming frame soon (first hit: "confirm") or tells the producer to skip that
+    camera until the cooldown ends (alert saved: "hold"); it also publishes a load factor that
+    stretches the producers' intervals while its queue is backed up, and drops stale frames.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    logger.info(f"🟢 [Unified] worker started (person model: {PERSON_MODEL}, monitor model: {MONITOR_MODEL})")
+    sess = session or {}
+    tag = f"[Unified {sess['name']}]" if sess.get("name") else "[Unified]"
+    fb_idx = sess.get("idx") or {}
+    no_hold, no_feedback = set(sess.get("no_hold") or []), set(sess.get("no_feedback") or [])
+    max_age = float(sess.get("max_age_s") or 0)
+    qmax = int(sess.get("qmax") or 0)
+    stale = 0
+    last_load = time.time()
+    logger.info(f"🟢 {tag} worker started (person model: {PERSON_MODEL}, monitor model: {MONITOR_MODEL})")
     by_model = {}
     for s in scripts or []:
         if s in EVALUATORS:
             by_model.setdefault(model_for(s), []).append(s)
     for name, users in sorted(by_model.items()):
         if BACKENDS[name].load_now():
-            logger.info(f"[Unified] {name} loaded for {sorted(users)}")
+            logger.info(f"{tag} {name} loaded for {sorted(users)}")
         else:
-            logger.error(f"[Unified] {name} FAILED to load — {sorted(users)} will not run until it does")
+            logger.error(f"{tag} {name} FAILED to load — {sorted(users)} will not run until it does")
     pool = ThreadPoolExecutor(max_workers=len(BACKENDS), thread_name_prefix="unified-model")
     stats, last_stats = {}, time.time()
     last_flush = time.time()
@@ -496,6 +510,19 @@ def unified_worker(frame_queue, scripts=None):
 
     def state_for(dev, ch, script):
         return states.setdefault((dev, ch, script), {})
+
+    def feedback(pkt, script, st, consec_before, save_before):
+        """Tell the camera's producer what this verdict means for its next frame."""
+        slot, i = pkt.get("slot"), fb_idx.get(script)
+        if slot is None or i is None or script in no_feedback:
+            return
+        k = slot * len(fb_idx) + i
+        now = time.time()
+        if st.get("last_save", 0) != save_before:
+            if script not in no_hold:          # alert saved: nothing new before its cooldown ends
+                sess["hold"][k] = now + max(COOLDOWNS.get(script, 120) - sess.get("confirm_s", 10), 0)
+        elif consec_before == 0 and st.get("consec", 0) == 1:
+            sess["confirm"][k] = now + sess.get("confirm_s", 10)   # first hit: confirm it soon
 
     while True:
         # Also runs while no frames arrive, so a held alert is not stuck waiting for
@@ -511,6 +538,9 @@ def unified_worker(frame_queue, scripts=None):
             continue
         if pkt is None:
             break
+        if max_age and pkt.get("captured_at") and time.time() - pkt["captured_at"] > max_age:
+            stale += 1                         # waited too long in the queue: a newer frame is coming
+            continue
         if pkt.get("cooldowns"):              # shift session: each analytic's frequency from the session file
             COOLDOWNS.update(pkt["cooldowns"])
         batch.append(pkt)
@@ -523,6 +553,11 @@ def unified_worker(frame_queue, scripts=None):
                 if nxt is None:        # shutdown sentinel mid-batch: process what we have, then stop
                     stop = True
                     break
+                if max_age and nxt.get("captured_at") and time.time() - nxt["captured_at"] > max_age:
+                    stale += 1
+                    continue
+                if nxt.get("cooldowns"):
+                    COOLDOWNS.update(nxt["cooldowns"])
                 batch.append(nxt)
             except queue_module.Empty:
                 time.sleep(0.002)
@@ -578,12 +613,28 @@ def unified_worker(frame_queue, scripts=None):
                         if idx not in person_views:
                             person_views[idx] = _person_view(result)
                         result = person_views[idx]
-                    EVALUATORS[script](result, item, state_for(dev, cam_no, script))
+                    st = state_for(dev, cam_no, script)
+                    consec_before, save_before = st.get("consec", 0), st.get("last_save", 0)
+                    EVALUATORS[script](result, item, st)
+                    if sess:
+                        feedback(pkt, script, st, consec_before, save_before)
                 except Exception as e:
                     logger.error(f"[Unified] evaluator '{script}' error ({dev}_{cam_no}): {e}")
 
         for p in batch:
             p.pop("frame", None)
+
+        if sess.get("load") is not None and qmax and time.time() - last_load >= 2.0:
+            last_load = time.time()
+            try:
+                backlog_now = frame_queue.qsize()
+            except Exception:
+                backlog_now = 0
+            li = sess["load_i"]
+            if backlog_now > 0.75 * qmax:      # behind: producers stretch their intervals
+                sess["load"][li] = min(sess["load"][li] * 1.15, 4.0)
+            elif backlog_now < 0.25 * qmax:
+                sess["load"][li] = max(sess["load"][li] / 1.15, 1.0)
 
         if time.time() - last_stats >= STATS_EVERY_S:
             elapsed = time.time() - last_stats
@@ -593,7 +644,11 @@ def unified_worker(frame_queue, scripts=None):
                 backlog = frame_queue.qsize()
             except Exception:
                 backlog = "?"
-            logger.info(f"[Unified] last {elapsed:.0f}s — queue backlog {backlog} — " + "; ".join(parts))
+            extra = ""
+            if sess:
+                extra = f" — stale dropped {stale}, load x{sess['load'][sess['load_i']]:.2f}"
+                stale = 0
+            logger.info(f"{tag} last {elapsed:.0f}s — queue backlog {backlog}{extra} — " + "; ".join(parts))
             stats.clear(); last_stats = time.time()
 
         if stop:
@@ -601,4 +656,4 @@ def unified_worker(frame_queue, scripts=None):
 
     _flush_stateful(states, None)
     pool.shutdown(wait=False)
-    logger.info("🔴 [Unified] worker stopped")
+    logger.info(f"🔴 {tag} worker stopped")
