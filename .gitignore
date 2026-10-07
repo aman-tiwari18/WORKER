@@ -15,6 +15,10 @@ results/
 scripts/detection/results/
 frames/
 scripts/detection/frames/
+# camera recordings for offline tests (record_session_cams.py) — large videos, never commit
+data/recordings/
+recordings/
+*.mp4
 
 # secrets / env
 .env
