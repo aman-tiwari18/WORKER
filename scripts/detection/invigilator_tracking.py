@@ -433,6 +433,10 @@ class PersonTracker:
                      and self._seen_frac(a, now - CHECK_WINDOW_SEC, now) >= CHECK_MIN_SEEN_FRAC]
         static_feet = []
         for p in people:
+            # Only a person STANDING in this frame is reported: a box that merely follows an
+            # anchored person (extra, h/w 2.0-2.5) is usually them sitting down at that spot.
+            if not p['strict']:
+                continue
             near = [a for a in confirmed if self._near(a, p['foot'], p['top'])]
             if near and any(self._same_person(a, self._sig(p)) for a in near):
                 static_feet.append(p['foot'])

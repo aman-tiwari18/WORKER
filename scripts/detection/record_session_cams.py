@@ -96,8 +96,10 @@ def main():
             for url in [mp_.add_token_to_url(u, stream_token) for u in mp_.order_urls(urls)]:
                 if rec.STOP.is_set() or time.time() >= deadline or mp_.is_private_ip_url(url):
                     continue
-                ran = rec.run_ffmpeg(rec.build_ffmpeg_cmd(url, pattern, args.segment, False), label,
-                                     max_seconds=deadline - time.time())
+                cmd = rec.build_ffmpeg_cmd(url, pattern, args.segment, False)
+                i = cmd.index("-timeout")               # ffmpeg 4.x: -timeout means "listen"; -stimeout = socket timeout (µs)
+                cmd[i] = "-stimeout"
+                ran = rec.run_ffmpeg(cmd, label, max_seconds=deadline - time.time())
                 if ran > 30:
                     break                                   # it recorded: get a fresh link next time
             time.sleep(min(rec.RETRY_DELAY, max(0, deadline - time.time())))
