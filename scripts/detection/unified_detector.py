@@ -527,6 +527,15 @@ def unified_worker(frame_queue, scripts=None):
             except queue_module.Empty:
                 time.sleep(0.002)
 
+        # shift session: producers send the small substream frame and ask for the zoom here,
+        # so the queue carries ~0.3 MB per frame instead of ~3.7 MB
+        for p in batch:
+            zw = p.pop("zoom", 0)
+            f = p["frame"]
+            if zw and f.shape[1] < zw:
+                h, w = f.shape[:2]
+                p["frame"] = cv2.resize(f, (zw, int(round(h * zw / w))), interpolation=cv2.INTER_LINEAR)
+
         # ---- each needed model runs once, in parallel, over only its frames ----
         frames = [p["frame"] for p in batch]
         need, assign = _plan_batch(batch)

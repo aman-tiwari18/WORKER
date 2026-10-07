@@ -44,6 +44,8 @@ _places_classes = []
 
 def load_places365():
     global _places_model, _places_classes
+    if _places_model is False:
+        return None, []
     if _places_model is not None:
         return _places_model, _places_classes
 
@@ -52,12 +54,16 @@ def load_places365():
     num_ftrs = model.fc.in_features
     model.fc = torch.nn.Linear(num_ftrs, 365)
 
+    # Disk only: a runtime download blocks the whole detector (places2.csail.mit.edu is ~7 KB/s from here).
+    cat_path = os.path.join(BASE_DIR, "categories_places365.txt")
+    weights = os.environ.get("PLACES365_WEIGHTS", "/app/models/resnet18_places365.pth.tar")
+    if not (os.path.exists(weights) and os.path.exists(cat_path)):
+        logger.warning(f"Places365 disabled (missing {weights if not os.path.exists(weights) else cat_path})")
+        _places_model = False
+        return None, []
+
     try:
-        checkpoint = torch.hub.load_state_dict_from_url(
-            "http://places2.csail.mit.edu/models_places365/resnet18_places365.pth.tar",
-            map_location=torch.device("cpu"),
-            progress=True
-        )
+        checkpoint = torch.load(weights, map_location=torch.device("cpu"), weights_only=False)
         state_dict = {k.replace("module.", ""): v for k, v in checkpoint["state_dict"].items()}
         model.load_state_dict(state_dict)
         model.eval()
@@ -72,7 +78,7 @@ def load_places365():
         logger.info("Places365 model loaded successfully")
     except Exception as e:
         logger.warning(f"Places365 load failed: {e}")
-        _places_model = None
+        _places_model = False
     
     return _places_model, _places_classes
 

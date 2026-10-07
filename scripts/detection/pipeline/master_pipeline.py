@@ -241,7 +241,8 @@ SESSION_RELOAD_S       = float(os.environ.get("SESSION_RELOAD_S", "10"))
 SESSION_MIN_INTERVAL_S = float(os.environ.get("SESSION_MIN_INTERVAL_S", "10"))
 SESSION_MAX_INTERVAL_S = float(os.environ.get("SESSION_MAX_INTERVAL_S", "60"))
 # monitor_tamper follows a continuous feed: frames per second per camera.
-SESSION_MONITOR_FPS    = float(os.environ.get("SESSION_MONITOR_FPS", "1"))
+SESSION_MONITOR_FPS    = float(os.environ.get("SESSION_MONITOR_FPS", "1"))  # legacy; see SESSION_MONITOR_INTERVAL_S
+SESSION_MONITOR_INTERVAL_S = float(os.environ.get("SESSION_MONITOR_INTERVAL_S", "15"))
 # Stop opening more streams when the host has less free memory than this (GB).
 SESSION_MIN_FREE_MEM_GB = float(os.environ.get("SESSION_MIN_FREE_MEM_GB", "6"))
 SESSION_START_STAGGER_S = float(os.environ.get("SESSION_START_STAGGER_S", "0.05"))
@@ -1335,7 +1336,7 @@ class _SessionConfig:
 
 def _session_interval(script, freq):
     if script == "monitor_tamper":
-        return 1.0 / max(SESSION_MONITOR_FPS, 0.05)
+        return max(SESSION_MONITOR_INTERVAL_S, 1.0)
     try:
         f = float(freq) if freq else 90.0
     except (TypeError, ValueError):
@@ -1463,18 +1464,18 @@ def session_producer(cfg, unified_queue, side_queues, session_file):
                 ok, frame = cap.retrieve()
                 if not ok or frame is None or frame.ndim != 3 or frame.size == 0:
                     continue
-                frame = _zoom(frame)
+                # zoom happens in the detector, so the queue carries the small substream frame
                 if uni and unified_queue is not None:
                     pkt = {"frame": frame, "device_id": device_id, "ch_no": camera_no, "camera_no": camera_no,
                            "camera_id_pk": camera_id_pk, "exam_id": exam_id, "shift_id": shift_id,
-                           "source_type": "RTSP", "enabled_scripts": uni, "captured_at": last_good}
+                           "source_type": "RTSP", "enabled_scripts": uni, "captured_at": last_good,
+                           "zoom": UPSCALE_MIN_WIDTH}
                     if cooldowns:
                         pkt["cooldowns"] = cooldowns
                     try:
                         unified_queue.put(pkt, timeout=0.1)
                     except queue_module.Full:
-                        for s_ in uni:                          # retry soon instead of a full interval
-                            next_due[s_] = last_good + 1.0
+                        pass                                    # detector busy: skip to the next interval
                 for s_ in side:
                     q = side_queues.get(s_)
                     if q is not None:
@@ -1519,8 +1520,10 @@ def run_rtsp_session(cams):
 
     workers = []
     unified_queue = mp.Queue(maxsize=int(os.environ.get("UNIFIED_QUEUE_SIZE", "512")))
+    # preload only the models this session's analytics read (a joiner's model loads on first use)
+    sess_scripts = sorted(set(_SessionConfig(SESSION_FILE).get() or {}) & set(UNIFIED_SCRIPTS))
     p = mp.Process(target=_worker_process_entry,
-                   args=("unified_detector", "unified_worker", unified_queue, sorted(UNIFIED_SCRIPTS)),
+                   args=("unified_detector", "unified_worker", unified_queue, sess_scripts or sorted(UNIFIED_SCRIPTS)),
                    name="Worker-unified", daemon=True)
     p.start(); _register_child_process(p); workers.append(p)
     side_queues = {}
@@ -1534,7 +1537,7 @@ def run_rtsp_session(cams):
         sp.start(); _register_child_process(sp); workers.append(sp)
     logger.info(f"[session] workers: unified (all analytics) + {sorted(side_queues)}; "
                 f"stream type {DSS_STREAM_TYPE} ({'substream' if DSS_STREAM_TYPE == '2' else 'main'}), "
-                f"zoom to {UPSCALE_MIN_WIDTH or 'off'} px, monitor {SESSION_MONITOR_FPS:g} fps, "
+                f"zoom to {UPSCALE_MIN_WIDTH or 'off'} px, monitor every {SESSION_MONITOR_INTERVAL_S:g} s, "
                 f"others every freq/3 in [{SESSION_MIN_INTERVAL_S:g}, {SESSION_MAX_INTERVAL_S:g}] s")
 
     producers, low_mem = [], False

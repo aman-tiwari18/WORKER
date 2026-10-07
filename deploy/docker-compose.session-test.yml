@@ -8,3 +8,8 @@ services:
     volumes:
       - ./app:/app/app
       - ./scripts/detection:/app/scripts/detection
+    # one stream = one process with several open files/sockets: 800 streams need far more than 1024
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
