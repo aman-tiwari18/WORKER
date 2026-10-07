@@ -1785,8 +1785,8 @@ def run_rtsp_session(exam_id, shift_id):
                 p.kill(); p.join(timeout=1)
             if not p.is_alive():
                 _unregister_child_process(p); closing.remove(item)
-        if now - last_stats >= 60:
-            last_stats = now
+        if time.time() - last_stats >= 60:      # `now` is stale after a long round of stream starts
+            last_stats = time.time()
             sizes = []
             for k, name in enumerate(q_names):
                 try:
