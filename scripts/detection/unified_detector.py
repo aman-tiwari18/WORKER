@@ -511,6 +511,8 @@ def unified_worker(frame_queue, scripts=None):
             continue
         if pkt is None:
             break
+        if pkt.get("cooldowns"):              # shift session: each analytic's frequency from the session file
+            COOLDOWNS.update(pkt["cooldowns"])
         batch.append(pkt)
 
         stop = False

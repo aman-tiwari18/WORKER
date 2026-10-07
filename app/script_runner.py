@@ -201,6 +201,10 @@ class ScriptRunner:
         named_log.info(header)
 
         timeout_s = _compute_timeout(execution)
+        if execution.get("_session_file"):
+            # Shift session: the pipeline ends itself after the last window in its session file
+            # (analytics that join later extend it); this is only a safety cap.
+            timeout_s = float(os.environ.get("SESSION_SAFETY_TIMEOUT_S", str(16 * 3600)))
         if timeout_s:
             named_log.info(f"  Timeout  : {timeout_s:.0f}s ({timeout_s/60:.1f} min)")
         named_log.info(f"  Pipeline : {full_script_path.relative_to(self.scripts_dir)}")
@@ -240,6 +244,11 @@ class ScriptRunner:
         env["LINK_TYPE"] = str(meta.get("link_type") or execution.get("link_type") or "")
         env["CAMERA_NAME"] = str(meta.get("camera_name") or execution.get("camera_name") or "")
         env["CAMERA_CLASSIFICATION"] = str(meta.get("classification") or execution.get("classification") or "")
+
+        # Shift session (poller): the running pipeline reads its analytics/windows from this file.
+        if execution.get("_session_file"):
+            env["SESSION_FILE"] = execution["_session_file"]
+            env["SHIFT_SESSION"] = "1"
 
         # Hand claimed shard ownership to the pipeline subprocess (plan §4.2).
         # camera_distributor.lease_from_env() picks these up inside master_pipeline,

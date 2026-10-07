@@ -1,0 +1,10 @@
+# Test overlay for branch new_architectured_stream (shift session / kept-open substreams).
+# Runs the branch code from this checkout instead of the image's copy:
+#   IMAGE=... IMAGE_TAG=... docker compose --project-directory /data/new_dev/worker \
+#     -f deploy/docker-compose.uat.yml -f deploy/docker-compose.session-test.yml up -d --force-recreate
+# Without this file (e.g. the next CI deploy) the container runs the image's code again.
+services:
+  worker-gpu0:
+    volumes:
+      - ./app:/app/app
+      - ./scripts/detection:/app/scripts/detection
