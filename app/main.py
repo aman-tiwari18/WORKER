@@ -127,31 +127,40 @@ def _epoch_ms(value) -> Optional[int]:
             return None
 
 
-# In-memory camera index — bulk-loaded at startup by _init_camera_index().
-# Keys: (device_id, camera_no) for RTSP; ch_no str for HLS.
+# In-memory camera index — loaded at startup by _init_camera_index() and reloaded every
+# CAMERA_INDEX_REFRESH_S by _camera_index_refresher(), so manual re-labels show up.
+# Keys: (exam_id, device_id, camera_no) and (device_id, camera_no) for RTSP; ch_no str for HLS.
+# The same camera exists once per exam (19, 42, 43 ...) with different labels, so a
+# lookup must use the detection's exam; (device_id, camera_no) is only a fallback.
 # This replaces per-request DB queries (50 queries × 27 ms = 1.4 s → 50 × 0 ms = ~0 ms).
 _rtsp_cam_index: dict = {}
 _hls_cam_index: dict = {}
+CAMERA_INDEX_REFRESH_S = int(os.environ.get("CAMERA_INDEX_REFRESH_S", "300"))
 
 
 def _init_camera_index():
-    """Bulk-load all active cameras into memory in a single query per table."""
+    """Bulk-load all active cameras into memory in a single query per table.
+    Builds new dicts and swaps them in, so readers never see a half-built index."""
     global _rtsp_cam_index, _hls_cam_index
     try:
+        rtsp_idx, hls_idx = {}, {}
         conn = _get_connection()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT device_id, camera_no, camera_name, centre_name, city, state, "
-                "tc_code, cctv_url, classification FROM camera_links_rtsp WHERE is_active=1"
+                "SELECT exam_id, device_id, camera_no, camera_name, centre_name, city, state, "
+                "tc_code, cctv_url, classification FROM camera_links_rtsp WHERE is_active=1 "
+                "ORDER BY exam_id, id"
             )
             rtsp_rows = cur.fetchall()
             for row in rtsp_rows:
                 dev = str(row.get("device_id") or "")
                 cam = str(row.get("camera_no") or "")
+                exam = str(row.get("exam_id") or "")
                 if dev and cam:
-                    _rtsp_cam_index[(dev, cam)] = row
+                    rtsp_idx[(exam, dev, cam)] = row
+                    rtsp_idx[(dev, cam)] = row
                 if cam:
-                    _rtsp_cam_index.setdefault(("", cam), row)
+                    rtsp_idx.setdefault(("", cam), row)
 
             cur.execute(
                 "SELECT exam_id, shift_id, ch_code, camera_name, centre_name, city, state, "
@@ -160,11 +169,18 @@ def _init_camera_index():
             for row in cur.fetchall():
                 ch = str(row.get("ch_code") or "")
                 if ch:
-                    _hls_cam_index[ch] = row
+                    hls_idx[ch] = row
         conn.close()
-        logger.info(f"Camera index: {len(rtsp_rows)} RTSP rows → {len(_rtsp_cam_index)} keys")
+        _rtsp_cam_index, _hls_cam_index = rtsp_idx, hls_idx
+        logger.info(f"Camera index: {len(rtsp_rows)} RTSP rows → {len(rtsp_idx)} keys")
     except Exception as e:
         logger.error(f"Camera index init failed: {e}")
+
+
+async def _camera_index_refresher():
+    while True:
+        await asyncio.sleep(CAMERA_INDEX_REFRESH_S)
+        await asyncio.to_thread(_init_camera_index)
 
 
 def _camera_meta_for_ch(ch_no: str, exam_date_iso: str = "") -> dict:
@@ -184,9 +200,13 @@ def _camera_meta_for_rtsp_pk(camera_id_pk: int) -> dict:
     return get_rtsp_camera_by_id(camera_id_pk) or {}
 
 
-def _camera_meta_for_rtsp_device_ch(device_id: str, camera_no: str) -> dict:
+def _camera_meta_for_rtsp_device_ch(device_id: str, camera_no: str, exam_id=None) -> dict:
     if not camera_no:
         return {}
+    if device_id and exam_id:
+        hit = _rtsp_cam_index.get((str(exam_id), device_id, camera_no))
+        if hit is not None:
+            return hit
     if device_id:
         hit = _rtsp_cam_index.get((device_id, camera_no))
         if hit is not None:
@@ -849,8 +869,9 @@ async def lifespan(app: FastAPI):
     await poller_service.start()
 
     global known_detection_files, known_detection_by_date
-    # Bulk-load all cameras into memory once — eliminates per-request DB queries.
+    # Bulk-load all cameras into memory — eliminates per-request DB queries; reloaded periodically.
     await asyncio.to_thread(_init_camera_index)
+    asyncio.create_task(_camera_index_refresher())
     # Run initial file scan in thread — 90k files takes ~0.5s synchronously.
     known_detection_files = await asyncio.to_thread(list_detection_files)
     known_detection_by_date = _build_date_index(known_detection_files)
@@ -1733,7 +1754,7 @@ def parse_detection_filename(
         rtsp_split = _split_rtsp_stem(stem)
         if rtsp_split:
             _, dev_id, cam_no_part = rtsp_split
-            cam_meta = _camera_meta_for_rtsp_device_ch(dev_id, cam_no_part)
+            cam_meta = _camera_meta_for_rtsp_device_ch(dev_id, cam_no_part, exam_id)
             logger.debug(f"RTSP metadata lookup: dev_id={dev_id}, cam_no={cam_no_part}, found={bool(cam_meta)}")
     
     # Fallback to HLS lookup if RTSP lookup failed or if source is HLS
@@ -2259,6 +2280,60 @@ async def _trigger_sms_alert(uid: str, source: str) -> None:
         logger.warning(f"SMS bridge call failed for uid={uid}: {e}")
 
 
+# ── Proximity repeat count as the CLIENT sees it ─────────────────────────────
+# The worker counts every report of the same pair (violation_count 1, 2, 3 ...), false
+# positives included. Operators push only the true ones, so the client could see "2"
+# without ever having seen "1". At push time the client count is worked out instead:
+#   - the pair's previous detection (same violation_chain, earlier time) was pushed and
+#     is still on the client's side, AND it is at most PROXIMITY_CLIENT_MAX_GAP_S older
+#       → continue: its client count + 1
+#   - otherwise (no previous one, previous was not pushed / was pulled back, or the gap
+#     is longer)  → restart at 1
+# violation_count keeps the worker's raw count for operators.
+PROXIMITY_CLIENT_MAX_GAP_S = int(os.environ.get("PROXIMITY_CLIENT_MAX_GAP_S", "150"))
+
+
+def _report_time(value):
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _client_violation_count(cur, table: str, row: dict):
+    """Client-facing repeat count for a proximity detection being pushed; None otherwise."""
+    if row.get("detection_type") != "proximity_detection" or row.get("violation_count") is None:
+        return None
+    if row.get("client_violation_count") is not None:      # pushed before: keep what the client saw
+        return int(row["client_violation_count"])
+    chain = row.get("violation_chain")
+    t = _report_time(row.get("date_time"))
+    if not chain or t is None:
+        return 1
+    cur.execute(
+        f"SELECT id, date_time, pushed_to_client, remove_from_client, client_violation_count "
+        f"FROM {table} WHERE violation_chain = %s AND id <> %s",
+        (chain, row.get("id")),
+    )
+    prev, prev_t = None, None
+    for r in cur.fetchall():
+        rt = _report_time(r.get("date_time"))
+        if rt is None or rt > t or (rt == t and r["id"] > row.get("id", 0)):
+            continue
+        if prev_t is None or rt > prev_t or (rt == prev_t and r["id"] > prev["id"]):
+            prev, prev_t = r, rt
+    if prev is None:
+        return 1
+    sent = (int(prev.get("pushed_to_client") or 0) == 1
+            and int(prev.get("remove_from_client") or 0) == 0
+            and prev.get("client_violation_count") is not None)
+    if sent and (t - prev_t).total_seconds() <= PROXIMITY_CLIENT_MAX_GAP_S:
+        return int(prev["client_violation_count"]) + 1
+    return 1
+
+
 @app.post("/client-detections/copy")
 async def copy_client_detections(payload: ClientDetectionCopyRequest):
     copied = []
@@ -2303,17 +2378,20 @@ async def copy_client_detections(payload: ClientDetectionCopyRequest):
                         continue
 
                     pushed_at_dt = datetime.now().replace(microsecond=0)
+                    client_count = _client_violation_count(cur, table_name, row)
                     cur.execute(
                         f"""
                         UPDATE {table_name}
                         SET pushed_to_client = 1,
                             pushed_by = %s,
                             pushed_at = %s,
-                            unique_id = COALESCE(NULLIF(unique_id, ''), %s)
+                            unique_id = COALESCE(NULLIF(unique_id, ''), %s),
+                            client_violation_count = COALESCE(%s, client_violation_count)
                         WHERE id = %s
                         """,
-                        (pushed_by, pushed_at_dt, item_uid, row.get("id")),
+                        (pushed_by, pushed_at_dt, item_uid, client_count, row.get("id")),
                     )
+                    row["client_violation_count"] = client_count
                     if not row.get("unique_id"):
                         row["unique_id"] = item_uid
                     pushed_at_ms = int(datetime.now().timestamp() * 1000)
@@ -2352,7 +2430,10 @@ async def copy_client_detections(payload: ClientDetectionCopyRequest):
                         # SMS now fires when the client ACCEPTS (not on push).
                         "sms_sent": 0,
                         "accepted": 0,
-                        "violation_count": row.get("violation_count"),
+                        # What the client sees (see _client_violation_count); raw count otherwise.
+                        "violation_count": (row.get("client_violation_count")
+                                            if row.get("client_violation_count") is not None
+                                            else row.get("violation_count")),
                         "pushedBy": pushed_by,
                         "pushed_by": pushed_by,
                         "pushedByName": pushed_by_name,
@@ -2685,7 +2766,10 @@ def list_client_detections(
                     # Client "Accept" state (cctv_backend sets accepted_by_client).
                     "accepted":    1 if row.get("accepted_by_client") == 1 else 0,
                     "accepted_at": _epoch_ms(row.get("accepted_at")),
-                    "violation_count": row.get("violation_count"),
+                    # Client feed: the client-facing count when it was set at push time.
+                    "violation_count": (row.get("client_violation_count")
+                                        if row.get("client_violation_count") is not None
+                                        else row.get("violation_count")),
                     "_mtime":      _epoch_ms(row.get("created_at")) or 0,
                     "updatedAt":   _epoch_ms(row.get("updated_at")),
                     "updated_at":  _epoch_ms(row.get("updated_at")),

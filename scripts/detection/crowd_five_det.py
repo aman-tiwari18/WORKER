@@ -38,19 +38,27 @@ MAX_PERSONS   = 5                # Violation when 0 < smoothed_count < MAX_PERSO
 CONF_THRESHOLD = 0.45
 
 # G3: Box size — resolution-scaled with absolute floor + ceiling.
-MIN_BOX_AREA_RATIO = 0.0006      # >= 0.06% of frame area
-MIN_BOX_AREA_ABS   = 600         # ... AND >= 600 px² absolute (rejects sub-resolution shadow noise)
+# 0.02% / 300 px² (was 0.06% / 600): heads at the back of large labs (conf 0.68-0.81) were
+# dropped as too small (6 Oct Shift 3 review).
+MIN_BOX_AREA_RATIO = 0.0002      # >= 0.02% of frame area
+MIN_BOX_AREA_ABS   = 300         # ... AND >= 300 px² absolute (rejects sub-resolution shadow noise)
 MAX_BOX_AREA_RATIO = 0.45        # Reject single boxes > 45% of frame (operator at lens, not candidate)
 
 # G4: Aspect-ratio sanity. Looser than invigilator's standing-only gate — seated
 # candidates are counted here too. Goal: reject obviously-not-a-person shapes.
-ASPECT_W_OVER_H_MAX = 1.20       # Reject very horizontal boxes (furniture mis-classified)
-ASPECT_W_OVER_H_MIN = 0.25       # Reject impossibly thin verticals
+# 2.5 (was 1.20): a seated candidate seen from above / behind the cubicle partition shows only
+# head and shoulders, a box wider than tall (conf 0.85-0.95) - 1.20 dropped them all.
+ASPECT_W_OVER_H_MAX = 2.5        # Reject very horizontal boxes (furniture mis-classified)
+# 0.12 (was 0.25): standing / side-on people from a high camera are ~0.15-0.22 wide, and on
+# the 960x1080 cameras 0.25 dropped them all (6 Oct, LAB10 CAM2: 8 people at conf >= 0.85, 3.5 counted).
+ASPECT_W_OVER_H_MIN = 0.12       # Reject impossibly thin verticals
 
 # G5: Edge handling — partial person at frame border counts as EDGE_WEIGHT (not 1.0)
 # so a person walking in/out isn't over-credited and the count is stable at doorways.
 EDGE_MARGIN_PX = 8
-EDGE_WEIGHT    = 0.5
+# 1.0 (was 0.5): a candidate cut off by the frame edge is still a candidate; at 0.5, five
+# people with one at the edge counted 4.5 and raised a false "fewer than 5".
+EDGE_WEIGHT    = 1.0
 
 # G6: Secondary IoMin dedup on top of YOLO's NMS — catches double-counts where
 # YOLO emits head + torso boxes for the same seated candidate.

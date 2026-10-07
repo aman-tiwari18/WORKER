@@ -49,7 +49,7 @@ Most specific first:
 4. Only if the exam has **no** uploaded sheet: the legacy tables in `server_room_constants.py`, exactly as before.
    - `SERVER_ROOM_LEGACY_FALLBACK=0` switches the legacy tables off.
 
-Detection fires when `person_count > limit`. The sheet's fractional limits (11.01) are **rounded down** (11), which means the same thing for whole people and matches the old constants convention.
+Detection fires when `person_count > limit`. The sheet's fractional limits are **rounded to the nearest whole number** on upload and manual edit (7.75 → 8), the way Excel displays them, and stored as whole numbers.
 
 Workers cache an exam's thresholds for `SERVER_ROOM_THRESHOLD_TTL_S` (default 300 s). If the DB or backend cannot be reached, the last good copy keeps being used. With no copy, the lookup falls back to the legacy tables. It never raises.
 

@@ -24,7 +24,7 @@ if DETECTION_ROOT not in sys.path:
 
 # Import core detection module
 import close_proximity as proximity_core
-from proximity_repeat import next_violation_count
+from proximity_repeat import next_violation
 
 # ================= GPU MEMORY GUARD =================
 from workers.gpu_memory_guard import apply_gpu_memory_limit
@@ -159,7 +159,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
 
             # Same pair at the same spot as this camera's earlier report → repeat count 2, 3, ...
             camera_key = f"hls_ch{ch_no}" if item.get("source_type") == "HLS" else f"rtsp_{dev_id}_{ch_no}"
-            repeat_count = next_violation_count(camera_key, violation_pairs, exam_id, shift_id)
+            repeat_count, repeat_chain = next_violation(camera_key, violation_pairs, exam_id, shift_id)
 
             path = os.path.join(save_folder, fname)
             cv2.imwrite(path, annotated_frame)
@@ -174,6 +174,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
                         image_name=fname,
                         folder="proximity_detection",
                         violation_count=repeat_count,
+                        violation_chain=repeat_chain,
                     )
                 except Exception as e:
                     logger.error(f"[Proximity] HLS DB Reporting Error: {e}")
@@ -186,6 +187,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=120):
                         image_name=fname,
                         folder="proximity_detection",
                         violation_count=repeat_count,
+                        violation_chain=repeat_chain,
                     )
                 except Exception as e:
                     logger.error(f"[Proximity] RTSP DB Reporting Error: {e}")

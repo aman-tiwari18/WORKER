@@ -42,6 +42,7 @@ import logging
 import threading
 
 import cv2
+import numpy as np
 import torch
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,7 +87,13 @@ def _env_choice(name, default, allowed):
 # Per-worker switches. The person default keeps the behaviour from before the
 # fine-tuned models, so nothing changes on a worker until it is set. monitor_tamper
 # defaults to RF-DETR, the model shipped with monitor_alerts_deploy_v2.
-PERSON_MODEL = _env_choice("UNIFIED_PERSON_MODEL", "yolov10m", ("yolov10m", "finetuned"))
+# UNIFIED_PERSON_BACKEND (if set) wins over UNIFIED_PERSON_MODEL: a key added to .env reaches
+# the workers on a plain restart, while a key already in the container env needs a recreate.
+# "rfdetr" = the RF-DETR person+monitor model (same file as monitor_tamper) for every person
+# analytic, read through _as_ultralytics_result.
+PERSON_MODEL = (_env_choice("UNIFIED_PERSON_BACKEND", "finetuned", ("yolov10m", "finetuned", "rfdetr"))
+                if os.environ.get("UNIFIED_PERSON_BACKEND", "").strip()
+                else _env_choice("UNIFIED_PERSON_MODEL", "yolov10m", ("yolov10m", "finetuned")))
 MONITOR_MODEL = _env_choice("UNIFIED_MONITOR_MODEL", "rfdetr", ("rfdetr", "yolo26m"))
 
 
@@ -98,6 +105,8 @@ def model_for(script):
         return "mobile"
     if script == "monitor_tamper":
         return "person_monitor_rfdetr" if MONITOR_MODEL == "rfdetr" else "person_monitor_yolo26m"
+    if script in PERSON_ANALYTICS and PERSON_MODEL == "rfdetr":
+        return "person_monitor_rfdetr"
     if script in PERSON_ANALYTICS and PERSON_MODEL == "finetuned":
         return "person_monitor_yolo26m"
     return "yolov10m"
@@ -180,7 +189,8 @@ def class_from_result(result, class_ids, conf=CONF_THRESHOLD):
 # Reporting helper (shared by all evaluators)
 # ============================================================
 def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
-                     exam_id, shift_id, source_type="RTSP", violation_count=None):
+                     exam_id, shift_id, source_type="RTSP", violation_count=None,
+                     violation_chain=None):
     """Save the annotated detection and report it, using the schema-correct identifier:
        - RTSP: device_id + camera_no  (filename `{dev}_{camera_no}`, report_to_db_rtsp)
        - HLS : ch_code (= camera_no)  (filename `ch{ch_code}`,        report_to_db_hls)
@@ -202,12 +212,12 @@ def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
         if str(source_type).upper() == "HLS":
             from utils.db_client import report_to_db_hls
             report_to_db_hls(ch_code=str(camera_no), image_name=fname, folder=folder,
-                             violation_count=violation_count)
+                             violation_count=violation_count, violation_chain=violation_chain)
         else:
             from utils.db_client import report_to_db_rtsp
             report_to_db_rtsp(device_id=str(device_id), camera_no=str(camera_no),
                               image_name=fname, folder=folder,
-                              violation_count=violation_count)
+                              violation_count=violation_count, violation_chain=violation_chain)
     except Exception as e:
         logger.error(f"[Unified] DB report error ({script_name}): {e}")
     logger.warning(f"[Unified] 🚨 {script_name} saved → {path}")
@@ -260,6 +270,40 @@ ANALYTIC_SPEC = {
 }
 
 
+# Person analytics read Ultralytics-style results (result.boxes; box.cls[0] / conf[0] /
+# xyxy[0]). RF-DETR returns supervision.Detections, so wrap it. Boxes under
+# RFDETR_PERSON_MIN_CONF are dropped first - the RF-DETR backend runs at 0.15 for
+# monitor_tamper's weak-monitor fallback, the YOLO person backend ran at 0.35.
+RFDETR_PERSON_MIN_CONF = float(os.environ.get("RFDETR_PERSON_MIN_CONF", "0.35"))
+
+
+class _Boxes(list):
+    def __init__(self, xyxy, conf, cls):
+        super().__init__(_Box(xyxy[i:i + 1], conf[i:i + 1], cls[i:i + 1]) for i in range(len(conf)))
+        self.xyxy, self.conf, self.cls = xyxy, conf, cls
+
+
+class _Box:
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy, self.conf, self.cls = xyxy, conf, cls
+
+
+class _UltralyticsLike:
+    def __init__(self, boxes):
+        self.boxes = boxes
+
+
+def _as_ultralytics_result(result):
+    if hasattr(result, "boxes"):
+        return result
+    xyxy = np.asarray(result.xyxy, dtype=np.float32).reshape(-1, 4)
+    conf = np.asarray(result.confidence, dtype=np.float32).reshape(-1)
+    cls = np.asarray(result.class_id, dtype=np.float32).reshape(-1)
+    keep = conf >= RFDETR_PERSON_MIN_CONF
+    return _UltralyticsLike(_Boxes(torch.from_numpy(xyxy[keep]), torch.from_numpy(conf[keep]),
+                                   torch.from_numpy(cls[keep])))
+
+
 def _make_evaluator(module_name, fn_name, folder, script_code):
     """Build an evaluator that runs the script's rule over the SHARED result (no re-inference)."""
     _cache = {}
@@ -271,7 +315,7 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             fn = getattr(mod, fn_name)
             _cache["fn"] = fn
         # Reuse the script's own rule + annotation by passing the shared result.
-        outputs = fn([item], results=[result])
+        outputs = fn([item], results=[_as_ultralytics_result(result)])
         out = outputs[0]
         annotated, detected = out[0], out[1]   # all return (annotated, detected, count[, ...])
         if not detected:
@@ -279,15 +323,15 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             return
         if not _passed_gate(state, script_code, time.time()):
             return
-        violation_count = None
+        violation_count = violation_chain = None
         if script_code == "proximity" and len(out) > 3:
             # Same pair at the same spot as this camera's earlier report → 2, 3, ...
             # Keys match workers/close_proximity_worker.py so both paths share counts.
-            from proximity_repeat import next_violation_count
+            from proximity_repeat import next_violation
             is_hls = str(item.get("source_type", "RTSP")).upper() == "HLS"
             camera_key = (f"hls_ch{item['camera_no']}" if is_hls
                           else f"rtsp_{item['device_id']}_{item['camera_no']}")
-            violation_count = next_violation_count(
+            violation_count, violation_chain = next_violation(
                 camera_key, out[3], item.get("exam_id", "0"), item.get("shift_id", "0"))
         _save_and_report(
             annotated, folder=folder, script_name=script_code,
@@ -295,6 +339,7 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             exam_id=item.get("exam_id", "0"), shift_id=item.get("shift_id", "0"),
             source_type=item.get("source_type", "RTSP"),
             violation_count=violation_count,
+            violation_chain=violation_chain,
         )
 
     return _eval

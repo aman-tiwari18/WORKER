@@ -455,6 +455,11 @@ def _ensure_status_column(conn):
         # Proximity repeat counter (mirrors migration 042).
         "ALTER TABLE camera_report_hls ADD COLUMN violation_count INT NULL DEFAULT NULL",
         "ALTER TABLE camera_report_rtsp ADD COLUMN violation_count INT NULL DEFAULT NULL",
+        # Proximity repeat chain + client-facing count (mirrors migration 045).
+        "ALTER TABLE camera_report_hls ADD COLUMN violation_chain VARCHAR(32) NULL DEFAULT NULL",
+        "ALTER TABLE camera_report_rtsp ADD COLUMN violation_chain VARCHAR(32) NULL DEFAULT NULL",
+        "ALTER TABLE camera_report_hls ADD COLUMN client_violation_count INT NULL DEFAULT NULL",
+        "ALTER TABLE camera_report_rtsp ADD COLUMN client_violation_count INT NULL DEFAULT NULL",
         # Per-run classification history tables (mirrors migration 024).
         # Created here as well so workers come up cleanly without a manual migration step.
         """CREATE TABLE IF NOT EXISTS camera_classification_hls (
@@ -749,7 +754,10 @@ def _fetch_rtsp(cur, base_sql: str, exam_id: int, order_by: str = "ORDER BY id")
             if e.args and e.args[0] == 1146:       # table doesn't exist
                 logger.warning("[DB] exam schedule tables missing (migration 046) — no schedule filter applied")
             else:
-                raise
+                logger.error(f"[DB] exam schedule filter failed ({e}) — no schedule filter applied")
+        except Exception as e:
+            # Any other failure (e.g. a collation mismatch) must not leave the run with 0 cameras.
+            logger.error(f"[DB] exam schedule filter failed ({e}) — no schedule filter applied")
     cur.execute(f"{base_sql} {order_by}", (exam_id,))
     return cur.fetchall()
 
@@ -1149,7 +1157,7 @@ def _extract_unique_id_from_image_name(image_name: str) -> Optional[str]:
 
 def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detection",
                      person_count: int = None, threshold: int = None,
-                     violation_count: int = None) -> bool:
+                     violation_count: int = None, violation_chain: str = None) -> bool:
     """
     Central HLS detection reporter.
 
@@ -1249,8 +1257,8 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
                         camera_name, camera_category, tc_code, ch_code,
                         state, camera_status, events, person_count, threshold,
                         date_time, imageurl, detection_type, unique_id, gpu_id,
-                        violation_count
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        violation_count, violation_chain
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), cam.get('shift_id'), cam.get('city'),
@@ -1258,7 +1266,7 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
                         cam.get('camera_category'), cam.get('tc_code'), ch_code,
                         cam.get('state'), camera_status, 1, person_count, threshold,
                         date_time, image_url, folder,
-                        unique_id, _GPU_ID, violation_count,
+                        unique_id, _GPU_ID, violation_count, violation_chain,
                     ),
                 )
             conn.commit()
@@ -1288,7 +1296,7 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
 
 def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: str = "crowd_detection",
                       person_count: int = None, threshold: int = None,
-                      violation_count: int = None) -> bool:
+                      violation_count: int = None, violation_chain: str = None) -> bool:
     """
     Central RTSP detection reporter.
 
@@ -1305,6 +1313,7 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
                     not count people leave it NULL. Consumed by the SMS layer.
         threshold : the per-TC-code limit this detection crossed. Optional.
         violation_count: proximity repeat count (see report_to_db_hls). Optional.
+        violation_chain: id of the repeating pair (proximity_repeat). Optional.
 
     Returns:
         True on success, False on any failure.
@@ -1385,8 +1394,8 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
                         device_id, camera_no, camera_name, tc_code,
                         state, camera_status, events, person_count, threshold,
                         date_time, imageurl, detection_type, unique_id, gpu_id,
-                        violation_count
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        violation_count, violation_chain
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), shift_id, cam.get('city'),
@@ -1394,7 +1403,7 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
                         camera_name, cam.get('tc_code'), cam.get('state'),
                         camera_status, 1, person_count, threshold,
                         date_time, image_url, folder,
-                        unique_id, _GPU_ID, violation_count,
+                        unique_id, _GPU_ID, violation_count, violation_chain,
                     ),
                 )
             conn.commit()

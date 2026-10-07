@@ -40,6 +40,10 @@ STANDING_ASPECT_RATIO = 2.5    # h/w >= 2.5 → "standing" pose. Tightened from 
                                # resetting the 7-min STATIC timer. This is the practical ceiling
                                # of bbox-only standing classification; going further requires pose
                                # estimation, which no script in this codebase currently uses.
+STATIC_MIN_ASPECT_RATIO = 2.0  # STATIC only: h/w still accepted for a person ALREADY anchored at a spot.
+                               # An invigilator leaning on a desk sits at h/w ~2.4-2.6 and flickers under
+                               # 2.5, so checkpoints missed him and the 7-min timer reset. New anchors
+                               # and ABSENT still require STANDING_ASPECT_RATIO.
 
 # --- ABSENT violation (no invigilator in the room) ---
 NO_TARGET_TIME_THRESH = 45     # Seconds of zero-standing-person before ABSENT fires
@@ -62,6 +66,16 @@ CONFIRM_HIT_STREAK    = 2     # The latest N checkpoints must all be hits — on
 ANCHOR_RADIUS_FLOOR   = 40    # px — foot must be within max(floor, bbox_h * ratio) of the anchor
 ANCHOR_RADIUS_RATIO   = 0.25
 MAX_ANCHORS           = 20    # Per camera; bounds work if a scene produces many standing boxes
+CHECK_WINDOW_SEC      = 10    # A checkpoint is judged on every frame within ± this many seconds of it
+                              # (5 fps feed: the frames around it; round-robin: the burst), not on the
+                              # checkpoint frame alone, so one bad frame — box cut short, pose under
+                              # the ratio — isn't a miss
+CHECK_MIN_SEEN_FRAC   = 0.6   # ...and is a hit if the person was matched at the spot in at least this
+                              # share of those frames. Someone standing there is matched in most of
+                              # them (0.84-1.0 on real lab footage); someone walking through the spot
+                              # only for the ~2 s it takes to cross it, and someone coming and going
+                              # every 20-40 s about half of them — neither counts as staying.
+                              # Round-robin burst of 2 frames: the first frame must match.
 
 # --- Same-person check (clothing colour signature) ---
 # HSV hue/saturation histogram of torso and legs, compared with Bhattacharyya distance
@@ -142,12 +156,19 @@ class PersonTracker:
                STATIC_TIME_THRESH seconds, judged at checkpoints taken every
                CHECK_INTERVAL_SEC.
 
-    At a checkpoint each anchor (foot position + colour gallery) is checked:
-    a standing box whose foot is within the anchor radius of the anchor's
-    stored position and whose colours match the gallery is a hit, anything
-    else is a miss. MISS_STREAK_RESET misses in a row drop the anchor.
+    At a checkpoint each anchor (foot + head position, colour gallery) is checked:
+    the anchor's person counts as seen when a box sits at the stored spot — foot
+    OR top of box within the anchor radius, since a desk or a seated student can
+    hide the legs — and its colours match the gallery. The checkpoint is a hit if
+    they were seen in at least CHECK_MIN_SEEN_FRAC of the frames within
+    CHECK_WINDOW_SEC of it, otherwise a miss.
+    MISS_STREAK_RESET misses in a row drop the anchor.
     Standing boxes that matched no anchor start new anchors — so a different
     person stepping into the spot starts their own timer instead of inheriting one.
+
+    Only boxes passing STANDING_ASPECT_RATIO start anchors and drive ABSENT.
+    `extra_boxes` (STATIC_MIN_ASPECT_RATIO <= h/w < STANDING_ASPECT_RATIO) are used
+    only to keep following an already-anchored person; ABSENT never sees them.
 
     Once an anchor is confirmed (7 min elapsed, enough hits, latest
     CONFIRM_HIT_STREAK checkpoints all hits) STATIC stays true on every frame where that person is still at the
@@ -171,13 +192,24 @@ class PersonTracker:
         return (float(box[0] + box[2]) / 2.0, float(box[3]))
 
     @staticmethod
+    def _top(box):
+        return (float(box[0] + box[2]) / 2.0, float(box[1]))
+
+    @staticmethod
     def _moved(anchor, foot):
         """Pixel distance of a foot point from the anchor's stored position."""
         return ((foot[0] - anchor['x']) ** 2 + (foot[1] - anchor['y']) ** 2) ** 0.5
 
     @classmethod
-    def _near(cls, anchor, foot):
-        return cls._moved(anchor, foot) < max(ANCHOR_RADIUS_FLOOR, anchor['h'] * ANCHOR_RADIUS_RATIO)
+    def _near(cls, anchor, foot, top=None):
+        radius = max(ANCHOR_RADIUS_FLOOR, anchor['h'] * ANCHOR_RADIUS_RATIO)
+        if cls._moved(anchor, foot) < radius:
+            return True
+        # Legs hidden behind a desk or a seated student cut the box short: the foot point
+        # jumps up while the top of the box (head) stays where it was.
+        if top is None or anchor.get('ty') is None:
+            return False
+        return ((top[0] - anchor['tx']) ** 2 + (top[1] - anchor['ty']) ** 2) ** 0.5 < radius
 
     @staticmethod
     def _colour_dist(anchor, sig):
@@ -189,6 +221,81 @@ class PersonTracker:
         d = cls._colour_dist(anchor, sig)
         return d is not None and d < APPEARANCE_MAX_DIST
 
+    @classmethod
+    def _people(cls, boxes, frame):
+        """[(box, strict)] -> per-person dicts; colour signatures are computed on first use."""
+        return [{'box': b, 'strict': strict, 'frame': frame, 'foot': cls._foot(b), 'top': cls._top(b),
+                 'h': max(float(b[3] - b[1]), 1.0)} for b, strict in boxes]
+
+    @staticmethod
+    def _sig(person):
+        if 'sig' not in person:
+            person['sig'] = appearance_signature(person['frame'], person['box'])
+        return person['sig']
+
+    def _match(self, anchor, people):
+        """Index of the first person at the anchor's spot wearing the anchor's colours, else None."""
+        for i, p in enumerate(people):
+            if self._near(anchor, p['foot'], p['top']) and self._same_person(anchor, self._sig(p)):
+                return i
+        return None
+
+    @staticmethod
+    def _seen_frac(a, t0, t1):
+        """Share of this camera's frames in [t0, t1] where the anchor's person was matched at the spot."""
+        frames = [m for t, m in a.get('seen', []) if t0 <= t <= t1]
+        return sum(frames) / len(frames) if frames else 0.0
+
+    def _record(self, a, t, hit, foot=None, sig=None, frac=None):
+        """Count one checkpoint result for anchor `a`. foot/sig: where the person was seen, for review."""
+        a['checks'] += 1
+        cd = self._colour_dist(a, sig)
+        a['history'] = (a['history'] + [{
+            't': round(t, 1), 'hit': hit, 'seen_frac': None if frac is None else round(frac, 2),
+            'x': None if foot is None else round(foot[0], 1),
+            'y': None if foot is None else round(foot[1], 1),
+            'moved_px': None if foot is None else round(self._moved(a, foot), 1),
+            'colour_dist': None if cd is None else round(cd, 3),
+        }])[-STATE_HISTORY_LEN:]
+        if not hit:
+            a['miss_streak'] += 1
+            a['hit_streak'] = 0
+            return
+        a['hits'] += 1
+        a['miss_streak'] = 0
+        a['hit_streak'] += 1
+        if sig is not None and len(a['gallery']) < GALLERY_SIZE:
+            a['gallery'].append(sig)
+
+    def _settle(self, a, now=None):
+        """Decide a pending checkpoint on the frames around it (all of them up to `now`)."""
+        t = a['pending']
+        frac = self._seen_frac(a, t - CHECK_WINDOW_SEC, t + CHECK_WINDOW_SEC if now is None else now)
+        if frac >= CHECK_MIN_SEEN_FRAC:
+            self._record(a, t, True, a.get('last_foot'), a.get('last_sig'), frac)
+        else:
+            self._record(a, t, False, *a.get('pending_seen', (None, None)), frac)
+        a['pending'] = None
+
+    def _follow(self, now, people):
+        """Every frame: note whether each anchor's person is at the spot, and settle checkpoints
+        whose window (CHECK_WINDOW_SEC after them) has passed."""
+        settled = False
+        for a in self.anchors:
+            i = self._match(a, people)
+            if i is not None:
+                a['last_seen'] = now
+                a['last_foot'] = people[i]['foot']
+                a['last_sig'] = self._sig(people[i])
+            a['seen'] = [(t, m) for t, m in a.get('seen', []) if now - t <= 2 * CHECK_WINDOW_SEC]
+            a['seen'].append((now, i is not None))
+            if a.get('pending') is not None and now - a['pending'] > CHECK_WINDOW_SEC:
+                self._settle(a)
+                settled = True
+        if settled:
+            self.anchors = [a for a in self.anchors if a['miss_streak'] < MISS_STREAK_RESET]
+            self._save(now)
+
     def _checkpoint(self, now, people):
         # Camera unseen for too long → can't vouch for continuity.
         if self.last_check is not None and now - self.last_check > MAX_CHECK_GAP_SEC:
@@ -198,44 +305,34 @@ class PersonTracker:
 
         matched = set()
         for a in self.anchors:
-            a['checks'] += 1
-            hit = None
-            for i, (foot, h, sig) in enumerate(people):
-                if self._near(a, foot) and self._same_person(a, sig):
-                    hit = i
-                    break
-            # Record where the person was at this checkpoint (the match, else the
-            # standing person closest to the spot) for review.
-            seen = hit if hit is not None else min(
-                range(len(people)), key=lambda i: self._moved(a, people[i][0]), default=None)
-            entry = {'t': round(now, 1), 'hit': hit is not None,
-                     'x': None, 'y': None, 'moved_px': None, 'colour_dist': None}
-            if seen is not None:
-                foot, _, sig = people[seen]
-                cd = self._colour_dist(a, sig)
-                entry.update(x=round(foot[0], 1), y=round(foot[1], 1),
-                             moved_px=round(self._moved(a, foot), 1),
-                             colour_dist=None if cd is None else round(cd, 3))
-            a['history'] = (a['history'] + [entry])[-STATE_HISTORY_LEN:]
-
-            if hit is None:
-                a['miss_streak'] += 1
-                a['hit_streak'] = 0
-                continue
-            matched.add(hit)
-            a['hits'] += 1
-            a['miss_streak'] = 0
-            a['hit_streak'] += 1
-            if len(a['gallery']) < GALLERY_SIZE:
-                a['gallery'].append(people[hit][2])
+            if a.get('pending') is not None:   # previous window still open: decide on what it has
+                self._settle(a, now)
+            hit = self._match(a, people)
+            if hit is not None:
+                matched.add(hit)
+            frac = self._seen_frac(a, now - CHECK_WINDOW_SEC, now)
+            if frac >= CHECK_MIN_SEEN_FRAC:
+                self._record(a, now, True, a.get('last_foot'), a.get('last_sig'), frac)
+            else:
+                # Too few sightings in the frames before the checkpoint: decide once the frames
+                # after it are in too. Keep the person closest to the spot now, to record where
+                # they were if it ends as a miss.
+                seen = min(people, key=lambda p: self._moved(a, p['foot']), default=None)
+                a['pending'] = now
+                a['pending_seen'] = (None, None) if seen is None else (seen['foot'], self._sig(seen))
         self.anchors = [a for a in self.anchors if a['miss_streak'] < MISS_STREAK_RESET]
 
-        for i, (foot, h, sig) in enumerate(people):
-            if i in matched or sig is None or len(self.anchors) >= MAX_ANCHORS:
+        for i, p in enumerate(people):
+            if i in matched or not p['strict'] or len(self.anchors) >= MAX_ANCHORS:
                 continue
+            sig = self._sig(p)
+            if sig is None:
+                continue
+            foot, top = p['foot'], p['top']
             self.anchors.append({
-                'x': foot[0], 'y': foot[1], 'h': h, 'gallery': [sig], 'start': now,
-                'checks': 1, 'hits': 1, 'miss_streak': 0, 'hit_streak': 1,
+                'x': foot[0], 'y': foot[1], 'tx': top[0], 'ty': top[1], 'h': p['h'], 'gallery': [sig],
+                'start': now, 'checks': 1, 'hits': 1, 'miss_streak': 0, 'hit_streak': 1,
+                'last_seen': now, 'last_foot': foot, 'last_sig': sig, 'seen': [(now, True)], 'pending': None,
                 'history': [{'t': round(now, 1), 'hit': True, 'x': round(foot[0], 1),
                              'y': round(foot[1], 1), 'moved_px': 0.0, 'colour_dist': 0.0}],
             })
@@ -251,9 +348,12 @@ class PersonTracker:
             'last_check': now,
             'anchors': [{
                 'x': round(float(a['x']), 1), 'y': round(float(a['y']), 1), 'h': round(float(a['h']), 1),
+                'tx': None if a.get('tx') is None else round(float(a['tx']), 1),
+                'ty': None if a.get('ty') is None else round(float(a['ty']), 1),
                 'start': a['start'],
                 'start_at': datetime.fromtimestamp(a['start']).strftime('%Y-%m-%d %H:%M:%S'),
                 'stood_sec': round(now - a['start'], 1),
+                'last_seen': a.get('last_seen'),
                 'checks': a['checks'], 'hits': a['hits'],
                 'miss_streak': a['miss_streak'], 'hit_streak': a['hit_streak'],
                 'history': a['history'],
@@ -293,44 +393,51 @@ class PersonTracker:
             self.anchors, self.last_check = [], None
             _warn_state_io(f"could not read {self.state_path}, starting fresh: {e}")
 
-    def update(self, person_boxes, frame):
+    def update(self, person_boxes, frame, extra_boxes=()):
         """
         person_boxes : list of [x1,y1,x2,y2] for STANDING-classified boxes.
         frame        : the un-annotated frame the boxes came from (for colour signatures).
+        extra_boxes  : boxes with STATIC_MIN_ASPECT_RATIO <= h/w < STANDING_ASPECT_RATIO. STATIC only:
+                       they keep following an anchored person but never start an anchor,
+                       and ABSENT never sees them.
         Returns (absent_violation: bool, static_violation: bool, static_feet: list[(fx,fy)]).
         `static_feet` holds the foot point of every box that is a confirmed STATIC
         person in this frame, so the caller can highlight only that subject.
         """
         now = time.time()
 
+        people = self._people([(b, True) for b in person_boxes] + [(b, False) for b in extra_boxes], frame)
+        self._follow(now, people)
         if self.next_check is None or now >= self.next_check:
-            people = [(self._foot(b), max(float(b[3] - b[1]), 1.0), appearance_signature(frame, b))
-                      for b in person_boxes]
             self._checkpoint(now, people)
 
-        # --- ABSENT branch -------------------------------------------------
+        # --- ABSENT branch (standing boxes only) ---------------------------
         if not person_boxes:
             if self.no_target_start is None:
                 self.no_target_start = now
-            return (now - self.no_target_start) > NO_TARGET_TIME_THRESH, False, []
-
-        # At least one standing person → disarm ABSENT clock
-        self.no_target_start = None
+            absent = (now - self.no_target_start) > NO_TARGET_TIME_THRESH
+        else:
+            # At least one standing person → disarm ABSENT clock
+            self.no_target_start = None
+            absent = False
 
         # --- STATIC branch -------------------------------------------------
+        # The last CHECK_WINDOW_SEC must also show them staying there, as at a checkpoint —
+        # someone who left after the last checkpoint and only walks back through the spot
+        # is not STATIC.
         confirmed = [a for a in self.anchors
                      if a['hit_streak'] >= CONFIRM_HIT_STREAK
                      and now - a['start'] >= STATIC_TIME_THRESH
                      and a['hits'] >= MIN_HITS
-                     and a['hits'] / a['checks'] >= MIN_HIT_RATIO]
+                     and a['hits'] / a['checks'] >= MIN_HIT_RATIO
+                     and self._seen_frac(a, now - CHECK_WINDOW_SEC, now) >= CHECK_MIN_SEEN_FRAC]
         static_feet = []
-        for b in person_boxes:
-            foot = self._foot(b)
-            near = [a for a in confirmed if self._near(a, foot)]
-            if near and any(self._same_person(a, appearance_signature(frame, b)) for a in near):
-                static_feet.append(foot)
+        for p in people:
+            near = [a for a in confirmed if self._near(a, p['foot'], p['top'])]
+            if near and any(self._same_person(a, self._sig(p)) for a in near):
+                static_feet.append(p['foot'])
 
-        return False, bool(static_feet), static_feet
+        return absent, bool(static_feet), static_feet
 
 # ================= STATE ===================
 trackers = {}
@@ -354,26 +461,65 @@ def _new_tracker(key):
 # =====================================================
 # CORE DETECTION LOGIC
 # =====================================================
-def detect_invigilator_in_frame(frame, device_id="unknown", camera_no="unknown", script_name="invigilator"):
-    """Standalone detection for a single frame."""
-    model = get_yolo_model()
-    results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
-
-    # Only standing persons count as invigilator candidates (per mentor rule).
-    # Standing := height >= MIN_HEIGHT AND height/width >= STANDING_ASPECT_RATIO.
-    # The aspect-ratio gate (h/w >= 2.0) rejects seated torso-above-desk bboxes
-    # (h/w ~1.2-1.7) regardless of where they sit in the frame.
-    person_boxes = []
-    person_confs = []
-    for box in results.boxes:
+def _split_person_boxes(boxes):
+    """Person boxes -> (standing, standing_confs, extra, extra_confs).
+    standing : height >= MIN_HEIGHT AND h/w >= STANDING_ASPECT_RATIO — invigilator candidates
+               (per mentor rule); they drive ABSENT and start STATIC anchors. The ratio gate
+               rejects seated torso-above-desk bboxes (h/w ~1.2-1.7) wherever they sit in the frame.
+    extra    : height >= MIN_HEIGHT AND STATIC_MIN_ASPECT_RATIO <= h/w < STANDING_ASPECT_RATIO —
+               only let STATIC keep following an already-anchored person."""
+    standing, standing_confs, extra, extra_confs = [], [], [], []
+    for box in boxes:
         if int(box.cls[0]) != 0 or float(box.conf[0]) < CONF_THRESHOLD:
             continue
         coords = box.xyxy[0].cpu().numpy()
         h = coords[3] - coords[1]
         w = max(coords[2] - coords[0], 1.0)
-        if h >= MIN_HEIGHT and (h / w) >= STANDING_ASPECT_RATIO:
-            person_boxes.append(coords)
-            person_confs.append(float(box.conf[0]))
+        if h < MIN_HEIGHT:
+            continue
+        if (h / w) >= STANDING_ASPECT_RATIO:
+            standing.append(coords)
+            standing_confs.append(float(box.conf[0]))
+        elif (h / w) >= STATIC_MIN_ASPECT_RATIO:
+            extra.append(coords)
+            extra_confs.append(float(box.conf[0]))
+    return standing, standing_confs, extra, extra_confs
+
+
+def _draw_person_boxes(frame, person_boxes, person_confs, extra_boxes, static_violation, static_feet):
+    """Box drawing:
+    - On STATIC: the track that fired (matched by foot position) gets a thick
+      red box with a "STATIC" label — also when it is an extra (leaning) box;
+      other standees get thin green boxes. Extra boxes are otherwise not drawn.
+    - On ABSENT: no person_boxes exist this frame, so nothing green is drawn.
+    - Active: everyone standing in thin green."""
+    def is_static_box(x1, y1, x2, y2):
+        fx, fy = (x1 + x2) / 2.0, float(y2)
+        match_r = max((y2 - y1) * 0.3, 25)
+        return static_violation and any(
+            ((fx - sx) ** 2 + (fy - sy) ** 2) ** 0.5 < match_r
+            for sx, sy in static_feet
+        )
+
+    boxes = [(b, c) for b, c in zip(person_boxes, person_confs)] + [(b, None) for b in extra_boxes]
+    for box, conf in boxes:
+        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+        if is_static_box(x1, y1, x2, y2):
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+            cv2.putText(frame, "STATIC", (x1, max(y1 - 8, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        elif conf is not None:
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+            cv2.putText(frame, f"Invig {conf:.2f}", (x1, max(y1 - 8, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+
+def detect_invigilator_in_frame(frame, device_id="unknown", camera_no="unknown", script_name="invigilator"):
+    """Standalone detection for a single frame."""
+    model = get_yolo_model()
+    results = model(frame, conf=CONF_THRESHOLD, verbose=False)[0]
+
+    person_boxes, person_confs, extra_boxes, _ = _split_person_boxes(results.boxes)
 
     key = f"{device_id}_{camera_no}"
     with _state_lock:
@@ -381,33 +527,11 @@ def detect_invigilator_in_frame(frame, device_id="unknown", camera_no="unknown",
             trackers[key] = _new_tracker(key)
         tracker = trackers[key]
 
-    absent, static_violation, static_feet = tracker.update(person_boxes, frame)
+    absent, static_violation, static_feet = tracker.update(person_boxes, frame, extra_boxes)
     violation_detected = absent or static_violation
     status = "ABSENT" if absent else ("STATIC" if static_violation else "Active")
 
-    # Box drawing:
-    # - On STATIC: the track that fired (matched by foot position) gets a thick
-    #   red box with a "STATIC" label; other standees get thin green boxes.
-    # - On ABSENT: no person_boxes exist this frame, so the loop draws nothing.
-    # - Active: everyone in thin green.
-    for box, conf in zip(person_boxes, person_confs):
-        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        bbox_h = y2 - y1
-        fx = (x1 + x2) / 2.0
-        fy = float(y2)
-        match_r = max(bbox_h * 0.3, 25)
-        is_static_box = static_violation and any(
-            ((fx - sx) ** 2 + (fy - sy) ** 2) ** 0.5 < match_r
-            for sx, sy in static_feet
-        )
-        if is_static_box:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(frame, "STATIC", (x1, max(y1 - 8, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        else:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-            cv2.putText(frame, f"Invig {conf:.2f}", (x1, max(y1 - 8, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    _draw_person_boxes(frame, person_boxes, person_confs, extra_boxes, static_violation, static_feet)
 
     # Status overlay
     overlay = frame.copy()
@@ -442,19 +566,7 @@ def detect_invigilator_batch(items, results=None):
     outputs = []
     for item, result in zip(items, results):
         frame = item['frame'].copy()
-        # Standing := height >= MIN_HEIGHT AND h/w >= STANDING_ASPECT_RATIO.
-        # Aspect-ratio gate (>= 2.0) rejects seated torso-above-desk shape.
-        person_boxes = []
-        person_confs = []
-        for box in result.boxes:
-            if int(box.cls[0]) != 0 or float(box.conf[0]) < CONF_THRESHOLD:
-                continue
-            coords = box.xyxy[0].cpu().numpy()
-            h = coords[3] - coords[1]
-            w = max(coords[2] - coords[0], 1.0)
-            if h >= MIN_HEIGHT and (h / w) >= STANDING_ASPECT_RATIO:
-                person_boxes.append(coords)
-                person_confs.append(float(box.conf[0]))
+        person_boxes, person_confs, extra_boxes, _ = _split_person_boxes(result.boxes)
 
         device_id = item.get('device_id', 'unknown')
         camera_no = item.get('ch_no', 'unknown')
@@ -465,31 +577,11 @@ def detect_invigilator_batch(items, results=None):
                 trackers[key] = _new_tracker(key)
             tracker = trackers[key]
 
-        absent, static_violation, static_feet = tracker.update(person_boxes, frame)
+        absent, static_violation, static_feet = tracker.update(person_boxes, frame, extra_boxes)
         violation_detected = absent or static_violation
         status = "ABSENT" if absent else ("STATIC" if static_violation else "Active")
 
-        # On STATIC, only the triggering track is drawn in thick red with "STATIC"
-        # label; everyone else gets a thin green box. On ABSENT, no boxes (the
-        # loop is empty). On Active, everyone in thin green.
-        for box, conf in zip(person_boxes, person_confs):
-            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            bbox_h = y2 - y1
-            fx = (x1 + x2) / 2.0
-            fy = float(y2)
-            match_r = max(bbox_h * 0.3, 25)
-            is_static_box = static_violation and any(
-                ((fx - sx) ** 2 + (fy - sy) ** 2) ** 0.5 < match_r
-                for sx, sy in static_feet
-            )
-            if is_static_box:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                cv2.putText(frame, "STATIC", (x1, max(y1 - 8, 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-                cv2.putText(frame, f"Invig {conf:.2f}", (x1, max(y1 - 8, 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        _draw_person_boxes(frame, person_boxes, person_confs, extra_boxes, static_violation, static_feet)
 
         # Status overlay
         overlay = frame.copy()

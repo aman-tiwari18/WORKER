@@ -55,16 +55,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLASS_IDS = {"person": 0, "monitor": 1}
 # RF-DETR Medium (models/monitor_person_rfdetr.pth), the default model
 # (UNIFIED_MONITOR_MODEL=rfdetr). Thresholds from monitor_alerts_deploy_v2/config.yaml.
-THRESHOLDS_RFDETR = {"person": 0.475, "monitor": 0.45}
+THRESHOLDS_RFDETR = {"person": 0.475, "monitor": 0.50}   # monitor 0.45 -> 0.50 (7 Oct)
 # Fine-tuned YOLO26m (models/monitor_person_yolo26m.pt, same classes), selected with
 # UNIFIED_MONITOR_MODEL=yolo26m. Best-F1 thresholds from the model's test split.
 THRESHOLDS = {"person": 0.425, "monitor": 0.35}
 HOMES_DIR = os.path.join(BASE_DIR, "results", "monitor_tamper_homes")
 ALERTS_DIR = os.path.join(BASE_DIR, "results", "monitor_tamper_alerts")
 # Debug: every frame this analytic checks, annotated with what it saw, whether or not it
-# alerted. MONITOR_TAMPER_SAVE_FRAMES=0 turns it off.
+# alerted. OFF by default (6 Oct 2026: ~360k frames / ~65 GB per exam day filled /data, and
+# nothing reads them back). MONITOR_TAMPER_SAVE_FRAMES=1 turns it on for a tuning run.
 FRAMES_DIR = os.path.join(BASE_DIR, "results", "monitor_tamper_frames")
-SAVE_ALL_FRAMES = os.environ.get("MONITOR_TAMPER_SAVE_FRAMES", "1") != "0"
+SAVE_ALL_FRAMES = os.environ.get("MONITOR_TAMPER_SAVE_FRAMES", "0") == "1"
 # At most one saved frame per camera per this many seconds (a continuous 5 fps feed on
 # 12 cameras would otherwise be ~60 images/s). 0 = save every checked frame.
 SAVE_EVERY_S = float(os.environ.get("MONITOR_TAMPER_SAVE_EVERY_S", "1.0"))

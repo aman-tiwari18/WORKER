@@ -18,8 +18,6 @@ import torch
 from workers.gpu_memory_guard import apply_gpu_memory_limit
 apply_gpu_memory_limit()  # FIXED: cap per-process VRAM before any CUDA alloc
 from concurrent.futures import ThreadPoolExecutor
-from torchvision import models, transforms
-from PIL import Image
 
 # Ensure detection root is on path for imports
 import sys
@@ -61,31 +59,42 @@ BATCH_WAIT_TIMEOUT  = 0.2
 THREAD_DELAY        = 0.1
 HLS_SAMPLE_EVERY    = 10
 
-# The 180°-rotated candidate must score at least this much higher (relative)
-# than the original before we flag the frame as inverted — guards against
-# false positives from marginal YOLO/Places365 scoring noise.
-INVERSION_SCORE_MARGIN = float(os.environ.get("INVERSION_SCORE_MARGIN", "0.20"))
+# Orientation evidence comes only from YOLO classes that look clearly
+# different upside down: people, and furniture that sits on the floor.
+# Other classes (suitcase, traffic light, kite, keyboard, clock…) get
+# hallucinated on empty walls/floors in *either* orientation, and a single
+# such box used to flip the verdict on empty rooms. Places365 scene
+# confidence was dropped too — it often scored the upside-down frame higher
+# (e.g. 0.12 upright vs 0.64 rotated on a crowded lab), so it added noise,
+# not signal.
+ORIENTATION_CLASS_WEIGHTS = {
+    "person": 1.0,
+    "chair": 0.5, "couch": 0.5, "bench": 0.5, "bed": 0.5,
+    "dining table": 0.5, "laptop": 0.5, "toilet": 0.5,
+    "tv": 0.3,  # monitors: frequent in labs but still detected upside down sometimes
+}
+DET_CONF = 0.35
 
-# On noisy/low-quality frames (e.g. IR grain) both orientations can score
-# near zero, where a tiny random fluctuation is enough to clear the relative
-# margin above. Require the winning side to clear an absolute floor too,
-# so near-zero-vs-near-zero noise can't masquerade as a confident win.
-INVERSION_MIN_ABS_SCORE = float(os.environ.get("INVERSION_MIN_ABS_SCORE", "0.5"))
+# The rotated candidate needs at least this much evidence (≈ one confident
+# person plus a chair) and must beat the original by this ratio. Empty
+# rooms produce no evidence either way and are never flagged — the camera
+# gets caught once anyone walks into view.
+INVERSION_MIN_EVIDENCE   = float(os.environ.get("INVERSION_MIN_EVIDENCE", "1.0"))
+INVERSION_EVIDENCE_RATIO = float(os.environ.get("INVERSION_EVIDENCE_RATIO", "2.0"))
+
+# A camera must come out inverted on this many consecutive sampled frames
+# before we alert. YOLO results shift slightly with batch composition
+# (letterbox padding depends on the other frames in the batch), so one
+# borderline frame shouldn't be enough.
+INVERSION_CONFIRM_FRAMES = int(os.environ.get("INVERSION_CONFIRM_FRAMES", "3"))
 
 _gpu_queue = queue.Queue(maxsize=GPU_QUEUE_SIZE)
 
 # ================= MODELS (lazy load) =================
 _yolo_model = None
-_places_model = None
-_classes = []
-_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-])
 
 def _load_models():
-    global _yolo_model, _places_model, _classes
+    global _yolo_model
     if _yolo_model is not None: return
 
     from ultralytics import YOLO
@@ -98,89 +107,42 @@ def _load_models():
     if torch.cuda.is_available():
         _yolo_model.to('cuda')
 
-    # Places365
-    _places_model = models.resnet18(num_classes=365)
-    ckpt_path = os.path.join(DETECTION_ROOT, "resnet18_places365.pth.tar")
-    if os.path.exists(ckpt_path):
-        checkpoint = torch.load(ckpt_path, map_location='cpu')
-        state_dict = {k.replace("module.", ""): v for k, v in checkpoint["state_dict"].items()}
-        _places_model.load_state_dict(state_dict)
-    
-    if torch.cuda.is_available():
-        _places_model = _places_model.cuda()
-    _places_model.eval()
-
-    # Categories
-    cats_path = os.path.join(DETECTION_ROOT, "categories_places365.txt")
-    if os.path.exists(cats_path):
-        with open(cats_path) as f:
-            for line in f:
-                _classes.append(line.strip().split(" ")[0][3:])
-
 # ================= BATCH DETECTION =================
+def _orientation_evidence(result):
+    """Weighted sum of confidences over orientation-informative classes."""
+    names = result.names
+    return sum(
+        ORIENTATION_CLASS_WEIGHTS.get(names[int(c)], 0.0) * float(conf)
+        for c, conf in zip(result.boxes.cls, result.boxes.conf)
+    )
+
 def _detect_orientation_batch(frames):
     _load_models()
     if not frames: return []
 
     all_rotations = []
-    meta = []
+    for frame in frames:
+        all_rotations.append(frame)
+        all_rotations.append(cv2.rotate(frame, cv2.ROTATE_180))
 
-    for idx, frame in enumerate(frames):
-        rot_v = [
-            ("original", frame),
-            ("180", cv2.rotate(frame, cv2.ROTATE_180)),
-        ]
-        for name, img in rot_v:
-            all_rotations.append(img)
-            meta.append((idx, name, img))
+    # YOLO BATCH — results alternate original, 180, original, 180, …
+    results = _yolo_model(all_rotations, conf=DET_CONF, verbose=False)
+    evidence = [_orientation_evidence(r) for r in results]
 
-    # YOLO BATCH
-    results = _yolo_model(all_rotations, conf=0.35, verbose=False)
-    yolo_outs = []
-    for r in results:
-        boxes = r.boxes
-        count = len(boxes)
-        confs = [float(b.conf[0]) for b in boxes]
-        avg_conf = sum(confs)/len(confs) if confs else 0
-        yolo_outs.append((count, avg_conf))
-
-    # PLACES365 BATCH
-    tensors = [ _transform(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))) for f in all_rotations ]
-    batch_tensor = torch.stack(tensors)
-    if torch.cuda.is_available():
-        batch_tensor = batch_tensor.cuda()
-        
-    with torch.no_grad():
-        out = _places_model(batch_tensor)
-        probs = torch.nn.functional.softmax(out, dim=1)
-        scene_scores, _ = probs.topk(1)
-        scene_scores = scene_scores.squeeze(1).tolist()
-
-    # Free CUDA-resident intermediates before continuing
-    del batch_tensor, out, probs, tensors, results, all_rotations
+    del results, all_rotations
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    scores_by_idx = {}
-    for (idx, name, img), (obj_count, obj_conf), scene_conf in zip(meta, yolo_outs, scene_scores):
-        score = obj_count * obj_conf + scene_conf
-        scores_by_idx.setdefault(idx, {})[name] = score
-
-    # Only call it "inverted" when the 180° candidate clearly beats the
-    # original — a marginal win is more likely model noise than a real
-    # upside-down feed, and used to produce false positives. Also require
-    # the winning score to clear an absolute floor, since two near-zero
-    # scores (e.g. on grainy/IR frames) can satisfy the relative margin
-    # on noise alone.
+    # Only call it "inverted" when the 180° candidate shows real evidence
+    # (people/furniture the right way up) and clearly beats the original.
+    # No evidence on either side (empty room, dark IR frame) → "original".
     outputs = []
     for i in range(len(frames)):
-        scores = scores_by_idx.get(i, {})
-        orig_score = scores.get("original", 0.0)
-        rot_score = scores.get("180", 0.0)
+        orig_score = evidence[2 * i]
+        rot_score = evidence[2 * i + 1]
         is_inverted = (
-            rot_score > 0
-            and rot_score > orig_score * (1 + INVERSION_SCORE_MARGIN)
-            and rot_score >= INVERSION_MIN_ABS_SCORE
+            rot_score >= INVERSION_MIN_EVIDENCE
+            and rot_score >= orig_score * INVERSION_EVIDENCE_RATIO
         )
         outputs.append({
             "orientation": "180" if is_inverted else "original",
@@ -200,6 +162,7 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
     _load_models()
     
     last_save_time = {}
+    inverted_streak = {}  # (cam_id, ch_no) -> consecutive "180" verdicts
 
     while not stop_event.is_set():
         batch = []
@@ -223,14 +186,19 @@ def _gpu_batch_worker(stop_event, save_folder, cooldown_time=240):
                 cam_id = item.get('device_id') or item.get('camera_id', 'unknown')
                 ch_no = item.get('ch_no', '0')
                 orientation = result["orientation"]
+                key = (cam_id, ch_no)
+                if orientation == "original":
+                    inverted_streak[key] = 0
+                else:
+                    inverted_streak[key] = inverted_streak.get(key, 0) + 1
                 logger.info(
                     f"[Inversion] scores cam={cam_id} ch={ch_no} "
                     f"orig={result['orig_score']:.3f} rot180={result['rot_score']:.3f} "
-                    f"margin={INVERSION_SCORE_MARGIN} min_abs={INVERSION_MIN_ABS_SCORE} "
-                    f"-> {orientation}"
+                    f"min_evidence={INVERSION_MIN_EVIDENCE} ratio={INVERSION_EVIDENCE_RATIO} "
+                    f"-> {orientation} (streak {inverted_streak[key]}/{INVERSION_CONFIRM_FRAMES})"
                 )
 
-                if orientation == "original":
+                if inverted_streak[key] < INVERSION_CONFIRM_FRAMES:
                     continue
 
                 now = time.time()
