@@ -88,6 +88,7 @@ jobs:
           rsync -a --delete \
             --exclude '.git/' --exclude '.env' \
             --exclude 'models/' --exclude 'hf_cache/' --exclude 'logs/' --exclude 'results/' \
+            --exclude 'data/' --exclude '.env.bak*' \
             ./ "$DEPLOY_DIR/"
       - name: Deploy container (Compose v2)
         run: |
