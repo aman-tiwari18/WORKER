@@ -1315,6 +1315,44 @@ def _handle_shutdown_signal(signum, frame):
     raise SystemExit(128 + signum)
 
 
+def _gpu_memory_gb() -> Optional[Tuple[float, float]]:
+    """(free_gb, total_gb) of GPU 0, or None when nvidia-smi is unavailable."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+        free_mb, total_mb = [float(x) for x in out.strip().splitlines()[0].split(",")]
+        return free_mb / 1024.0, total_mb / 1024.0
+    except Exception:
+        return None
+
+
+def _wait_for_free_gpu_memory() -> None:
+    """Block (up to VLLM_WAIT_FREE_MEM_S, default 15 min) until vLLM's memory request fits on the GPU."""
+    try:
+        util = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.55"))
+    except ValueError:
+        util = 0.55
+    limit = float(os.getenv("VLLM_WAIT_FREE_MEM_S", "900"))
+    deadline = time.time() + limit
+    announced = False
+    while True:
+        mem = _gpu_memory_gb()
+        if mem is None:
+            return
+        free, total = mem
+        need = util * total + 1.0
+        if free >= need:
+            return
+        if time.time() >= deadline:
+            logger.error(f"GPU memory still short after {limit:.0f}s (free {free:.0f} GB, vLLM needs {need:.0f} GB); starting anyway.")
+            return
+        if not announced:
+            logger.warning(f"Waiting for GPU memory before starting vLLM: free {free:.0f} GB, needs {need:.0f} GB "
+                           f"(another job is using the card); will wait up to {limit:.0f}s.")
+            announced = True
+        time.sleep(20)
+
+
 def _ensure_vllm_running():
     global _VLLM_PROC
     try:
@@ -1326,6 +1364,12 @@ def _ensure_vllm_running():
             return None
     except Exception:
         pass
+
+    # vLLM refuses to start unless the GPU has gpu-memory-utilization x total memory free. Another
+    # exam's detectors can still be holding the card when this run begins (14 Oct 2026 10:50: SSC's
+    # session held ~70 GB, vLLM crashed, and every camera was then saved as "Uncertain"). Wait for the
+    # memory to come free instead of starting a server that is bound to crash.
+    _wait_for_free_gpu_memory()
 
     logger.info("Starting temporary vLLM server process. Please wait (~20 seconds)...")
     _vllm_script = os.getenv("VLLM_START_SCRIPT", os.path.join(PROJECT_ROOT, "start_vllm.sh"))
@@ -1364,6 +1408,18 @@ if __name__ == "__main__":
     logger.info("=" * 80)
 
     _ensure_vllm_running()
+
+    # No model server = no classification. Carrying on would label every camera "Uncertain" and
+    # overwrite the labels it already has, so stop here without touching the database; the failed
+    # exit lets the scheduler retry inside the window.
+    try:
+        _vllm_ok = requests.get("http://localhost:8001/health", timeout=3).status_code == 200
+    except Exception:
+        _vllm_ok = False
+    if not _vllm_ok:
+        logger.error("vLLM server is not available; aborting classification so existing labels are not overwritten.")
+        _shutdown_vllm("vLLM unavailable")
+        sys.exit(3)
 
     try:
         if VISION_ASSIGNMENT_PAYLOAD:

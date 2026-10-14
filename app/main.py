@@ -584,6 +584,49 @@ def _basic_detection_matches(
     return True
 
 
+_inv_issue_db = {"map": {}, "at": 0.0}
+_INV_ISSUE_TTL_S = 30
+
+
+def _invigilator_issue_db_map() -> dict:
+    """unique_id -> 'static_person' | 'no_targets' from camera_report_rtsp/hls.issue_type (refreshed every 30 s).
+    The file name carries the event only for alerts saved after 13 Oct 2026; older ones were back-filled in the DB."""
+    now = time.time()
+    if now - _inv_issue_db["at"] < _INV_ISSUE_TTL_S:
+        return _inv_issue_db["map"]
+    _inv_issue_db["at"] = now            # a failing DB is retried in 30 s, not on every request
+    try:
+        conn = _get_connection()
+        try:
+            m = {}
+            with conn.cursor() as cur:
+                for table in ("camera_report_rtsp", "camera_report_hls"):
+                    cur.execute(f"SELECT unique_id, issue_type FROM {table} "
+                                f"WHERE issue_type IS NOT NULL AND detection_type='invigilator_detection'")
+                    for row in cur.fetchall():
+                        uid, it = (row[0], row[1]) if not isinstance(row, dict) else (row.get("unique_id"), row.get("issue_type"))
+                        if uid and it:
+                            m[str(uid).lower()] = it
+            _inv_issue_db["map"] = m
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[detections] invigilator issue map not refreshed: {e}")
+    return _inv_issue_db["map"]
+
+
+def _invigilator_issue_from_name(name: str) -> str:
+    """'static_person' (invigilator not moving), 'no_targets' (no invigilator) or '' (unknown / older file)."""
+    n = str(name).lower()
+    if "static_person" in n:
+        return "static_person"
+    if "no_targets" in n:
+        return "no_targets"
+    # No event in the name (alert saved before it was added): use the database column.
+    uid = os.path.splitext(str(name).rsplit("/", 1)[-1])[0].split("_")[-1].lower()
+    return _invigilator_issue_db_map().get(uid, "")
+
+
 def _iter_detection_files(type_key: str, folder: Path):
     """Yield image files for one detection type.
 
@@ -1739,12 +1782,11 @@ def parse_detection_filename(
             issue_type = "no_targets"
         elif "static_person" in inv_parts:
             issue_type = "static_person"
-        elif not issue_type:
-            stem_l = stem.lower()
-            if "static_person" in stem_l:
-                issue_type = "static_person"
-            elif "no_targets" in stem_l:
-                issue_type = "no_targets"
+        else:
+            # 13 Oct 2026: the unified detector puts the event in the filename
+            # (..._gpuN_static_person_<ts>_<uid>.jpg / ..._no_targets_...). Files saved before
+            # that carry no event, so the label stays empty (the regex above only returns noise).
+            issue_type = _invigilator_issue_from_name(stem)
 
     exam_date_iso = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}" if date_str else ""
 
@@ -1808,8 +1850,8 @@ def parse_detection_filename(
 
     image_rel = quote(str(file_obj.as_posix()), safe="/")
     issue_label_map = {
-        "no_targets": "No Targets",
-        "static_person": "Static Person",
+        "no_targets": "Absent (no invigilator)",
+        "static_person": "Not moving (static)",
     }
 
     # ── Image URL: different endpoint for RTSP vs HLS ──
@@ -1881,6 +1923,7 @@ def list_detections(
     until: Optional[str] = None,       # queued-review anchor (see _FEED_SOURCE_RANK)
     until_source: Optional[str] = None,
     until_id: Optional[int] = None,
+    issue: Optional[str] = None,       # invigilator only: static_person | no_targets
 ):
     selected_types = set(type.split(',')) if type else set()
     check_types = selected_types if selected_types else set(DETECTION_FOLDERS.keys())
@@ -1908,6 +1951,7 @@ def list_detections(
     # When a date filter is provided and the index is populated we iterate only
     # the O(k) bucket for that date instead of the full O(N) snapshot.
     all_counts = {k: 0 for k in DETECTION_FOLDERS}
+    invigilator_issue_counts = {"static_person": 0, "no_targets": 0, "unknown": 0}
     candidates = []  # (sort_key, type_key, relative_path, origin, feed_id)
     skipped_uids = _get_skipped_uids()
     untagged_gpu = None   # loaded on the first untagged file an operator request hits
@@ -1967,6 +2011,12 @@ def list_detections(
             # every detection is shown, flagged `skipped` below, never hidden.
 
             all_counts[type_key] += 1
+
+            if type_key == "invigilator":
+                _iss = _invigilator_issue_from_name(relative_path) or "unknown"
+                invigilator_issue_counts[_iss] = invigilator_issue_counts.get(_iss, 0) + 1
+                if issue and _iss != issue:
+                    continue
 
             if type_key in check_types:
                 candidates.append((basic["sort_key"], type_key, relative_path, origin, basic["fid"]))
@@ -2165,6 +2215,7 @@ def list_detections(
         "page":    page,
         "limit":   limit,
         "counts":  all_counts,
+        "invigilatorIssueCounts": invigilator_issue_counts,
         "data":    paginated,
     }
 

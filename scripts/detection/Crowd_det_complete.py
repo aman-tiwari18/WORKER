@@ -37,6 +37,50 @@ CONF_THRESHOLD = 0.45     # Confidence for person detection
 STANDING_MIN_HEIGHT   = 100   # px; below this is far-away YOLO noise
 STANDING_ASPECT_RATIO = 2.5   # h/w >= 2.5 → standing
 
+# 13 Oct 2026: Entry / Outside / Parking / Biometric cameras see people small and far, so the strict rule above
+# (>= 100 px tall AND h/w >= 2.5) counted only a few of a real crowd and almost no camera reached 10. For those
+# camera types a person counts when >= OUTDOOR_MIN_HEIGHT px tall and h/w >= OUTDOOR_ASPECT. Lab cameras
+# (Inside Lab run) keep the strict rule, otherwise seated candidates would count as a crowd.
+OUTDOOR_TYPES = ("entry", "outside", "outdoor", "parking", "biometric")
+OUTDOOR_MIN_HEIGHT = int(os.environ.get("CROWD_OUTDOOR_MIN_HEIGHT", "40"))
+OUTDOOR_ASPECT = float(os.environ.get("CROWD_OUTDOOR_ASPECT", "1.8"))
+
+
+# 14 Oct 2026: on LAB cameras (Inside Lab run) "standing" is counted by the posture model
+# (posture_rfdetr, standing >= LAB_POSTURE_STANDING_MIN), not by box shape: seated candidates passed the
+# shape rule and every lab alert checked on 13 Oct was a room of seated candidates (3,276 alerts, the
+# posture model found none with 10+ standing). Entry / Outside / cameras of unknown type keep the old count.
+LAB_TYPES = ("computer lab", "inside lab", "classroom", "exam lab")
+LAB_POSTURE_STANDING_MIN = float(os.environ.get("CROWD_LAB_POSTURE_STANDING_MIN", "0.6"))
+LAB_POSTURE = os.environ.get("CROWD_LAB_POSTURE", "1").strip() not in ("0", "false", "no", "")
+
+
+def is_lab(classification):
+    c = str(classification or "").lower()
+    return any(t in c for t in LAB_TYPES)
+
+
+def _iou(a, b):
+    x1, y1, x2, y2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _posture_standing(posture):
+    """Posture boxes [(xyxy, class, conf)] -> standing people [(x1,y1,x2,y2,conf)], one box per person."""
+    st = sorted([(b, c) for b, cl, c in posture if cl == 1 and c >= LAB_POSTURE_STANDING_MIN], key=lambda x: -x[1])
+    keep = []
+    for b, c in st:
+        if all(_iou(b, k[0]) < 0.5 for k in keep):
+            keep.append((b, c))
+    return [(int(b[0]), int(b[1]), int(b[2]), int(b[3]), c) for b, c in keep]
+
+
+def _is_outdoor(classification):
+    c = str(classification or "").lower()
+    return any(t in c for t in OUTDOOR_TYPES)
+
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
 # ================= YOLO ====================
@@ -63,8 +107,10 @@ _state_lock = threading.Lock()
 # =====================================================
 # CORE DETECTION LOGIC
 # =====================================================
-def _split_standing_seated(boxes):
+def _split_standing_seated(boxes, outdoor=False):
     """Return (standing, seated) lists of (x1, y1, x2, y2, conf) person boxes."""
+    min_h = OUTDOOR_MIN_HEIGHT if outdoor else STANDING_MIN_HEIGHT
+    min_ratio = OUTDOOR_ASPECT if outdoor else STANDING_ASPECT_RATIO
     standing, seated = [], []
     for box in boxes:
         if int(box.cls[0]) != 0:
@@ -76,7 +122,7 @@ def _split_standing_seated(boxes):
         w, h = x2 - x1, y2 - y1
         if w <= 0 or h <= 0:
             continue
-        if h >= STANDING_MIN_HEIGHT and (h / w) >= STANDING_ASPECT_RATIO:
+        if h >= min_h and (h / w) >= min_ratio:
             standing.append((x1, y1, x2, y2, conf))
         else:
             seated.append((x1, y1, x2, y2, conf))
@@ -160,7 +206,10 @@ def detect_crowd_batch(items, results=None):
     outputs = []
     for item, result in zip(items, results):
         frame = item['frame'].copy()
-        standing, seated = _split_standing_seated(result.boxes)
+        standing, seated = _split_standing_seated(result.boxes, _is_outdoor(item.get('classification')))
+        if LAB_POSTURE and is_lab(item.get('classification')) and item.get('posture') is not None:
+            standing = _posture_standing(item['posture'])
+            seated = [p for p in seated + [] if all(_iou(p[:4], s_[:4]) < 0.5 for s_ in standing)]
         person_count = len(standing)
         crowd_detected = person_count >= MIN_PERSONS
 

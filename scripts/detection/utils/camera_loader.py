@@ -98,12 +98,20 @@ SCRIPT_CLASSIFICATION_MAP = {
 # Keep in sync with DEFAULT_CLASSIFICATIONS in
 # cctv_frontend/src/components/ShiftScriptManager.jsx.
 CLASSIFICATION_ALIASES = {
-    "inside lab":    ["computer lab", "inside classroom"],
+    "inside lab":    ["computer lab", "inside classroom", "inside lab"],
     "server room":   ["server room", "strong room"],
     "entry/exit":    ["entry"],          # matches "Entry" and "Entry/Exit"
     "entry exit":    ["entry"],
-    "outside":       ["outside area", "outdoor scene", "parking lot"],
+    "outside":       ["outside area", "outdoor scene", "parking lot", "outside lab"],
 }
+
+# The client's sheet gives every HLS camera a category (the "Camera Category" column). When the
+# assignment names camera types, that category is the authority: the vision model labels night /
+# infrared frames wrongly now and then (an office read as "Server Room", labs as "Uncertain"),
+# and a wrong label sent whole analytics to the wrong cameras (14 Oct 2026: an "Outside Lab"
+# camera got Server Room intruder detection). The vision label is only the fallback when the
+# sheet category is blank or not one of these.
+SHEET_CATEGORIES = {"inside lab", "outside lab", "server room", "entry/exit", "entry exit"}
 
 
 def _expand_classifications(values):
@@ -184,11 +192,15 @@ def load_cameras_for_execution(execution: dict) -> list:
         for row in rows:
             ch_code = _text(row, "ch_code")
             classification = _text(row, "classification")
+            category = _text(row, "camera_category")
             
             if not ch_code or not row.get("cctv_url"):
                 continue
             
-            if not _camera_matches_script(classification, script_code, custom_cls):
+            # Camera types named on the assignment are matched against the sheet's category when it
+            # has one (see SHEET_CATEGORIES); otherwise against the vision label, as before.
+            match_label = category if (custom_cls and category.lower() in SHEET_CATEGORIES) else classification
+            if not _camera_matches_script(match_label, script_code, custom_cls):
                 continue
 
             cameras.append({

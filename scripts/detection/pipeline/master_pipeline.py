@@ -234,6 +234,15 @@ CONTINUOUS_SCRIPTS = {s.strip() for s in os.environ.get("CONTINUOUS_SCRIPTS", "m
 # SESSION_FILE (written by the poller, re-read every SESSION_RELOAD_S, so analytics that start
 # later in the shift join the running session without a restart). SHIFT_SESSION=0 = old path.
 SHIFT_SESSION          = os.environ.get("SHIFT_SESSION", "0") == "1"
+
+# 13 Oct: every kept-open camera is its own process and the parent holds pipes / sockets for each;
+# the container's soft open-files limit is 1024 (hard 524288), so raise it for ~800 cameras.
+try:
+    import resource
+    _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(max(_soft, 65536), _hard), _hard))
+except Exception:
+    pass
 SESSION_FILE           = os.environ.get("SESSION_FILE", "").strip()
 SESSION_MAX_STREAMS    = int(os.environ.get("SESSION_MAX_STREAMS", "800"))
 SESSION_RELOAD_S       = float(os.environ.get("SESSION_RELOAD_S", "10"))
@@ -1591,7 +1600,7 @@ def session_producer(cfg, queues, session_file, slot, fb):
                     pkt = {"frame": frame, "device_id": device_id, "ch_no": camera_no, "camera_no": camera_no,
                            "camera_id_pk": camera_id_pk, "exam_id": exam_id, "shift_id": shift_id,
                            "tc_code": tc_code, "source_type": "RTSP", "enabled_scripts": scripts,
-                           "captured_at": last_good, "slot": slot}
+                           "captured_at": last_good, "slot": slot, "classification": cls}
                     if SESSION_ZOOM_W:
                         pkt["zoom"] = SESSION_ZOOM_W            # enlarged in the detector, not on the queue
                     cds = {s_: cooldowns[s_] for s_ in scripts if s_ in cooldowns}

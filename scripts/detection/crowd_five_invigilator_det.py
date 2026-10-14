@@ -77,6 +77,7 @@ def _split_persons(yolo_boxes, frame_w, frame_h, telemetry):
     list of (xyxy_tuple, conf, weight) and seated_count is the sum of weights.
     """
     standing_boxes, standing_confs, seated = [], [], []
+    cand = []
     for box in yolo_boxes:
         if int(box.cls[0]) != 0:
             continue
@@ -84,11 +85,12 @@ def _split_persons(yolo_boxes, frame_w, frame_h, telemetry):
         if conf < crowd_five.CONF_THRESHOLD:
             telemetry['conf_reject'] += 1
             continue
-        coords = box.xyxy[0].cpu().numpy()
-        h = coords[3] - coords[1]
-        w = max(coords[2] - coords[0], 1.0)
-        # Standing: the invigilator rule, unchanged
-        if h >= invigilator.MIN_HEIGHT and (h / w) >= invigilator.STANDING_ASPECT_RATIO:
+        cand.append((box.xyxy[0].cpu().numpy(), conf))
+    # Standing: the shared invigilator rule (sure h/w >= 2.5, or soft >= 2.0 not shorter than its
+    # neighbours; partial boxes at the frame edge are not standing) - see invigilator_tracking
+    flags = invigilator.standing_flags([c for c, _ in cand], frame_w, frame_h, soft=False)   # STATIC only: sure rule
+    for (coords, conf), is_std in zip(cand, flags):
+        if is_std:
             standing_boxes.append(coords)
             standing_confs.append(conf)
             continue
@@ -142,7 +144,7 @@ def _draw(frame, standing_boxes, standing_confs, static_violation, static_feet, 
     cv2.putText(frame, ch_label, (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
 
-def _evaluate(frame, result, device_id, camera_no, telemetry):
+def _evaluate(frame, result, device_id, camera_no, telemetry, posture=None):
     """Run the combined rule on one frame. Returns (annotated_frame, violation, seated_smoothed)."""
     state = _camera_state(f"{device_id}_{camera_no}")
 
@@ -164,6 +166,9 @@ def _evaluate(frame, result, device_id, camera_no, telemetry):
 
     # Tracker gets the un-annotated frame (colour signatures) and stores positions in JSON.
     _absent, static_violation, static_feet = state['tracker'].update(standing_boxes, frame)
+    # 14 Oct 2026: STATIC only on a person the posture model calls standing (see invigilator.posture_gate)
+    static_feet = invigilator.posture_gate(static_feet, list(standing_boxes), posture)
+    static_violation = bool(static_feet)
 
     violation = few_seated and static_violation
     if violation:
@@ -197,6 +202,7 @@ def detect_crowd_five_invigilator_batch(items, results=None):
         telemetry = defaultdict(int)
         device_id = item.get('device_id') or item.get('camera_id') or 'unknown'
         camera_no = item.get('ch_no') or item.get('camera_no') or 'unknown'
-        annotated, violation, seated = _evaluate(item['frame'], result, device_id, camera_no, telemetry)
+        annotated, violation, seated = _evaluate(item['frame'], result, device_id, camera_no, telemetry,
+                                                 posture=item.get('posture'))
         outputs.append((annotated, violation, seated, dict(telemetry)))
     return outputs

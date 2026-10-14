@@ -33,6 +33,11 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/phone_detection")
 
 COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 90))        # Seconds between saves (1.5 min — per detection frequency spec)
 CONF_THRESHOLD = 0.78     # Confidence for phone detection (raised from 0.25 on 2026-10-01).
+# 12 Oct 2026: with the RF-DETR phone model (UNIFIED_PHONE_BACKEND=rfdetr) its own scale applies:
+# 0.5 found 31/40 operator-accepted phones with 2/40 false on no-phone frames (old YOLO @0.78: 1/40);
+# 13 Oct: new phone model (mobile_best.pth), threshold set to 0.6.
+if os.environ.get("UNIFIED_PHONE_BACKEND", "").strip().lower() == "rfdetr":
+    CONF_THRESHOLD = float(os.environ.get("PHONE_RFDETR_CONF", "0.6"))
                           # Keep in step with the 'mobile' backend conf in detection_models.py: the
                           # model drops boxes below ITS conf first, so both must carry the same value.
 

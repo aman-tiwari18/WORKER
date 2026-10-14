@@ -113,13 +113,14 @@ class RFDetrBackend(_Backend):
     On CUDA it is traced in FP16 for a fixed batch size, so smaller batches are
     padded with a copy of their last frame and the extra outputs dropped."""
 
-    def __init__(self, name, path, conf, resolution=768, batch_size=GPU_BATCH_SIZE):
+    def __init__(self, name, path, conf, resolution=768, batch_size=GPU_BATCH_SIZE, num_classes=2):
         super().__init__(name, path)
         self.conf, self.resolution, self.batch_size = conf, resolution, batch_size
+        self.num_classes = num_classes
 
     def _load(self):
         from rfdetr import RFDETRMedium
-        model = RFDETRMedium(pretrain_weights=self.path, resolution=self.resolution, num_classes=2)
+        model = RFDETRMedium(pretrain_weights=self.path, resolution=self.resolution, num_classes=self.num_classes)
         if torch.cuda.is_available():
             optimize = getattr(model, "optimize_for_inference", None) or model.inference
             optimize(dtype=torch.float16, batch_size=self.batch_size)
@@ -157,4 +158,12 @@ BACKENDS = {
     "person_monitor_rfdetr": RFDetrBackend("person_monitor_rfdetr",
                                            os.path.join(MODELS_DIR, "monitor_person_rfdetr.pth"), conf=0.15),
     "mobile": YoloBackend("mobile", os.path.join(MODELS_DIR, "best_mobile_model.pt"), conf=0.78, imgsz=960),
+    # 12 Oct 2026: RF-DETR phone model (single class 0 = "mobile"); used when
+    # UNIFIED_PHONE_BACKEND=rfdetr. conf = PHONE_RFDETR_CONF, same value phone_det_complete applies.
+    # 14 Oct 2026: posture model (RF-DETR, classes 0 sitting / 1 standing / 2 unsure). Gates the
+    # invigilator STATIC alert: it fires only on a person this model calls standing.
+    "posture_rfdetr": RFDetrBackend("posture_rfdetr", os.path.join(MODELS_DIR, "posture_rfdetr.pth"),
+                                    conf=0.25, num_classes=3),
+    "mobile_rfdetr": RFDetrBackend("mobile_rfdetr", os.path.join(MODELS_DIR, "mobile_rfdetr.pth"),
+                                   conf=float(os.environ.get("PHONE_RFDETR_CONF", "0.6")), num_classes=1),
 }

@@ -95,6 +95,8 @@ PERSON_MODEL = (_env_choice("UNIFIED_PERSON_BACKEND", "finetuned", ("yolov10m", 
                 if os.environ.get("UNIFIED_PERSON_BACKEND", "").strip()
                 else _env_choice("UNIFIED_PERSON_MODEL", "yolov10m", ("yolov10m", "finetuned")))
 MONITOR_MODEL = _env_choice("UNIFIED_MONITOR_MODEL", "rfdetr", ("rfdetr", "yolo26m"))
+# 12 Oct 2026: phone model switch - "yolo" (best_mobile_model.pt) or "rfdetr" (mobile_rfdetr.pth).
+PHONE_MODEL = _env_choice("UNIFIED_PHONE_BACKEND", "yolo", ("yolo", "rfdetr"))
 
 
 def model_for(script):
@@ -102,7 +104,7 @@ def model_for(script):
     model isn't loaded, the analytic doesn't run (and says so in the log) rather than
     quietly reading a different model's boxes."""
     if script == "phone":
-        return "mobile"
+        return "mobile_rfdetr" if PHONE_MODEL == "rfdetr" else "mobile"
     if script == "monitor_tamper":
         return "person_monitor_rfdetr" if MONITOR_MODEL == "rfdetr" else "person_monitor_yolo26m"
     if script in PERSON_ANALYTICS and PERSON_MODEL == "rfdetr":
@@ -190,20 +192,23 @@ def class_from_result(result, class_ids, conf=CONF_THRESHOLD):
 # ============================================================
 def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
                      exam_id, shift_id, source_type="RTSP", violation_count=None,
-                     violation_chain=None):
+                     violation_chain=None, issue=""):
     """Save the annotated detection and report it, using the schema-correct identifier:
        - RTSP: device_id + camera_no  (filename `{dev}_{camera_no}`, report_to_db_rtsp)
        - HLS : ch_code (= camera_no)  (filename `ch{ch_code}`,        report_to_db_hls)
     Matches the convention used by the per-script workers."""
     ts = time.strftime("%Y%m%d_%H%M%S")
     uid = str(uuid.uuid4())
+    # Event of the alert (invigilator: static_person / no_targets) sits in the name, after the gpu token,
+    # where the Detections list reads it; empty for every other script, so their names do not change.
+    issue_tok = f"_{issue}" if issue else ""
 
     if str(source_type).upper() == "HLS":
         save_folder = os.path.join(RESULTS_ROOT, "tcs_detections", folder)
-        fname = f"{script_name}_ch{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
+        fname = f"{script_name}_ch{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}{issue_tok}_{ts}_{uid}.jpg"
     else:
         save_folder = os.path.join(RESULTS_ROOT, folder)
-        fname = f"{script_name}_{device_id}_{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}_{ts}_{uid}.jpg"
+        fname = f"{script_name}_{device_id}_{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}{issue_tok}_{ts}_{uid}.jpg"
 
     os.makedirs(save_folder, exist_ok=True)
     path = os.path.join(save_folder, fname)
@@ -289,11 +294,16 @@ class _Box:
 
 
 class _UltralyticsLike:
-    def __init__(self, boxes):
+    def __init__(self, boxes, names=None):
         self.boxes = boxes
+        self.names = names or {}
 
 
-def _as_ultralytics_result(result):
+# Class names of the RF-DETR models whose consumers look classes up by name (phone).
+_RFDETR_NAMES = {"phone": {0: "mobile"}}
+
+
+def _as_ultralytics_result(result, names=None):
     if hasattr(result, "boxes"):
         return result
     xyxy = np.asarray(result.xyxy, dtype=np.float32).reshape(-1, 4)
@@ -301,7 +311,7 @@ def _as_ultralytics_result(result):
     cls = np.asarray(result.class_id, dtype=np.float32).reshape(-1)
     keep = conf >= RFDETR_PERSON_MIN_CONF
     return _UltralyticsLike(_Boxes(torch.from_numpy(xyxy[keep]), torch.from_numpy(conf[keep]),
-                                   torch.from_numpy(cls[keep])))
+                                   torch.from_numpy(cls[keep])), names)
 
 
 def _make_evaluator(module_name, fn_name, folder, script_code):
@@ -315,7 +325,7 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             fn = getattr(mod, fn_name)
             _cache["fn"] = fn
         # Reuse the script's own rule + annotation by passing the shared result.
-        outputs = fn([item], results=[_as_ultralytics_result(result)])
+        outputs = fn([item], results=[_as_ultralytics_result(result, _RFDETR_NAMES.get(script_code))])
         out = outputs[0]
         annotated, detected = out[0], out[1]   # all return (annotated, detected, count[, ...])
         if not detected:
@@ -340,6 +350,7 @@ def _make_evaluator(module_name, fn_name, folder, script_code):
             source_type=item.get("source_type", "RTSP"),
             violation_count=violation_count,
             violation_chain=violation_chain,
+            issue=(getattr(out, "issue", "") or "") if script_code == "invigilator" else "",
         )
 
     return _eval
@@ -418,6 +429,32 @@ def _flush_stateful(states, now):
             logger.error(f"[Unified] flush '{script}' error ({dev}_{cam_no}): {e}")
 
 
+# 14 Oct 2026: the invigilator scripts also get the posture model's boxes (item["posture"]) and fire
+# STATIC only on a person it calls standing. INVIGILATOR_POSTURE_GATE=0 switches the pass off.
+POSTURE_SCRIPTS = {"invigilator", "crowd_five_invigilator"}
+POSTURE_MODEL = "posture_rfdetr"
+POSTURE_GATE = os.environ.get("INVIGILATOR_POSTURE_GATE", "1").strip() not in ("0", "false", "no", "")
+
+
+# 14 Oct 2026: Crowd on LAB cameras also counts standing people with the posture model (Crowd_det_complete).
+CROWD_LAB_POSTURE = os.environ.get("CROWD_LAB_POSTURE", "1").strip() not in ("0", "false", "no", "")
+_LAB_TYPES = ("computer lab", "inside lab", "classroom", "exam lab")
+
+
+def _is_lab(classification):
+    c = str(classification or "").lower()
+    return any(t in c for t in _LAB_TYPES)
+
+
+def _posture_boxes(result):
+    """RF-DETR posture result -> [(xyxy, class_id, conf)]."""
+    try:
+        return [(tuple(float(v) for v in b), int(c), float(s))
+                for b, c, s in zip(result.xyxy, result.class_id, result.confidence)]
+    except Exception:
+        return None
+
+
 def _plan_batch(batch):
     """Map each (frame, analytic) to its model. Analytics whose model isn't loaded are
     skipped for this batch. Returns ({model: [frame idx]}, {(idx, script): model})."""
@@ -432,6 +469,10 @@ def _plan_batch(batch):
                 continue
             assign[(idx, script)] = model
             need.setdefault(model, set()).add(idx)
+            if BACKENDS[POSTURE_MODEL].ready() and (
+                    (POSTURE_GATE and script in POSTURE_SCRIPTS)
+                    or (script == "crowd" and CROWD_LAB_POSTURE and _is_lab(pkt.get("classification")))):
+                need.setdefault(POSTURE_MODEL, set()).add(idx)
     for model, scripts in skipped.items():
         _log_skipped(model, scripts)
     return {m: sorted(idxs) for m, idxs in need.items()}, assign
@@ -497,6 +538,9 @@ def unified_worker(frame_queue, scripts=None, session=None):
     for s in scripts or []:
         if s in EVALUATORS:
             by_model.setdefault(model_for(s), []).append(s)
+    _posture_users = (POSTURE_SCRIPTS if POSTURE_GATE else set()) | ({"crowd"} if CROWD_LAB_POSTURE else set())
+    if _posture_users & set(scripts or []):
+        by_model.setdefault(POSTURE_MODEL, []).extend(sorted(_posture_users & set(scripts or [])))
     for name, users in sorted(by_model.items()):
         if BACKENDS[name].load_now():
             logger.info(f"{tag} {name} loaded for {sorted(users)}")
@@ -600,9 +644,14 @@ def unified_worker(frame_queue, scripts=None, session=None):
                 # on ANY single person. The per-script workers pass it, so the
                 # unified path has to as well.
                 "tc_code":     pkt.get("tc_code", ""),
+                # Camera type (Entry / Outside / Computer Lab ...): the crowd rule counts people differently outdoors.
+                "classification": pkt.get("classification", ""),
                 # Set by the producers; stateful analytics time their rules on it.
                 "captured_at": pkt.get("captured_at"),
             }
+            # Posture boxes for the invigilator STATIC gate; None = posture model not run / not ready.
+            _pr = out.get((POSTURE_MODEL, idx))
+            item["posture"] = _posture_boxes(_pr) if _pr is not None else None
             for script in pkt.get("enabled_scripts", []):
                 model = assign.get((idx, script))
                 result = out.get((model, idx)) if model else None

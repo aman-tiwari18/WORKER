@@ -531,7 +531,6 @@ def get_hls_cameras(exam_id: int, shift_id: int, exam_date: str) -> list:
           AND (shift_id = %s OR shift_id IS NULL)
           AND (exam_date = %s OR exam_date IS NULL)
           AND is_active = 1
-        ORDER BY id
     """
     params = [exam_id, shift_id, exam_date]
 
@@ -539,8 +538,7 @@ def get_hls_cameras(exam_id: int, shift_id: int, exam_date: str) -> list:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, tuple(params))
-                rows = cur.fetchall()
+                rows = _fetch_hls(cur, sql, params, exam_date, shift_id)
                 
                 # Apply camera distribution filter for horizontal scaling
                 try:
@@ -593,7 +591,6 @@ def get_hls_cameras_accessible(exam_id: int, shift_id: int, exam_date: str) -> l
           AND (exam_date = %s OR exam_date IS NULL)
           AND is_active = 1
           AND status = 'Accessible'
-        ORDER BY id
     """
     params = [exam_id, shift_id, exam_date]
 
@@ -601,8 +598,7 @@ def get_hls_cameras_accessible(exam_id: int, shift_id: int, exam_date: str) -> l
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, tuple(params))
-                rows = cur.fetchall()
+                rows = _fetch_hls(cur, sql, params, exam_date, shift_id)
                 
                 # Apply camera distribution filter for horizontal scaling
                 try:
@@ -759,6 +755,30 @@ def _fetch_rtsp(cur, base_sql: str, exam_id: int, order_by: str = "ORDER BY id")
             # Any other failure (e.g. a collation mismatch) must not leave the run with 0 cameras.
             logger.error(f"[DB] exam schedule filter failed ({e}) — no schedule filter applied")
     cur.execute(f"{base_sql} {order_by}", (exam_id,))
+    return cur.fetchall()
+
+
+def _fetch_hls(cur, base_sql: str, params, exam_date, shift_id, order_by: str = "ORDER BY id"):
+    """
+    13 Oct 2026: HLS exams use the uploaded centre schedule too (exam_centre_schedule /
+    exam_slot_schedule, same rule as RTSP): a camera whose centre is NO for this date + shift is
+    not loaded. The date + shift are the ones the HLS query is already scoped to. No schedule
+    uploaded = no restriction; any failure falls back to the unrestricted query.
+    """
+    date = str(exam_date)[:10] if exam_date else None
+    try:
+        sid = int(shift_id) if shift_id is not None and str(shift_id).strip() != "" else None
+    except (TypeError, ValueError):
+        sid = None
+    sched_sql, sched_params = _rtsp_schedule_sql(date, sid)
+    if sched_sql:
+        try:
+            cur.execute(f"{base_sql} {sched_sql.replace('camera_links_rtsp', 'camera_links_hls')} {order_by}",
+                        (*params, *sched_params))
+            return cur.fetchall()
+        except Exception as e:
+            logger.error(f"[DB] HLS schedule filter failed ({e}) — no schedule filter applied")
+    cur.execute(f"{base_sql} {order_by}", tuple(params))
     return cur.fetchall()
 
 
@@ -1137,6 +1157,38 @@ _LOG_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../logs/
 os.makedirs(os.path.dirname(_LOG_FILE), exist_ok=True)
 
 
+# 14 Oct 2026: detections carry an `issue_type` (invigilator: static_person / no_targets). A database that
+# has not got the column yet (backend migration 048) must not lose detections: the insert is retried
+# without it, once, and that is remembered for the rest of the process.
+_ISSUE_TYPE_COLUMN = {"ok": True}
+
+
+def _execute_report_insert(cur, sql, params):
+    if _ISSUE_TYPE_COLUMN["ok"]:
+        try:
+            cur.execute(sql, params)
+            return
+        except Exception as e:
+            if "issue_type" not in str(e) or "Unknown column" not in str(e):
+                raise
+            _ISSUE_TYPE_COLUMN["ok"] = False
+            logger.warning("[DB-REPORT] camera_report tables have no issue_type column (apply backend migration 048); "
+                           "saving detections without it")
+    sql = sql.replace("violation_chain, issue_type", "violation_chain", 1)
+    sql = re.sub(r",\s*%s\s*\)(\s*)$", r")\1", sql.rstrip()) if sql.rstrip().endswith(")") else sql
+    cur.execute(sql, tuple(params)[:-1])
+
+
+def _issue_type_from_image_name(image_name: str) -> Optional[str]:
+    """Invigilator event carried in the saved file name: 'static_person' (not moving), 'no_targets' (absent), else None."""
+    n = os.path.basename(str(image_name)).lower()
+    if "static_person" in n:
+        return "static_person"
+    if "no_targets" in n:
+        return "no_targets"
+    return None
+
+
 def _extract_unique_id_from_image_name(image_name: str) -> Optional[str]:
     """Extract the detection UID from a saved image filename."""
     base_name = os.path.basename(str(image_name))
@@ -1250,15 +1302,15 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
             _embed_gpu_id_in_image(hls_image_path, _GPU_ID)
 
             with conn.cursor() as cur:
-                cur.execute(
+                _execute_report_insert(cur,
                     """
                     INSERT INTO camera_report_hls (
                         exam_id, shift_id, city, center_name, camera_id,
                         camera_name, camera_category, tc_code, ch_code,
                         state, camera_status, events, person_count, threshold,
                         date_time, imageurl, detection_type, unique_id, gpu_id,
-                        violation_count, violation_chain
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        violation_count, violation_chain, issue_type
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), cam.get('shift_id'), cam.get('city'),
@@ -1267,6 +1319,7 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
                         cam.get('state'), camera_status, 1, person_count, threshold,
                         date_time, image_url, folder,
                         unique_id, _GPU_ID, violation_count, violation_chain,
+                        _issue_type_from_image_name(image_name),
                     ),
                 )
             conn.commit()
@@ -1387,15 +1440,15 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
             _embed_gpu_id_in_image(rtsp_image_path, _GPU_ID)
 
             with conn.cursor() as cur:
-                cur.execute(
+                _execute_report_insert(cur,
                     """
                     INSERT INTO camera_report_rtsp (
                         exam_id, shift_id, city, center_name, camera_id,
                         device_id, camera_no, camera_name, tc_code,
                         state, camera_status, events, person_count, threshold,
                         date_time, imageurl, detection_type, unique_id, gpu_id,
-                        violation_count, violation_chain
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        violation_count, violation_chain, issue_type
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         cam.get('exam_id'), shift_id, cam.get('city'),
@@ -1404,6 +1457,7 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
                         camera_status, 1, person_count, threshold,
                         date_time, image_url, folder,
                         unique_id, _GPU_ID, violation_count, violation_chain,
+                        _issue_type_from_image_name(image_name),
                     ),
                 )
             conn.commit()
