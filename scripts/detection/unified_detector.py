@@ -69,6 +69,12 @@ CONF_THRESHOLD = 0.45          # base detector confidence; per-rule filters tigh
 
 # Analytics that only look at person boxes (class 0). They can read either
 # yolov10m (COCO) or the fine-tuned person+monitor model, whose person is also class 0.
+# 15 Oct 2026: "new" = the Proximity_New_Script logic (proximity_new_det.py: own yolo11m + pose models,
+# closeness rules, pair confirmed over two samples); "old" = close_proximity.py on the shared person model.
+PROXIMITY_ENGINE = os.environ.get("PROXIMITY_ENGINE", "new").strip().lower()
+if PROXIMITY_ENGINE not in ("new", "old"):
+    PROXIMITY_ENGINE = "new"
+
 PERSON_ANALYTICS = {
     "crowd", "crowd_zero", "crowd_five", "crowd_biometric", "proximity", "intruder",
     "entry_exit", "server", "invigilator", "strongroom", "blind_spot",
@@ -107,6 +113,8 @@ def model_for(script):
         return "mobile_rfdetr" if PHONE_MODEL == "rfdetr" else "mobile"
     if script == "monitor_tamper":
         return "person_monitor_rfdetr" if MONITOR_MODEL == "rfdetr" else "person_monitor_yolo26m"
+    if script == "proximity" and PROXIMITY_ENGINE == "new":
+        return "proximity_people"
     if script in PERSON_ANALYTICS and PERSON_MODEL == "rfdetr":
         return "person_monitor_rfdetr"
     if script in PERSON_ANALYTICS and PERSON_MODEL == "finetuned":
@@ -372,10 +380,14 @@ def _make_stateful_evaluator(module_name, folder, script_code):
         return mod
 
     def _report(state, alerts):
-        for annotated, _event_type in alerts:
-            _save_and_report(annotated, folder=folder, script_name=script_code, **state["report_to"])
+        # an alert is (frame, event_type) or (frame, event_type, {extra _save_and_report fields}),
+        # e.g. proximity's violation_count / violation_chain
+        for alert in alerts:
+            extra = alert[2] if len(alert) > 2 else {}
+            _save_and_report(alert[0], folder=folder, script_name=script_code, **state["report_to"], **extra)
 
     def _eval(result, item, state):
+        state["posture"] = item.get("posture")      # RF-DETR posture boxes of this frame, None = not run
         exam_id, shift_id = item.get("exam_id", "0"), item.get("shift_id", "0")
         state["report_to"] = dict(device_id=item["device_id"], camera_no=item["camera_no"],
                                   exam_id=exam_id, shift_id=shift_id,
@@ -398,6 +410,10 @@ def _make_stateful_evaluator(module_name, folder, script_code):
 STATEFUL_SPEC = {
     "monitor_tamper": ("monitor_tamper_det", "monitor_tamper_detection"),
 }
+if PROXIMITY_ENGINE == "new":
+    ANALYTIC_SPEC.pop("proximity", None)
+    PERSON_ANALYTICS.discard("proximity")      # it has its own model, not the shared person result
+    STATEFUL_SPEC["proximity"] = ("proximity_new_det", "proximity_detection")
 
 # Registry: script_code -> evaluator (all analytics, driven by the shared inference).
 EVALUATORS = {
@@ -434,6 +450,10 @@ def _flush_stateful(states, now):
 POSTURE_SCRIPTS = {"invigilator", "crowd_five_invigilator"}
 POSTURE_MODEL = "posture_rfdetr"
 POSTURE_GATE = os.environ.get("INVIGILATOR_POSTURE_GATE", "1").strip() not in ("0", "false", "no", "")
+# 15 Oct 2026: the new proximity (PROXIMITY_ENGINE=new) also gets the posture boxes and does not report a pair
+# in which someone is standing: standing people behind desks pass the script's own ankle check.
+PROXIMITY_POSTURE = (PROXIMITY_ENGINE == "new"
+                     and os.environ.get("PROXIMITY_POSTURE", "1").strip() not in ("0", "false", "no", ""))
 
 
 # 14 Oct 2026: Crowd on LAB cameras also counts standing people with the posture model (Crowd_det_complete).
@@ -470,7 +490,7 @@ def _plan_batch(batch):
             assign[(idx, script)] = model
             need.setdefault(model, set()).add(idx)
             if BACKENDS[POSTURE_MODEL].ready() and (
-                    (POSTURE_GATE and script in POSTURE_SCRIPTS)
+                    (POSTURE_GATE and script in POSTURE_SCRIPTS) or (script == "proximity" and PROXIMITY_POSTURE)
                     or (script == "crowd" and CROWD_LAB_POSTURE and _is_lab(pkt.get("classification")))):
                 need.setdefault(POSTURE_MODEL, set()).add(idx)
     for model, scripts in skipped.items():
@@ -538,7 +558,8 @@ def unified_worker(frame_queue, scripts=None, session=None):
     for s in scripts or []:
         if s in EVALUATORS:
             by_model.setdefault(model_for(s), []).append(s)
-    _posture_users = (POSTURE_SCRIPTS if POSTURE_GATE else set()) | ({"crowd"} if CROWD_LAB_POSTURE else set())
+    _posture_users = ((POSTURE_SCRIPTS if POSTURE_GATE else set()) | ({"crowd"} if CROWD_LAB_POSTURE else set())
+                      | ({"proximity"} if PROXIMITY_POSTURE else set()))
     if _posture_users & set(scripts or []):
         by_model.setdefault(POSTURE_MODEL, []).extend(sorted(_posture_users & set(scripts or [])))
     for name, users in sorted(by_model.items()):

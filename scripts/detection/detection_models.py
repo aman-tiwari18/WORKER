@@ -108,6 +108,24 @@ class YoloBackend(_Backend):
         return model(frames, conf=self.conf, verbose=False, **kw)
 
 
+class ProximityPeopleBackend(_Backend):
+    """yolo11m person boxes + yolo11m-pose skeletons (Proximity_New_Script.PersonDetector), for the proximity
+    analytic. predict() returns one list of Person objects per frame."""
+
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.pose_path = os.path.join(os.path.dirname(path), "yolo11m-pose.pt")
+
+    def _load(self):
+        if not os.path.exists(self.pose_path):
+            raise FileNotFoundError(self.pose_path)
+        import proximity_new_det
+        return proximity_new_det.P.PersonDetector(proximity_new_det.make_config(MODELS_DIR))
+
+    def _predict(self, model, frames):
+        return [model.detect(f) for f in frames]
+
+
 class RFDetrBackend(_Backend):
     """RF-DETR Medium. Returns supervision.Detections (xyxy, confidence, class_id).
     On CUDA it is traced in FP16 for a fixed batch size, so smaller batches are
@@ -162,6 +180,8 @@ BACKENDS = {
     # UNIFIED_PHONE_BACKEND=rfdetr. conf = PHONE_RFDETR_CONF, same value phone_det_complete applies.
     # 14 Oct 2026: posture model (RF-DETR, classes 0 sitting / 1 standing / 2 unsure). Gates the
     # invigilator STATIC alert: it fires only on a person this model calls standing.
+    # 15 Oct 2026: proximity runs the Proximity_New_Script logic (PROXIMITY_ENGINE=new, the default).
+    "proximity_people": ProximityPeopleBackend("proximity_people", os.path.join(MODELS_DIR, "yolo11m.pt")),
     "posture_rfdetr": RFDetrBackend("posture_rfdetr", os.path.join(MODELS_DIR, "posture_rfdetr.pth"),
                                     conf=0.25, num_classes=3),
     "mobile_rfdetr": RFDetrBackend("mobile_rfdetr", os.path.join(MODELS_DIR, "mobile_rfdetr.pth"),
