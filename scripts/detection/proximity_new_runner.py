@@ -112,7 +112,8 @@ def main():
     ap.add_argument("--script", default=os.path.join(HERE, "Proximity_New_Script.py"))
     ap.add_argument("--work", default="/tmp/proximity_new_work")
     ap.add_argument("--gpu", default=os.environ.get("WORKER_INDEX", "0"), help="gpu number written into the file name")
-    ap.add_argument("--no-report", action="store_true", help="run only; save no image and write no row")
+    ap.add_argument("--no-report", action="store_true", help="write no database row (and save no image unless --save-dir is given)")
+    ap.add_argument("--save-dir", default="", help="with --no-report: save each flagged image here, for review")
     args = ap.parse_args()
 
     os.environ["EXAM_ID"], os.environ["SHIFT_ID"] = str(args.exam), str(args.shift)
@@ -176,6 +177,9 @@ def main():
                 ok = report(device_id=dev, camera_no=cam, image_name=fname, folder=FOLDER)
             else:
                 ok = None
+                if args.save_dir:
+                    os.makedirs(args.save_dir, exist_ok=True)
+                    cv2.imwrite(os.path.join(args.save_dir, fname), frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
             last_report[(dev, cam)] = when
             reported.append({"at": when.strftime("%H:%M:%S"), "pair": ev["ids"], "secs": round(ev["last_s"] - ev["first_s"], 1),
                              "dist": ev["min_dist_m"], "file": fname, "db_ok": ok})

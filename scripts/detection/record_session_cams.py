@@ -31,6 +31,8 @@ def main():
     p.add_argument("--shift", required=True, help="exam_shifts.id")
     p.add_argument("--date", required=True, help="YYYY-MM-DD (centre schedule)")
     p.add_argument("--count", type=int, default=20)
+    p.add_argument("--camera-list", default="", help="JSON file [{camera_id, camera_no}, ...]: record exactly these cameras")
+    p.add_argument("--no-schedule", action="store_true", help="do not limit the cameras to the centres scheduled for --date/--shift")
     p.add_argument("--minutes", type=float, required=True)
     p.add_argument("--stream", choices=("sub", "main"), default="sub")
     p.add_argument("--cls", nargs="+", default=["Inside Lab"], help="camera types (assignment names)")
@@ -41,6 +43,8 @@ def main():
     # the pipeline reads these at import
     os.environ["DSS_STREAM_TYPE"] = "2" if args.stream == "sub" else "1"
     os.environ["SHIFT_ID"], os.environ["ASSIGNMENT_DATE"] = str(args.shift), args.date
+    if args.no_schedule:
+        del os.environ["ASSIGNMENT_DATE"]          # the loader then applies no centre schedule
     for d in (HERE, os.path.join(HERE, "pipeline")):
         sys.path.insert(0, d)
     import master_pipeline as mp_
@@ -55,6 +59,14 @@ def main():
     rnd = random.Random(f"{args.exam}-{args.shift}-{args.date}")
     for lst in by_centre.values():
         rnd.shuffle(lst)
+    if args.camera_list:
+        want = {(str(x["camera_id"]), str(x["camera_no"])) for x in json.load(open(args.camera_list))}
+        listed = [c for c in pool.values() if (c["camera_id"], c["camera_no"]) in want]
+        missing = len(want) - len(listed)
+        if missing:
+            rec.logger.warning(f"{missing} camera(s) of the list are not in the exam's camera list and are skipped")
+        by_centre = {"list": listed}
+        args.count = len(listed)
     picked, centres = [], sorted(by_centre)
     rnd.shuffle(centres)
     while len(picked) < args.count and any(by_centre.values()):
