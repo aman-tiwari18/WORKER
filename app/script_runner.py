@@ -314,6 +314,13 @@ class ScriptRunner:
                 "assignment_date": meta.get("assignment_date") or execution.get("assignment_date"),
                 "link_type": meta.get("link_type") or execution.get("link_type"),
             })
+            # Hash mode splits classification by WORKER_INDEX / TOTAL_WORKERS like detection,
+            # but only servers with a local vLLM classify. VISION_WORKER_INDEX /
+            # VISION_TOTAL_WORKERS give classification its own split among those servers
+            # (e.g. one vLLM server among two: 0 / 1 there, so it classifies every camera).
+            if os.environ.get("VISION_TOTAL_WORKERS"):
+                env["TOTAL_WORKERS"] = os.environ["VISION_TOTAL_WORKERS"]
+                env["WORKER_INDEX"] = os.environ.get("VISION_WORKER_INDEX", "0")
 
         process = await asyncio.create_subprocess_exec(
             command, str(full_script_path), *args,
