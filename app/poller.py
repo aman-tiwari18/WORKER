@@ -210,11 +210,8 @@ class Poller:
         return passthrough + combined
 
     # ── shift sessions ────────────────────────────────────────────────────
-    def _session_merge(self, assignment):
-        """Merge this poll's members into the session record and rewrite its file. Returns the record."""
-        key = str(assignment["id"])
-        rec = self.sessions.setdefault(key, {"members": {}, "status": {}, "file": None})
-        rec["members"].update(assignment.get("_session") or {})
+    def _session_write(self, key, rec):
+        """Rewrite the session file from rec["members"] (the pipeline re-reads it every few seconds)."""
         os.makedirs(SESSION_DIR, exist_ok=True)
         rec["file"] = os.path.join(SESSION_DIR, f"{key}.json")
         analytics = {}
@@ -235,10 +232,58 @@ class Poller:
             a = analytics.setdefault(name, {"windows": []})
             a["windows"].append({"start": m["start"], "end": m["end"], "freq": m.get("freq"), "cls": cls})
         tmp = rec["file"] + ".tmp"
-        import json as _json
         with open(tmp, "w") as f:
             _json.dump({"session": key, "updated": time.time(), "analytics": analytics}, f, indent=1)
         os.replace(tmp, rec["file"])
+
+    async def _session_prune(self, client):
+        """Drop session windows whose assignment was deleted, cancelled or deactivated.
+
+        15 Oct 2026: assignments of a live shift were deleted and re-created; their old windows stayed
+        in rec["members"] for the life of the poller, one of them (05:24 -> next day 00:00) kept the
+        intruder analytic running for 5 hours and made the poller relaunch the session after it was
+        stopped. A member is dropped only on an explicit answer from the backend (404, CANCELLED /
+        STOPPED, or is_active = 0); a failed or timed-out request never drops anything.
+        """
+        now = time.time()
+        if now - getattr(self, "_last_session_prune", 0) < 60:
+            return
+        self._last_session_prune = now
+        for key, rec in list(self.sessions.items()):
+            dropped = []
+            for mid in list(rec["members"].keys()):
+                if not str(mid).isdigit():
+                    continue
+                try:
+                    r = await client.get(f"{self.backend_url}/executions/{mid}",
+                                         headers={"X-API-Key": self.api_key}, timeout=10)
+                except Exception:
+                    continue
+                if r.status_code == 404:
+                    dropped.append((mid, "deleted"))
+                elif r.status_code == 200:
+                    data = (r.json() or {}).get("data") or {}
+                    status = str(data.get("status", "")).upper()
+                    if status in ("CANCELLED", "CANCELED", "STOPPED"):
+                        dropped.append((mid, status.lower()))
+                    elif data.get("is_active") in (0, False, "0"):
+                        dropped.append((mid, "inactive"))
+            if dropped:
+                for mid, why in dropped:
+                    m = rec["members"].pop(mid, None) or {}
+                    logger.warning(f"[session] {key}: dropped window of assignment {mid} ({why}) "
+                                   f"{m.get('code')} start={m.get('start')} end={m.get('end')}")
+                try:
+                    self._session_write(key, rec)
+                except Exception as e:
+                    logger.error(f"[session] {key}: could not rewrite session file after pruning: {e}")
+
+    def _session_merge(self, assignment):
+        """Merge this poll's members into the session record and rewrite its file. Returns the record."""
+        key = str(assignment["id"])
+        rec = self.sessions.setdefault(key, {"members": {}, "status": {}, "file": None})
+        rec["members"].update(assignment.get("_session") or {})
+        self._session_write(key, rec)
         assignment["_session_file"] = rec["file"]
         assignment["_member_ids"] = list(rec["members"].keys())
         # the run lasts from the first window's start to the last window's end
@@ -388,6 +433,7 @@ class Poller:
             async with httpx.AsyncClient() as client:
                 # 0. Enforce cancellations on anything we're running locally.
                 await self._enforce_cancellations(client)
+                await self._session_prune(client)
 
                 # 1. Fetch PENDING tasks
                 pending_response = await client.get(

@@ -1651,7 +1651,8 @@ def _bulk_persist(runtime: dict, classifications: List[dict]) -> int:
                     device_id = parts[0]
                     camera_no = parts[1] if len(parts) > 1 else ""
                 updated += update_rtsp_classification(
-                    runtime["exam_id"], device_id, camera_no, label, status, frame_path
+                    runtime["exam_id"], device_id, camera_no, label, status, frame_path,
+                    camera_pk=camera_pk,    # one row: a device id + camera no can repeat on another server
                 )
                 history_inserted += insert_rtsp_classification_history(
                     camera_pk, runtime.get("shift_id"),
@@ -1693,13 +1694,14 @@ def _bulk_persist_status(runtime: dict, statuses: List[dict]) -> int:
                     parts     = cam_id.split("_", 1)
                     device_id = parts[0]
                     camera_no = parts[1] if len(parts) > 1 else ""
+                camera_pk  = item.get("camera_pk")
                 if frame_path:
                     updated += update_rtsp_status_and_frame_path(
-                        runtime["exam_id"], device_id, camera_no, status, frame_path
+                        runtime["exam_id"], device_id, camera_no, status, frame_path, camera_pk=camera_pk
                     )
                 else:
                     updated += update_rtsp_status(
-                        runtime["exam_id"], device_id, camera_no, status
+                        runtime["exam_id"], device_id, camera_no, status, camera_pk=camera_pk
                     )
         except Exception as e:
             logger.error(f"DB status persist failed for {cam_id}: {e}")
@@ -1884,6 +1886,7 @@ async def run_assignment_mode() -> dict:
                 "camera_id": x["camera_id"],
                 "device_id": str(x["cam"].get("device_id") or ""),
                 "camera_no": str(x["cam"].get("camera_no") or ""),
+                "camera_pk": x["cam"].get("id"),
                 "status":    "Accessible",
                 "frame_path": x.get("frame_path"),  # written to DB in Pass-1 persist
             })
@@ -1897,6 +1900,7 @@ async def run_assignment_mode() -> dict:
                 "camera_id": x["camera_id"],
                 "device_id": str(cam.get("device_id") or ""),
                 "camera_no": str(cam.get("camera_no") or ""),
+                "camera_pk": cam.get("id"),
                 "status": "Not Accessible",
             })
         _bulk_persist_status(runtime, statuses_to_persist)
@@ -1972,6 +1976,7 @@ async def run_assignment_mode() -> dict:
             "camera_id": c["camera_id"],
             "device_id": str(c.get("device_id") or ""),
             "camera_no": str(c.get("camera_no") or ""),
+            "camera_pk": c.get("camera_pk"),
             "status":    "Not Accessible",
         }
         for c in classifications
@@ -2357,6 +2362,44 @@ def _handle_shutdown_signal(signum, frame):
     raise SystemExit(128 + signum)
 
 
+def _gpu_memory_gb() -> Optional[Tuple[float, float]]:
+    """(free_gb, total_gb) of GPU 0, or None when nvidia-smi is unavailable."""
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+        free_mb, total_mb = [float(x) for x in out.strip().splitlines()[0].split(",")]
+        return free_mb / 1024.0, total_mb / 1024.0
+    except Exception:
+        return None
+
+
+def _wait_for_free_gpu_memory() -> None:
+    """Block (up to VLLM_WAIT_FREE_MEM_S, default 15 min) until vLLM's memory request fits on the GPU."""
+    try:
+        util = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.55"))
+    except ValueError:
+        util = 0.55
+    limit = float(os.getenv("VLLM_WAIT_FREE_MEM_S", "900"))
+    deadline = time.time() + limit
+    announced = False
+    while True:
+        mem = _gpu_memory_gb()
+        if mem is None:
+            return
+        free, total = mem
+        need = util * total + 1.0
+        if free >= need:
+            return
+        if time.time() >= deadline:
+            logger.error(f"GPU memory still short after {limit:.0f}s (free {free:.0f} GB, vLLM needs {need:.0f} GB); starting anyway.")
+            return
+        if not announced:
+            logger.warning(f"Waiting for GPU memory before starting vLLM: free {free:.0f} GB, needs {need:.0f} GB "
+                           f"(another job is using the card); will wait up to {limit:.0f}s.")
+            announced = True
+        time.sleep(20)
+
+
 def _ensure_vllm_running():
     global _VLLM_PROC, _VLLM_TOUCHED
     if _VLLM_PROC is not None and _VLLM_PROC.poll() is None:
@@ -2371,6 +2414,10 @@ def _ensure_vllm_running():
             return None
     except:
         pass
+
+    # Same guard as the HLS script: vLLM refuses to start unless gpu-memory-utilization x total is
+    # free, and the other exam's detectors may still hold the card. Wait for it instead of crashing.
+    _wait_for_free_gpu_memory()
 
     logger.info("Starting temporary vLLM server process. Please wait (~60-180 seconds)...")
     _vllm_script = os.getenv("VLLM_START_SCRIPT", os.path.join(PROJECT_ROOT, "start_vllm.sh"))

@@ -160,19 +160,22 @@ def update_hls_status(exam_id, shift_id, exam_date, ch_code, status):
                       "exam_date": exam_date, "ch_code": ch_code, "status": status})
 
 
-def update_rtsp_classification(exam_id, device_id, camera_no, classification, status=None, frame_path=None):
+# camera_pk (16 Oct 2026, same as db_client): update exactly that camera row - one device id + camera no can
+# exist on two camview servers. A server-tagged device id ("1000103d16") picks that server's row.
+def update_rtsp_classification(exam_id, device_id, camera_no, classification, status=None, frame_path=None, camera_pk=None):
     return _classify({"op": "update_rtsp", "exam_id": exam_id, "device_id": device_id, "camera_no": camera_no,
-                      "classification": classification, "status": status, "frame_path": frame_path})
+                      "classification": classification, "status": status, "frame_path": frame_path,
+                      "camera_pk": camera_pk})
 
 
-def update_rtsp_status(exam_id, device_id, camera_no, status):
+def update_rtsp_status(exam_id, device_id, camera_no, status, camera_pk=None):
     return _classify({"op": "update_rtsp_status", "exam_id": exam_id, "device_id": device_id,
-                      "camera_no": camera_no, "status": status})
+                      "camera_no": camera_no, "status": status, "camera_pk": camera_pk})
 
 
-def update_rtsp_status_and_frame_path(exam_id, device_id, camera_no, status, frame_path):
+def update_rtsp_status_and_frame_path(exam_id, device_id, camera_no, status, frame_path, camera_pk=None):
     return _classify({"op": "update_rtsp_status_frame", "exam_id": exam_id, "device_id": device_id,
-                      "camera_no": camera_no, "status": status, "frame_path": frame_path})
+                      "camera_no": camera_no, "status": status, "frame_path": frame_path, "camera_pk": camera_pk})
 
 
 def insert_hls_classification_history(camera_id, shift_id, exam_date, frame_path, classification):

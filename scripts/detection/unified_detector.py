@@ -176,6 +176,11 @@ COOLDOWNS = {
                             default if key in _OWN_COOLDOWN_ONLY else (_GLOBAL_COOLDOWN or default)))
     for key, default in _COOLDOWN_DEFAULTS.items()
 }
+# Blind spot fires on edge strips / people near the frame edge, which is true for most lab cameras
+# almost all the time (14 Oct 2026: ~100 alerts a minute). Whatever the assignment's Frequency says,
+# one camera never alerts more often than this (seconds).
+BLIND_SPOT_MIN_COOLDOWN = int(os.environ.get("BLIND_SPOT_MIN_COOLDOWN", "420"))
+COOLDOWNS["blind_spot"] = max(COOLDOWNS["blind_spot"], BLIND_SPOT_MIN_COOLDOWN)
 
 RESULTS_ROOT = os.path.join(BASE_DIR, "results")
 

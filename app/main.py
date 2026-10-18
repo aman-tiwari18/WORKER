@@ -479,10 +479,13 @@ def _split_rtsp_stem(stem: str):
     """
     parts = stem.split("_")
     for i in range(1, len(parts) - 1):
-        if parts[i].isdigit() and parts[i + 1].isdigit():
+        # 16 Oct 2026: a device id shared by two camview servers is saved server-tagged
+        # ("1000103d16"); the real device id is its leading digits.
+        dev_m = re.match(r"^(\d+)(?:[a-z][a-z0-9]*)?$", parts[i])
+        if dev_m and parts[i + 1].isdigit():
             prefix = "_".join(parts[:i]).lower()
             if prefix in _RTSP_SCRIPT_PREFIXES:
-                return prefix, parts[i], parts[i + 1]
+                return prefix, dev_m.group(1), parts[i + 1]
             return None
     return None
 

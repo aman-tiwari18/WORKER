@@ -321,7 +321,11 @@ class ScriptRunner:
             env=env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True
+            start_new_session=True,
+            # 16 Oct 2026: tqdm progress bars rewrite one line with "\r" and no newline; on a long
+            # classification (1,180 cameras) that "line" passed the default 64 KB limit, readline()
+            # raised, and the run was marked FAILED while the script kept going.
+            limit=8 * 1024 * 1024,
         )
 
         # Register so cancel() can reach this process. For a grouped detection run
@@ -336,7 +340,13 @@ class ScriptRunner:
             """Read output line by line, writing to both named log and log_manager."""
             data_chunks = []
             while True:
-                line = await stream.readline()
+                try:
+                    line = await stream.readline()
+                except ValueError:
+                    # Over-long line (no newline within the limit): asyncio already dropped it from
+                    # the buffer; skip it instead of failing the run.
+                    logger.warning(f"Script {execution_id}: skipped an over-long output line")
+                    continue
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()

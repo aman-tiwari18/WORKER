@@ -27,7 +27,9 @@ SAVE_FOLDER = os.path.join(BASE_DIR, "results/blind_spot_detection")
 
 EDGE_OBSTRUCTION_THRESHOLD = 0.15
 CONF_THRESHOLD = 0.40
-COOLDOWN_TIME = int(os.environ.get("COOLDOWN_TIME", 180))
+# One camera never alerts more often than BLIND_SPOT_MIN_COOLDOWN (default 7 min), whatever the
+# assignment's Frequency says: the rule is true for most lab cameras almost all the time.
+COOLDOWN_TIME = max(int(os.environ.get("COOLDOWN_TIME", 180)), int(os.environ.get("BLIND_SPOT_MIN_COOLDOWN", "420")))
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 

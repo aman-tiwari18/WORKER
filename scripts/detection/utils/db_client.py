@@ -525,7 +525,8 @@ def get_hls_cameras(exam_id: int, shift_id: int, exam_date: str) -> list:
         SELECT
             id, exam_id, shift_id, centre_name, city, state,
             camera_name, ch_code, tc_code, cctv_url,
-            camera_category, classification, status, is_active, exam_date
+            camera_category, classification, status, is_active, exam_date,
+            manually_verified, frame_path
         FROM camera_links_hls USE INDEX (idx_exam_id, idx_shift_id)
         WHERE exam_id   = %s
           AND (shift_id = %s OR shift_id IS NULL)
@@ -539,7 +540,7 @@ def get_hls_cameras(exam_id: int, shift_id: int, exam_date: str) -> list:
         with conn:
             with conn.cursor() as cur:
                 rows = _fetch_hls(cur, sql, params, exam_date, shift_id)
-                
+
                 # Apply camera distribution filter for horizontal scaling
                 try:
                     try:
@@ -552,13 +553,13 @@ def get_hls_cameras(exam_id: int, shift_id: int, exam_date: str) -> list:
                         if root_dir not in sys.path:
                             sys.path.append(root_dir)
                         from app.camera_distributor import filter_cameras
-                    
+
                     rows = filter_cameras(rows)
                 except Exception as e:
                     logger.warning(f"Failed to apply camera distribution filter: {e}")
                     # If distributor not available, return all cameras (single-node mode)
                     pass
-                
+
                 logger.info(
                     f"[DB] Loaded {len(rows)} HLS cameras "
                     f"(exam_id={exam_id}, shift_id={shift_id}, date={exam_date})"
@@ -631,23 +632,24 @@ def get_hls_cameras_accessible(exam_id: int, shift_id: int, exam_date: str) -> l
 
 def update_hls_classification(exam_id: int, shift_id: int, exam_date: str, ch_code: str, classification: str, status: str = None, frame_path: str = None) -> int:
     """Update classification, status, and frame_path in camera_links_hls for one camera.
-    Reclassification clears any prior manual verification: a fresh VLM result
-    invalidates the operator's prior override, so the camera goes back to the
-    untouched/VLM-only state until a human re-verifies it.
+    Same rule as RTSP (15 Oct 2026): a manual verification is cleared only when the label
+    actually CHANGES — rewriting the same label (a kept camera's status/frame refresh) keeps it.
+    MySQL applies SET left to right, so the two IF()s must come before `classification = %s`.
     """
     frame_path = _canonicalize_frame_path(frame_path)
     # Only overwrite frame_path when a fresh one is supplied — a frame_path-less
     # update (e.g. the checkpoint-resume path) must not wipe an existing capture.
-    frame_set = "frame_path = %s," if frame_path is not None else ""
+    frame_set = ", frame_path = %s" if frame_path is not None else ""
     sql = f"""
         UPDATE camera_links_hls
-        SET classification = %s, status = %s, {frame_set}
-            manually_verified = 0, verified_by = NULL
+        SET manually_verified = IF(classification <=> %s, manually_verified, 0),
+            verified_by       = IF(classification <=> %s, verified_by, NULL),
+            classification = %s, status = %s{frame_set}
         WHERE exam_id = %s
           AND ch_code = %s
           AND is_active = 1
     """
-    params = [classification, status]
+    params = [classification, classification, classification, status]
     if frame_path is not None:
         params.append(frame_path)
     params += [exam_id, ch_code]
@@ -916,7 +918,7 @@ def get_rtsp_camera_by_id(camera_id_pk: int) -> dict:
         logger.error(f"[DB] Error fetching camera_links_rtsp by ID ({camera_id_pk}): {e}")
         return {}
 
-def update_rtsp_classification(exam_id: int, device_id: str, camera_no: str, classification: str, status: str = None, frame_path: str = None) -> int:
+def update_rtsp_classification(exam_id: int, device_id: str, camera_no: str, classification: str, status: str = None, frame_path: str = None, camera_pk=None) -> int:
     """Update classification, status, and frame_path in camera_links_rtsp for one camera.
     A manual verification is cleared only when the label actually CHANGES — rewriting the same
     label (e.g. a status/frame refresh) keeps it. MySQL applies SET left to right, so the two
@@ -929,36 +931,36 @@ def update_rtsp_classification(exam_id: int, device_id: str, camera_no: str, cla
             verified_by       = IF(classification <=> %s, verified_by, NULL),
             classification = %s, status = %s, frame_path = %s
         WHERE exam_id = %s
-          AND device_id = %s
-          AND camera_no = %s
+          AND {where}
           AND is_active = 1
     """
+    where, wparams = _rtsp_cam_where(device_id, camera_no, camera_pk)   # one row, not every server's
     try:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (classification, classification, classification, status, frame_path, exam_id, device_id, camera_no))
+                cur.execute(sql.format(where=where), tuple([classification, classification, classification, status, frame_path, exam_id] + wparams))
                 conn.commit()
                 return cur.rowcount
     except Exception as e:
         logger.error(f"[DB] Error updating camera_links_rtsp classification (device_id={device_id}, camera_no={camera_no}): {e}")
         return 0
 
-def update_rtsp_status(exam_id: int, device_id: str, camera_no: str, status: str) -> int:
+def update_rtsp_status(exam_id: int, device_id: str, camera_no: str, status: str, camera_pk=None) -> int:
     """Update only status in camera_links_rtsp for one camera."""
-    sql = """
+    where, wparams = _rtsp_cam_where(device_id, camera_no, camera_pk)
+    sql = f"""
         UPDATE camera_links_rtsp
         SET status = %s
         WHERE exam_id = %s
-          AND device_id = %s
-          AND camera_no = %s
+          AND {where}
           AND is_active = 1
     """
     try:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (status, exam_id, device_id, camera_no))
+                cur.execute(sql, tuple([status, exam_id] + wparams))
                 conn.commit()
                 return cur.rowcount
     except Exception as e:
@@ -968,23 +970,23 @@ def update_rtsp_status(exam_id: int, device_id: str, camera_no: str, status: str
 
 def update_rtsp_status_and_frame_path(
     exam_id: int, device_id: str, camera_no: str,
-    status: str, frame_path: Optional[str],
+    status: str, frame_path: Optional[str], camera_pk=None,
 ) -> int:
     """Update status and frame_path in camera_links_rtsp without touching classification."""
     frame_path = _canonicalize_frame_path(frame_path)
-    sql = """
+    where, wparams = _rtsp_cam_where(device_id, camera_no, camera_pk)
+    sql = f"""
         UPDATE camera_links_rtsp
         SET status = %s, frame_path = %s
         WHERE exam_id = %s
-          AND device_id = %s
-          AND camera_no = %s
+          AND {where}
           AND is_active = 1
     """
     try:
         conn = _get_connection()
         with conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (status, frame_path, exam_id, device_id, camera_no))
+                cur.execute(sql, tuple([status, frame_path, exam_id] + wparams))
                 conn.commit()
                 return cur.rowcount
     except Exception as e:
@@ -1347,6 +1349,39 @@ def report_to_db_hls(ch_code: str, image_name: str, folder: str = "crowd_detecti
 # 📝  RTSP DETECTION REPORTING
 # ============================================================
 
+# 16 Oct 2026: a device id + camera no is unique only per camview server (1000103/0 is one camera
+# on d15 and another on d16). Inside the detection pipeline the second such camera carries the
+# server tag in its device id ("1000103d16"); these helpers make and read that tag.
+_TAGGED_DEV_RE = re.compile(r"^(\d+)([a-z][a-z0-9]*)$")
+
+
+def rtsp_server_tag(cctv_url) -> str:
+    """'d16.camview.io' / 'https://d16.camview.io/x' -> 'd16'."""
+    host = str(cctv_url or "").strip().lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].split(":", 1)[0]
+    tag = re.sub(r"[^a-z0-9]", "", host.split(".", 1)[0])
+    return tag if tag and tag[0].isalpha() else ("s" + tag if tag else "")
+
+
+def split_rtsp_device(device_id):
+    """'1000103d16' -> ('1000103', 'd16'); '1000103' -> ('1000103', None)."""
+    d = str(device_id or "").strip()
+    m = _TAGGED_DEV_RE.match(d)
+    return (m.group(1), m.group(2)) if m else (d, None)
+
+
+def _rtsp_cam_where(device_id, camera_no, camera_pk=None):
+    """WHERE fragment + params that pick exactly one camera_links_rtsp row (no exam filter)."""
+    if camera_pk not in (None, ""):
+        return "id = %s", [int(camera_pk)]
+    dev, tag = split_rtsp_device(device_id)
+    if tag:
+        return "device_id = %s AND camera_no = %s AND cctv_url LIKE %s", [dev, camera_no, f"%{tag}.%"]
+    return "device_id = %s AND camera_no = %s", [dev, camera_no]
+
+
 def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: str = "crowd_detection",
                       person_count: int = None, threshold: int = None,
                       violation_count: int = None, violation_chain: str = None) -> bool:
@@ -1410,15 +1445,21 @@ def report_to_db_rtsp(device_id: str, camera_no: str, image_name: str, folder: s
         try:
             with conn.cursor() as cur:
                 # Look up camera row
+                # A server-tagged id ("1000103d16") finds that server's camera; a plain id finds the
+                # oldest row, the same one the session gave the plain id to.
+                _where, _params = _rtsp_cam_where(device_id, camera_no)
                 cur.execute(
-                    """
+                    f"""
                     SELECT * FROM camera_links_rtsp
-                    WHERE device_id = %s AND camera_no = %s AND exam_id = %s
+                    WHERE {_where} AND exam_id = %s
+                    ORDER BY id
                     LIMIT 1
                     """,
-                    (device_id, camera_no, exam_id),
+                    tuple(_params + [exam_id]),
                 )
                 cam = cur.fetchone()
+                if cam:
+                    device_id = str(cam.get("device_id") or device_id)   # the real device id goes in the report
 
             if not cam:
                 msg = (

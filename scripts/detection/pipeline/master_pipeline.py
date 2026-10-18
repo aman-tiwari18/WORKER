@@ -186,6 +186,7 @@ def get_worker_info(analytic_name, mode="rtsp"):
 
 # ================= CAMERA LOADER (DB-driven) =================
 from utils.camera_loader import load_all_pending_cameras, load_cameras_for_execution, _camera_matches_script
+from utils.db_client import rtsp_server_tag
 
 
 # ================= CONFIG =================
@@ -1521,12 +1522,13 @@ def session_producer(cfg, queues, session_file, slot, fb):
     shift_id     = cfg.get("shift_id") or os.environ.get("SHIFT_ID", "0")
     tc_code      = cfg.get("tc_code") or ""
     cls          = cfg.get("classification") or ""
+    pkt_dev      = cfg.get("pkt_dev") or device_id    # device id the detectors see (server-tagged when shared)
     server       = cfg.get("server_ip") or cfg.get("cctv_url", "")
     if "://" in str(server):
         server = urllib.parse.urlparse(str(server)).netloc
     direct_url   = cfg.get("cctv_url") or cfg.get("stream_url", "")
     use_dss      = bool(server and not str(direct_url).startswith("rtsp://"))
-    label        = f"{device_id}_{camera_no}"
+    label        = f"{pkt_dev}_{camera_no}"
     conf_src     = _SessionConfig(session_file)
     shard        = slot                    # each detector group takes slot % its number of processes
     failures     = 0
@@ -1589,7 +1591,7 @@ def session_producer(cfg, queues, session_file, slot, fb):
                             q = (queues.get("side") or {}).get(s_)
                             if q is not None:
                                 try:
-                                    q.put((frame, device_id, camera_no, camera_id_pk, exam_id), timeout=0.05)
+                                    q.put((frame, pkt_dev, camera_no, camera_id_pk, exam_id), timeout=0.05)
                                 except queue_module.Full:
                                     pass
                         continue
@@ -1597,7 +1599,7 @@ def session_producer(cfg, queues, session_file, slot, fb):
                     if not gq:
                         continue
                     q = gq[shard % len(gq)]               # a camera always goes to the same process
-                    pkt = {"frame": frame, "device_id": device_id, "ch_no": camera_no, "camera_no": camera_no,
+                    pkt = {"frame": frame, "device_id": pkt_dev, "ch_no": camera_no, "camera_no": camera_no,
                            "camera_id_pk": camera_id_pk, "exam_id": exam_id, "shift_id": shift_id,
                            "tc_code": tc_code, "source_type": "RTSP", "enabled_scripts": scripts,
                            "captured_at": last_good, "slot": slot, "classification": cls}
@@ -1850,16 +1852,31 @@ def _session_camera_pool(exam_id, shift_id):
         logger.error(f"[session] camera list failed: {e}")
         return {}
     pool = {}
+    # 16 Oct 2026: one device id + camera no can be two different cameras on two camview servers
+    # (e.g. 1000103/0 on d15 and on d16). The oldest row (lowest id) keeps the plain key; any other
+    # gets the server tag in its id (1000103d16), which every detector, cooldown, monitor-tamper
+    # memory, proximity count and image name then uses. The stream still uses the real device id,
+    # and report_to_db_rtsp reads the tag to find that camera's own row.
+    rows = sorted(rows, key=lambda r: int(r.get("id") or 0))
     for r in rows:
         dev = str(r.get("device_id") or "").strip()
         if not dev or not r.get("cctv_url"):
             continue
         cam_no = str(r.get("camera_no") or "").strip()
         cam_no = cam_no if cam_no.lower() not in ("", "none", "null") else "1"
+        pkt_dev = dev
         key = f"{dev}_{cam_no}"
+        tag = rtsp_server_tag(r["cctv_url"])
         if key in pool:
-            continue
+            if tag == pool[key]["server_tag"]:
+                continue                     # same camera listed twice on one server: a true duplicate
+            pkt_dev = dev + tag
+            key = f"{pkt_dev}_{cam_no}"
+            if not tag or key in pool:
+                continue
         pool[key] = {
+            "server_tag": tag,
+            "pkt_dev": pkt_dev,
             "cctv_url": r["cctv_url"], "camera_id": dev, "camera_id_pk": str(r.get("id") or ""),
             "camera_no": cam_no, "ch_no": cam_no, "classification": str(r.get("classification") or ""),
             "link_type": "RTSP", "camera_name": r.get("camera_name"), "centre_name": r.get("centre_name"),
