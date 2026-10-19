@@ -153,7 +153,28 @@ class FleetAgent:
             await self.register(client)
             return
         resp.raise_for_status()
-        await self._apply_status(((resp.json() or {}).get("data") or {}).get("status"))
+        data = (resp.json() or {}).get("data") or {}
+        await self._apply_status(data.get("status"))
+        if data.get("restart"):
+            await self._restart(data.get("restart_reason") or "Fleet page")
+
+    async def _restart(self, reason) -> None:
+        """Restart asked on the Fleet page (Restart / Update / camera split) for a server without
+        a Fleet agent, i.e. the main server. Stop the running jobs and exit: Docker's restart
+        policy (unless-stopped) starts the container again, and run.py loads the new settings."""
+        logger.warning(f"fleet: restart requested ({reason}) — stopping jobs and restarting this worker")
+        try:
+            from app.poller import poller_service
+            from app.script_runner import script_runner
+            for key in list(getattr(poller_service, "running_scripts", set())):
+                try:
+                    await script_runner.cancel(key)
+                except Exception as exc:
+                    logger.warning(f"fleet: could not stop {key} before restart: {exc}")
+        except Exception as exc:
+            logger.error(f"fleet: cleanup before restart failed: {exc}")
+        await asyncio.sleep(2)
+        os._exit(0)
 
     async def _apply_status(self, status) -> None:
         """React to an operator action on the Fleet page. RETIRED: stop everything

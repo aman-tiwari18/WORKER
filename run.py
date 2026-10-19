@@ -15,6 +15,11 @@ import asyncio
 
 
 def _run_agent():
+    # Fleet page settings (incl. the camera split) first: the modules below read their
+    # configuration when imported.
+    from app.fleet_config import apply as apply_fleet_settings
+    apply_fleet_settings(log=lambda m: print(m, flush=True))
+
     from app.poller import poller_service
     from app.fleet_agent import fleet_agent
     from app.lifecycle import lifecycle_reconciler
