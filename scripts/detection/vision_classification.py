@@ -1457,7 +1457,8 @@ def _ensure_vllm_running():
         preexec_fn=os.setsid
     )
     _VLLM_PROC = proc
-    for _ in range(300):
+    # Same limit as the RTSP script: the 30B weights read from a cold disk cache at ~50 s/shard (≈11 min).
+    for _ in range(max(1, int(os.getenv("VLLM_STARTUP_TIMEOUT_S", "1500")) // 2)):
         try:
             if requests.get("http://localhost:8001/health", timeout=2).status_code == 200:
                 logger.info("Temporary vLLM server successfully started!")

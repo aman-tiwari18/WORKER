@@ -126,6 +126,25 @@ class ProximityPeopleBackend(_Backend):
         return [model.detect(f) for f in frames]
 
 
+class ProximityTemporalBackend(_Backend):
+    """yolo11m + yolo11m-pose + Depth-Anything-V2 (proximity_temporal_system), for the proximity analytic.
+    predict() returns one stateless FrameInference per frame; each camera's tracking and decisions run in
+    proximity_temporal_det. The loaded model is a ProximityTemporalSystem that every camera shares."""
+
+    def __init__(self, name, path):
+        super().__init__(name, path)
+        self.pose_path = os.path.join(os.path.dirname(path), "yolo11m-pose.pt")
+
+    def _load(self):
+        if not os.path.exists(self.pose_path):
+            raise FileNotFoundError(self.pose_path)
+        import proximity_temporal_system
+        return proximity_temporal_system.ProximityTemporalSystem(det_weights=self.path, pose_weights=self.pose_path)
+
+    def _predict(self, model, frames):
+        return [model.infer(f) for f in frames]
+
+
 class RFDetrBackend(_Backend):
     """RF-DETR Medium. Returns supervision.Detections (xyxy, confidence, class_id).
     On CUDA it is traced in FP16 for a fixed batch size, so smaller batches are
@@ -180,8 +199,10 @@ BACKENDS = {
     # UNIFIED_PHONE_BACKEND=rfdetr. conf = PHONE_RFDETR_CONF, same value phone_det_complete applies.
     # 14 Oct 2026: posture model (RF-DETR, classes 0 sitting / 1 standing / 2 unsure). Gates the
     # invigilator STATIC alert: it fires only on a person this model calls standing.
-    # 15 Oct 2026: proximity runs the Proximity_New_Script logic (PROXIMITY_ENGINE=new, the default).
+    # 15 Oct 2026: proximity runs the Proximity_New_Script logic (PROXIMITY_ENGINE=new).
     "proximity_people": ProximityPeopleBackend("proximity_people", os.path.join(MODELS_DIR, "yolo11m.pt")),
+    # 21 Oct 2026: the temporal proximity system (PROXIMITY_ENGINE=temporal, the default).
+    "proximity_temporal": ProximityTemporalBackend("proximity_temporal", os.path.join(MODELS_DIR, "yolo11m.pt")),
     "posture_rfdetr": RFDetrBackend("posture_rfdetr", os.path.join(MODELS_DIR, "posture_rfdetr.pth"),
                                     conf=0.25, num_classes=3),
     "mobile_rfdetr": RFDetrBackend("mobile_rfdetr", os.path.join(MODELS_DIR, "mobile_rfdetr.pth"),

@@ -14,6 +14,10 @@
 # so each cold start re-downloaded the whole model (~25 min at 40 MB/s) and
 # blew past the pipeline's run timeout. Compose can override.
 export HF_HOME=${HF_HOME:-/app/data/hf_cache}
+# Weights are already on disk (downloaded by the install / Add vLLM step); never let a slow or
+# blocked huggingface.co lookup stall startup (old setup, 16 Oct 11:40 failure). Override with
+# HF_HUB_OFFLINE=0 to let vLLM download missing files itself.
+export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
 export VLLM_USE_V1=0
 # Give the APIServer extra time to complete multi-modal warmup before
 # EngineCore times out waiting for the initial IPC connection.

@@ -33,6 +33,12 @@ def _truthy(name, default):
 FLEET_ENABLED = _truthy("FLEET_ENABLED", "1")
 REQUEST_TIMEOUT_S = float(os.getenv("FLEET_REQUEST_TIMEOUT_S", "10"))
 _MAX_BACKOFF_S = 120
+# GPU watchdog: a container can lose its GPU while running ("Failed to initialize NVML: Unknown
+# Error" — seen on the main server 22 Oct 2026: classification's vLLM could not start and 0 cameras
+# were classified). Only restarting the container gives the GPU back, so a worker that HAD a GPU
+# and then fails GPU_LOST_CHECKS checks in a row (every GPU_CHECK_S) restarts itself.
+GPU_CHECK_S = int(os.getenv("FLEET_GPU_CHECK_S", "30"))
+GPU_LOST_CHECKS = int(os.getenv("FLEET_GPU_LOST_CHECKS", "3"))
 
 
 def _worker_index() -> int:
@@ -122,6 +128,8 @@ class FleetAgent:
                 "running_scripts": len(running),
                 "running_assignment_ids": sorted(str(x) for x in running),
                 "uptime_s": int(time.time() - self._started_at),
+                # False = the container cannot reach its GPU (see GPU watchdog); None = not checked
+                "gpu_ok": (getattr(self, "_gpu_state", None) or {}).get("ok"),
             },
         }
 
@@ -203,10 +211,45 @@ class FleetAgent:
             logger.error(f"fleet: retire cleanup failed: {exc}")
 
     # ── loop ────────────────────────────────────────────────────────────────
+    async def _gpu_ok(self):
+        """True / False from `nvidia-smi -L`; None when there is no nvidia-smi (CPU-only host)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "nvidia-smi", "-L", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=20)
+            return proc.returncode == 0 and b"GPU " in out
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return False
+
+    async def _gpu_watch(self) -> None:
+        if not hasattr(self, "_gpu_state"):
+            self._gpu_state = {"seen": False, "fails": 0, "next": 0.0, "ok": None}
+        st = self._gpu_state
+        if time.time() < st["next"]:
+            return
+        st["next"] = time.time() + GPU_CHECK_S
+        ok = await self._gpu_ok()
+        st["ok"] = ok
+        if ok:
+            st["seen"], st["fails"] = True, 0
+        elif ok is False and st["seen"]:
+            st["fails"] += 1
+            logger.error(f"fleet: GPU not reachable from this container ({st['fails']}/{GPU_LOST_CHECKS})")
+            if st["fails"] >= GPU_LOST_CHECKS:
+                await self._restart("GPU lost inside the container (nvidia-smi fails); a restart gives it back")
+
     async def _loop(self) -> None:
         backoff = HEARTBEAT_INTERVAL_S
         async with httpx.AsyncClient() as client:
             while not self._stopping:
+                try:
+                    await self._gpu_watch()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"fleet: GPU check failed: {exc}")
                 try:
                     if not self._registered:
                         await self.register(client)

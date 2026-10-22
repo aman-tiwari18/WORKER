@@ -69,11 +69,13 @@ CONF_THRESHOLD = 0.45          # base detector confidence; per-rule filters tigh
 
 # Analytics that only look at person boxes (class 0). They can read either
 # yolov10m (COCO) or the fine-tuned person+monitor model, whose person is also class 0.
-# 15 Oct 2026: "new" = the Proximity_New_Script logic (proximity_new_det.py: own yolo11m + pose models,
-# closeness rules, pair confirmed over two samples); "old" = close_proximity.py on the shared person model.
-PROXIMITY_ENGINE = os.environ.get("PROXIMITY_ENGINE", "new").strip().lower()
-if PROXIMITY_ENGINE not in ("new", "old"):
-    PROXIMITY_ENGINE = "new"
+# 21 Oct 2026: "temporal" = the temporal proximity system (proximity_temporal_det.py: yolo11m + pose + depth,
+# per-camera tracking, roles by mobility, self-calibration, sustained closeness over the camera's samples);
+# "new" = the Proximity_New_Script logic (proximity_new_det.py: own yolo11m + pose models, closeness rules,
+# pair confirmed over two samples); "old" = close_proximity.py on the shared person model.
+PROXIMITY_ENGINE = os.environ.get("PROXIMITY_ENGINE", "temporal").strip().lower()
+if PROXIMITY_ENGINE not in ("temporal", "new", "old"):
+    PROXIMITY_ENGINE = "temporal"
 
 PERSON_ANALYTICS = {
     "crowd", "crowd_zero", "crowd_five", "crowd_biometric", "proximity", "intruder",
@@ -113,6 +115,8 @@ def model_for(script):
         return "mobile_rfdetr" if PHONE_MODEL == "rfdetr" else "mobile"
     if script == "monitor_tamper":
         return "person_monitor_rfdetr" if MONITOR_MODEL == "rfdetr" else "person_monitor_yolo26m"
+    if script == "proximity" and PROXIMITY_ENGINE == "temporal":
+        return "proximity_temporal"
     if script == "proximity" and PROXIMITY_ENGINE == "new":
         return "proximity_people"
     if script in PERSON_ANALYTICS and PERSON_MODEL == "rfdetr":
@@ -415,10 +419,11 @@ def _make_stateful_evaluator(module_name, folder, script_code):
 STATEFUL_SPEC = {
     "monitor_tamper": ("monitor_tamper_det", "monitor_tamper_detection"),
 }
-if PROXIMITY_ENGINE == "new":
+if PROXIMITY_ENGINE != "old":
     ANALYTIC_SPEC.pop("proximity", None)
     PERSON_ANALYTICS.discard("proximity")      # it has its own model, not the shared person result
-    STATEFUL_SPEC["proximity"] = ("proximity_new_det", "proximity_detection")
+    STATEFUL_SPEC["proximity"] = (("proximity_temporal_det" if PROXIMITY_ENGINE == "temporal" else "proximity_new_det"),
+                                  "proximity_detection")
 
 # Registry: script_code -> evaluator (all analytics, driven by the shared inference).
 EVALUATORS = {
@@ -455,9 +460,9 @@ def _flush_stateful(states, now):
 POSTURE_SCRIPTS = {"invigilator", "crowd_five_invigilator"}
 POSTURE_MODEL = "posture_rfdetr"
 POSTURE_GATE = os.environ.get("INVIGILATOR_POSTURE_GATE", "1").strip() not in ("0", "false", "no", "")
-# 15 Oct 2026: the new proximity (PROXIMITY_ENGINE=new) also gets the posture boxes and does not report a pair
-# in which someone is standing: standing people behind desks pass the script's own ankle check.
-PROXIMITY_POSTURE = (PROXIMITY_ENGINE == "new"
+# 15 Oct 2026: the new proximity (PROXIMITY_ENGINE=new / temporal) also gets the posture boxes and does not report
+# a pair in which someone is standing: standing people behind desks pass the script's own ankle check.
+PROXIMITY_POSTURE = (PROXIMITY_ENGINE != "old"
                      and os.environ.get("PROXIMITY_POSTURE", "1").strip() not in ("0", "false", "no", ""))
 
 
