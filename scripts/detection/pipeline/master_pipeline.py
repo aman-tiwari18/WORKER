@@ -271,6 +271,10 @@ SESSION_ZOOM_W = int(os.environ.get("SESSION_ZOOM_W", "1280") or 0)
 SESSION_OPEN_LEAD_S  = float(os.environ.get("SESSION_OPEN_LEAD_S", "180"))
 SESSION_IDLE_CLOSE_S = float(os.environ.get("SESSION_IDLE_CLOSE_S", "120"))
 SESSION_CAMERA_REFRESH_S = float(os.environ.get("SESSION_CAMERA_REFRESH_S", "600"))
+# Non-session jobs (HLS): re-read the accessible/classified cameras this often while the job runs, so
+# cameras that become accessible after launch are picked up; also how often a job that started with no
+# cameras re-checks. 0 = off (the old behaviour: cameras are read once at launch, no cameras = exit).
+CAMERA_REFRESH_S = float(os.environ.get("CAMERA_REFRESH_S", "300"))
 # Stop opening more streams when the host has less free memory than this (GB).
 SESSION_MIN_FREE_MEM_GB = float(os.environ.get("SESSION_MIN_FREE_MEM_GB", "6"))
 SESSION_START_STAGGER_S = float(os.environ.get("SESSION_START_STAGGER_S", "0.05"))
@@ -2559,7 +2563,94 @@ def _hls_unified_capture(cfg, stop_event, unified_queue, side_queues=None, state
         cap.release()
 
 
-def run_hls_pipeline(camera_group):
+def _cam_key(c):
+    return str(c.get("ch_no") or c.get("camera_no") or c.get("camera_id"))
+
+
+def _hls_collapse(camera_group, served_unified=None, served_side=None):
+    """One config per camera carrying every analytic enabled for it: model analytics in
+    enabled_scripts, classical-CV ones in side_scripts. served_* limit the analytics to the ones this
+    job's workers actually run (a refresh can find a camera newly eligible for an analytic that has no
+    worker, and must not hand it frames)."""
+    by_camera, order, others = {}, [], []
+    for c in camera_group:
+        sc = c.get("script_code")
+        if sc in UNIFIED_SCRIPTS and (served_unified is None or sc in served_unified):
+            bucket_name = "enabled_scripts"
+        elif sc in HLS_SIDE_SCRIPTS and (served_side is None or sc in served_side):
+            bucket_name = "side_scripts"
+        else:
+            others.append(c)
+            continue
+        key = _cam_key(c)
+        entry = by_camera.get(key)
+        if entry is None:
+            entry = dict(c)
+            entry["enabled_scripts"], entry["side_scripts"] = [], []
+            by_camera[key] = entry
+            order.append(key)
+        if sc and sc not in entry[bucket_name]:
+            entry[bucket_name].append(sc)
+    return [by_camera[k] for k in order], others
+
+
+def _hls_capture_supervisor(configs, reload_fn, stop_event, unified_queue, side_queues,
+                            served_unified, served_side, label="UnifiedHLS", interval=None):
+    """Runs the HLS capture and, every `interval` seconds, re-reads the job's cameras. A camera that
+    is new, or newly eligible for another analytic, restarts ONLY the capture layer with the merged
+    camera list; the detector workers, their queues and per-camera state are untouched. Cameras that
+    stop being accessible are kept (their stream just fails) so a flap does not churn the streams."""
+    from workers.hls_scheduler import run_hls_cameras, HLS_RR_POOL_SIZE, HLS_RR_ENABLED
+    interval = CAMERA_REFRESH_S if interval is None else interval
+
+    def sig(cfgs):
+        return {_cam_key(c): (tuple(sorted(c["enabled_scripts"])), tuple(sorted(c["side_scripts"]))) for c in cfgs}
+
+    def start(cfgs):
+        persistent = (not HLS_RR_ENABLED) or len(cfgs) <= HLS_RR_POOL_SIZE
+        fn = _hls_unified_persistent if persistent else _hls_unified_capture
+        run_stop = threading.Event()
+        t = threading.Thread(target=run_hls_cameras, args=(cfgs, run_stop, fn),
+                             kwargs={"label": label, "extra_args": (unified_queue, side_queues)}, daemon=True)
+        t.start()
+        return run_stop, t
+
+    current = {_cam_key(c): c for c in configs}
+    run_stop, t = start(list(current.values())) if current else (None, None)
+    while not stop_event.wait(interval):
+        try:
+            fresh, _ = _hls_collapse(reload_fn(), served_unified, served_side)
+        except Exception as e:
+            logger.warning("[%s refresh] camera re-read failed: %s", label, e)
+            continue
+        have, new = sig(list(current.values())), sig(fresh)
+        added = [k for k in new if k not in have]
+        widened = [k for k in new if k in have
+                   and (set(new[k][0]) - set(have[k][0]) or set(new[k][1]) - set(have[k][1]))]
+        if not added and not widened:
+            continue
+        for c in fresh:
+            k = _cam_key(c)
+            if k in current:                     # union of what it runs and what it is now eligible for
+                c["enabled_scripts"] = sorted(set(c["enabled_scripts"]) | set(current[k]["enabled_scripts"]))
+                c["side_scripts"] = sorted(set(c["side_scripts"]) | set(current[k]["side_scripts"]))
+            current[k] = c
+        logger.info("[%s refresh] %d new camera(s), %d with more analytics -> restarting capture on %d cameras",
+                    label, len(added), len(widened), len(current))
+        if run_stop is not None:
+            run_stop.set()
+            t.join(timeout=60)
+        try:
+            _per = {sc: sum(1 for c in current.values() if sc in c["enabled_scripts"]) for sc in sorted(served_unified)}
+            _publish_camera_count(len(current), sorted(served_unified), per_analytic=_per)
+        except Exception:
+            pass
+        run_stop, t = start(list(current.values()))
+    if run_stop is not None:
+        run_stop.set()
+
+
+def run_hls_pipeline(camera_group, reload_fn=None, job_scripts=None):
     if not (UNIFIED_DETECTOR and UNIFIED_HLS):
         return _run_hls_pipeline_per_script(camera_group)
 
@@ -2600,6 +2691,10 @@ def run_hls_pipeline(camera_group):
     if unified_configs:
         all_scripts = sorted({s for c in unified_configs for s in c["enabled_scripts"]})
         side_scripts = sorted({s for c in unified_configs for s in c["side_scripts"]})
+        if reload_fn is not None and job_scripts:
+            # a refresh can make a camera eligible for an analytic that had none at launch: have its worker up
+            all_scripts = sorted(set(all_scripts) | (set(job_scripts) & UNIFIED_SCRIPTS))
+            side_scripts = sorted(set(side_scripts) | (set(job_scripts) & HLS_SIDE_SCRIPTS))
         logger.info(
             "HLS UNIFIED: %d analytic-camera pairs -> %d distinct cameras (%.1fx fewer opens); "
             "model analytics: %s; classical-CV on the same capture: %s",
@@ -2649,12 +2744,21 @@ def run_hls_pipeline(camera_group):
         logger.info("HLS UNIFIED capture mode: %s", "PERSISTENT (streams held open)"
                     if persistent else "ROUND-ROBIN (open/burst/release)")
         stop_event = threading.Event()
-        t = threading.Thread(
-            target=run_hls_cameras,
-            args=(unified_configs, stop_event, capture_fn),
-            kwargs={"label": "UnifiedHLS", "extra_args": (unified_queue, side_queues)},
-            daemon=True,
-        )
+        if reload_fn is not None and CAMERA_REFRESH_S > 0:
+            logger.info("HLS camera refresh: re-reading accessible cameras every %.0fs", CAMERA_REFRESH_S)
+            t = threading.Thread(
+                target=_hls_capture_supervisor,
+                args=(unified_configs, reload_fn, stop_event, unified_queue, side_queues,
+                      set(all_scripts), set(side_scripts)),
+                daemon=True,
+            )
+        else:
+            t = threading.Thread(
+                target=run_hls_cameras,
+                args=(unified_configs, stop_event, capture_fn),
+                kwargs={"label": "UnifiedHLS", "extra_args": (unified_queue, side_queues)},
+                daemon=True,
+            )
         t.start()
         threads.append(t)
 
@@ -2702,6 +2806,30 @@ def _run_hls_pipeline_per_script(camera_group):
 # ============================================================
 # MAIN
 # ============================================================
+def _load_group_results(exam_id, shift_id, link_type, script_codes, quiet=False):
+    """[(execution, cameras)] for every analytic of this job that has cameras right now."""
+    results = []
+    for script_code in script_codes:
+        execution = {
+            "exam_id":     exam_id,
+            "shift_id":    shift_id,
+            "link_type":   link_type,
+            "script_code": script_code,
+        }
+        # The assignment's "Camera Type" selection for THIS analytic (set by
+        # script_runner.py as CAMERA_CLASSIFICATIONS_<ANALYTIC>); none = the
+        # analytic's built-in default camera types.
+        custom_cls = _camera_classes_from_env(script_code)
+        if custom_cls:
+            execution["camera_classifications"] = custom_cls
+            if not quiet:
+                logger.info(f"[CameraLoader] {script_code}: camera types from the assignment = {custom_cls}")
+        cameras = load_cameras_for_execution(execution)
+        if cameras:
+            results.append((execution, cameras))
+    return results
+
+
 def main():
     exam_id   = os.environ.get("EXAM_ID",  "").strip()
     shift_id  = os.environ.get("SHIFT_ID", "").strip()
@@ -2723,24 +2851,24 @@ def main():
             logger.error("--analytics flag missing")
             os._exit(1)
 
-        results = []
-        for script_code in script_codes:
-            execution = {
-                "exam_id":     exam_id,
-                "shift_id":    shift_id,
-                "link_type":   link_type,
-                "script_code": script_code,
-            }
-            # The assignment's "Camera Type" selection for THIS analytic (set by
-            # script_runner.py as CAMERA_CLASSIFICATIONS_<ANALYTIC>); none = the
-            # analytic's built-in default camera types.
-            custom_cls = _camera_classes_from_env(script_code)
-            if custom_cls:
-                execution["camera_classifications"] = custom_cls
-                logger.info(f"[CameraLoader] {script_code}: camera types from the assignment = {custom_cls}")
-            cameras = load_cameras_for_execution(execution)
-            if cameras: 
-                results.append((execution, cameras))
+        results = _load_group_results(exam_id, shift_id, link_type, script_codes)
+        if not results and CAMERA_REFRESH_S > 0:
+            # Nothing eligible yet (classification may not have run, or the streams are not up): stay
+            # alive and look again instead of exiting — an exit marks the assignment COMPLETED and the
+            # poller never relaunches it. The runner ends the process at the window's end.
+            wait_s = min(CAMERA_REFRESH_S, 120.0)
+            logger.info(f"No cameras to process yet — re-checking every {wait_s:.0f}s until the window ends")
+            while not results and not STOP:
+                for _ in range(int(wait_s)):          # 1 s steps so a stop signal is honoured at once
+                    if STOP:
+                        break
+                    time.sleep(1)
+                if not STOP:
+                    results = _load_group_results(exam_id, shift_id, link_type, script_codes, quiet=True)
+            if STOP:
+                logger.info("Stopped while waiting for cameras")
+                os._exit(0)
+            logger.info("Cameras are now available — starting")
 
         # Tell the GPU Monitor how many cameras this job runs on, whatever capture path it takes.
         _key = lambda c: (c.get("camera_id"), c.get("ch_no") or c.get("camera_no"))
@@ -2776,7 +2904,16 @@ def main():
         pipeline_threads.append(t)
 
     if all_hls_cameras:
-        t = threading.Thread(target=run_hls_pipeline, args=(all_hls_cameras,), name="HLS-pipeline")
+        _reload = None
+        if exam_id and shift_id and link_type and script_codes:
+            def _reload():
+                cams = []
+                for ex, cs in _load_group_results(exam_id, shift_id, link_type, script_codes, quiet=True):
+                    if ex.get("link_type", "").upper() == "HLS":
+                        cams.extend(cs)
+                return cams
+        t = threading.Thread(target=run_hls_pipeline, args=(all_hls_cameras,),
+                             kwargs={"reload_fn": _reload, "job_scripts": script_codes}, name="HLS-pipeline")
         t.start()
         pipeline_threads.append(t)
 
