@@ -57,6 +57,10 @@ RUN pip install --no-cache-dir uv && \
 # its resolver cannot move transformers back.
 RUN uv pip install --system "rfdetr==1.11.0" "transformers==5.8.0"
 
+# ByteTrack (ultralytics.trackers) needs lap: the temporal proximity engine tracks people with it.
+# Its own layer, so adding it does not invalidate (and re-download) the big pip layer above.
+RUN uv pip install --system "lap>=0.5.12"
+
 # Copy application code
 COPY . .
 

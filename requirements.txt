@@ -26,8 +26,6 @@ torchvision>=0.15.0
 # YOLO_INVERSION_MODEL in .env (see scripts/detection/model_config.py), which
 # defaults to yolo26m.pt/yolo26n.pt, so the floor must cover that.
 ultralytics>=8.4.0,<9.0.0
-# ByteTrack (ultralytics.trackers) needs lap; the temporal proximity engine tracks people with it
-lap>=0.5.12
 
 # Database
 pymysql>=1.1.0
