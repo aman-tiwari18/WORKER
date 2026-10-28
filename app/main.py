@@ -1636,7 +1636,10 @@ def _get_skipped_uids():
 # only exists on camera_links_rtsp (added 2026-09-30), so this covers RTSP
 # detections only — HLS items have no region and are excluded when a region
 # filter is active. Cached with a short TTL since /detections is polled often.
-_region_cache: dict = {"map": {}, "regions": [], "ts": 0.0}
+_region_cache: dict = {"map": {}, "centres": {}, "regions": [], "ts": 0.0}
+# unique_ids of the RTSP detections in a region, per (region, exam_id, date); see _region_uids.
+_region_uid_cache: dict = {}
+_REGION_UID_TTL = 30.0
 _REGION_CACHE_TTL = 60.0
 
 
@@ -1650,26 +1653,78 @@ def _get_region_map():
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT device_id, camera_no, region FROM camera_links_rtsp "
+                    "SELECT exam_id, tc_code, device_id, camera_no, region FROM camera_links_rtsp "
                     "WHERE region IS NOT NULL AND region <> ''"
                 )
                 rows = cur.fetchall()
         finally:
             conn.close()
-        m, regions = {}, set()
+        m, centres, regions = {}, {}, set()
         for r in rows:
             reg = str(r.get("region") or "").strip()
             if not reg:
                 continue
             key = f"{str(r.get('device_id') or '').strip()}_{str(r.get('camera_no') or '').strip()}"
             m[key] = reg
+            # Region belongs to the centre; a device id + camera no is not unique (the same pair
+            # can be two centres on two camview servers), so filters use exam + tc_code.
+            tc = str(r.get("tc_code") or "").strip()
+            if tc:
+                centres[f"{r.get('exam_id')}|{tc}"] = reg
             regions.add(reg)
         _region_cache["map"] = m
+        _region_cache["centres"] = centres
         _region_cache["regions"] = sorted(regions)
         _region_cache["ts"] = now
     except Exception as e:
         logger.error(f"Failed to load region map: {e}")
     return _region_cache["map"], _region_cache["regions"]
+
+
+def _region_centre_keys(region: str, exam_id=None) -> list:
+    """["{exam_id}|{tc_code}", ...] of the centres in `region` (optionally one exam)."""
+    _get_region_map()
+    keys = [k for k, v in _region_cache["centres"].items() if v == region]
+    if exam_id:
+        keys = [k for k in keys if k.split("|", 1)[0] == str(exam_id)]
+    return keys
+
+
+def _region_uids(region: str, exam_id=None, date=None) -> set:
+    """unique_ids (lower-case) of RTSP detections at the region's centres, matched on exam + tc_code.
+    The detection file name only carries device id + camera no, which two centres can share."""
+    ck = (region, str(exam_id or ""), str(date or ""))
+    hit = _region_uid_cache.get(ck)
+    now = time.time()
+    if hit and now - hit[0] < _REGION_UID_TTL:
+        return hit[1]
+    keys = _region_centre_keys(region, exam_id)
+    uids = set()
+    if keys:
+        conds = [f"CONCAT(exam_id, '|', tc_code) IN ({','.join(['%s'] * len(keys))})"]
+        params = list(keys)
+        if exam_id:
+            conds.append("exam_id = %s"); params.append(exam_id)
+        if date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date)):
+            # created_at is server time (IST); the session may run in UTC.
+            conds.append("created_at >= CONVERT_TZ(%s, 'SYSTEM', @@session.time_zone) "
+                         "AND created_at < CONVERT_TZ(%s + INTERVAL 1 DAY, 'SYSTEM', @@session.time_zone)")
+            params += [f"{date} 00:00:00", f"{date} 00:00:00"]
+        try:
+            conn = _get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT unique_id FROM camera_report_rtsp WHERE {' AND '.join(conds)}", tuple(params))
+                    uids = {str(r.get("unique_id") or "").lower() for r in cur.fetchall() if r.get("unique_id")}
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Failed to load region detections ({region}): {e}")
+    _region_uid_cache[ck] = (now, uids)
+    if len(_region_uid_cache) > 64:
+        for k in sorted(_region_uid_cache, key=lambda k: _region_uid_cache[k][0])[:32]:
+            _region_uid_cache.pop(k, None)
+    return uids
 
 
 @app.get("/detections/regions")
@@ -1946,8 +2001,10 @@ def list_detections(
 
     region = (region or "").strip()
     region_map = {}
+    region_uids = None
     if region:
         region_map, _ = _get_region_map()
+        region_uids = _region_uids(region, exam_id, date)
 
     # Single pass: compute counts for ALL types (for the sidebar / header pill)
     # AND build the candidate list for the requested type(s) only.
@@ -1993,12 +2050,13 @@ def list_detections(
                     if db_gpu is not None and db_gpu != int(gpu_id):
                         continue
 
-            # Region filter (RTSP only — no region on HLS cameras). Cheap: just
-            # splits the filename stem, no DB hit (region_map is preloaded above).
+            # Region filter (RTSP only — no region on HLS cameras): the file's uid must be one of
+            # the region's detections (exam + centre), preloaded above in one query.
             if region:
-                stem_for_region = os.path.splitext(relative_path.split("/")[-1])[0]
-                split = _split_rtsp_stem(stem_for_region)
-                if not split or region_map.get(f"{split[1]}_{split[2]}") != region:
+                if origin != "rtsp":
+                    continue
+                uid_for_region = os.path.splitext(relative_path.split("/")[-1])[0].split("_")[-1].lower()
+                if uid_for_region not in region_uids:
                     continue
 
             # Date is pre-filtered by the index; only run the regex for the
@@ -2188,7 +2246,9 @@ def list_detections(
             # Item display doesn't require the `region` query filter to be active —
             # load the map lazily (still TTL-cached) so cards can show region too.
             region_map, _ = _get_region_map()
-        reg = region_map.get(f"{item.get('device_id')}_{item.get('camera_no')}")
+        tc_for_region = meta.get("tcCode") or item.get("tc_code")
+        reg = (_region_cache["centres"].get(f"{item.get('exam_id')}|{tc_for_region}") if tc_for_region else None) \
+            or region_map.get(f"{item.get('device_id')}_{item.get('camera_no')}")
         if reg:
             item["region"] = reg
         # Filename gpu_id is primary (e.g. _gpu4_ token); only fall back to the
@@ -2667,27 +2727,16 @@ def list_client_detections(
                     conds.append(f"detection_type IN ({ph})"); params.extend(sql_folder_names)
                 # Region has no HLS equivalent — dropping camera_report_hls from
                 # active_tables below (when region is set) is what actually excludes
-                # HLS rows; this subquery only needs to run for the RTSP table.
+                # HLS rows; this condition only needs to run for the RTSP table.
                 if region:
-                    # camera_report_rtsp and camera_links_rtsp have different default
-                    # collations (utf8mb4_0900_ai_ci vs utf8mb4_unicode_ci) — bare
-                    # columns need an explicit COLLATE to compare. The table name is
-                    # hardcoded (not an alias) because this is only ever reached for
-                    # the RTSP table — region has no HLS equivalent, so
-                    # camera_report_hls is dropped from active_tables below whenever
-                    # region is set. An unqualified `device_id` here would resolve to
-                    # the subquery's own camera_links_rtsp column, making EXISTS
-                    # trivially true for every row instead of correlating to the
-                    # outer one — silently returning everything unfiltered.
-                    conds.append(
-                        "EXISTS (SELECT 1 FROM camera_links_rtsp l "
-                        "WHERE l.device_id COLLATE utf8mb4_unicode_ci = "
-                        "camera_report_rtsp.device_id COLLATE utf8mb4_unicode_ci "
-                        "AND l.camera_no COLLATE utf8mb4_unicode_ci = "
-                        "camera_report_rtsp.camera_no COLLATE utf8mb4_unicode_ci "
-                        "AND l.region = %s)"
-                    )
-                    params.append(region)
+                    # Match the centre (exam + tc_code): a device id + camera no can be two
+                    # centres in different regions, which put one region's detections in another.
+                    keys = _region_centre_keys(region, exam_id)
+                    if keys:
+                        conds.append(f"CONCAT(exam_id, '|', tc_code) IN ({','.join(['%s'] * len(keys))})")
+                        params.extend(keys)
+                    else:
+                        conds.append("1 = 0")
                 return " AND ".join(conds), params
 
             where_data, params_data = _build_where(include_type=True)
