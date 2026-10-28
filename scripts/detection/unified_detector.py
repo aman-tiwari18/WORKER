@@ -579,6 +579,27 @@ def unified_worker(frame_queue, scripts=None, session=None):
             logger.error(f"{tag} {name} FAILED to load — {sorted(users)} will not run until it does")
     pool = ThreadPoolExecutor(max_workers=len(BACKENDS), thread_name_prefix="unified-model")
     stats, last_stats = {}, time.time()
+
+    # Stall watchdog (28 Oct 2026: the person detectors of the remote servers did 3 passes in 170 s while 96
+    # frames waited, GPU 0 %, and nothing in the logs said where the time went). If this loop does not come round
+    # for UNIFIED_STALL_DUMP_S seconds, write every thread's stack to the log (at most once a minute).
+    _beat = {"t": time.time()}
+    _stall_s = float(os.environ.get("UNIFIED_STALL_DUMP_S", "30"))
+    if _stall_s > 0:
+        def _stall_watch():
+            import faulthandler, sys
+            last_dump = 0.0
+            while True:
+                time.sleep(5)
+                now = time.time()
+                if now - _beat["t"] > _stall_s and now - last_dump > 60:
+                    last_dump = now
+                    logger.error(f"{tag} no loop progress for {now - _beat['t']:.0f}s — thread stacks follow")
+                    try:
+                        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+                    except Exception:
+                        pass
+        threading.Thread(target=_stall_watch, name="stall-watchdog", daemon=True).start()
     last_flush = time.time()
     # per-(camera, script) cooldown/consec state
     states = {}
@@ -600,6 +621,7 @@ def unified_worker(frame_queue, scripts=None, session=None):
             sess["confirm"][k] = now + sess.get("confirm_s", 10)   # first hit: confirm it soon
 
     while True:
+        _beat["t"] = time.time()
         # Also runs while no frames arrive, so a held alert is not stuck waiting for
         # its camera's next frame.
         if time.time() - last_flush >= FLUSH_EVERY_S:

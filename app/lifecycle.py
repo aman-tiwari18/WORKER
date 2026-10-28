@@ -53,6 +53,15 @@ class LifecycleReconciler:
         mapping = {}
         for exec_key in list(getattr(poller_service, "running_scripts", set())):
             members = poller_service.group_members.get(exec_key, [exec_key])
+            # A shift session keeps the finished windows of its earlier runs / earlier analytics in its member
+            # list, and the backend orders STOP for any member that is COMPLETED. 28 Oct 2026: a second run on
+            # the same shift joined the session whose first run (assignment 9771) had completed -> the new run
+            # was stopped 8 s after it started on every worker. Ask only about members that are not done
+            # (if all are done, ask about all so the job is still stopped).
+            done = ((getattr(poller_service, "sessions", {}) or {}).get(exec_key) or {}).get("status") or {}
+            live = [m for m in members if done.get(str(m)) != "COMPLETED"]
+            if live:
+                members = live
             for mid in members:
                 try:
                     mapping[int(mid)] = exec_key
