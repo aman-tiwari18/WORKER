@@ -88,16 +88,26 @@ _CPU_CORES = multiprocessing.cpu_count()
 MAX_WORKERS_NETWORK:      int = int(os.getenv("VISION_MAX_WORKERS_NETWORK",      "16"))  # 16 for RTSP (was 64 — DVR gets overwhelmed)
 MAX_WORKERS_VLM:          int = int(os.getenv("VISION_MAX_WORKERS_VLM",          "32"))
 MAX_WORKERS_RTSP_CAPTURE: int = int(os.getenv("VISION_MAX_WORKERS_RTSP_CAPTURE", "6"))   # concurrent FFmpeg RTSP streams per worker; DVR stream limit
-THREAD_POOL_SIZE:         int = int(os.getenv("VISION_THREAD_POOL",              str(min(_CPU_CORES * 2, 128))))
+THREAD_POOL_SIZE:         int = int(os.getenv("VISION_THREAD_POOL",              str(max(min(_CPU_CORES * 2, 128), 256))))   # >= the Pass-1 capture limit below
 
-# 28 Oct 2026: faster Pass-1 (accessibility). Pass-1 checks cameras in database order, ~21 per DVR in a row, so any
-# real parallelism hits ONE DVR at a time (why the limits above are so low). With VISION_PASS1_INTERLEAVE=1 the cameras
-# are mixed across DVRs and capped per DVR / per Camview server, so VISION_MAX_WORKERS_NETWORK and
-# VISION_MAX_WORKERS_RTSP_CAPTURE can be raised a lot (e.g. 128 / 64). All off by default: nothing changes until set.
-PASS1_INTERLEAVE:      bool = os.getenv("VISION_PASS1_INTERLEAVE", "0").strip().lower() in ("1", "true", "yes")
-MAX_PER_DEVICE:        int = int(os.getenv("VISION_MAX_PER_DEVICE", "0"))   # simultaneous checks per DVR (device_id); 0 = no cap
-MAX_PER_CAMVIEW_HOST:  int = int(os.getenv("VISION_MAX_PER_CAMVIEW_HOST", "0"))   # per Camview server (cctv_url host); 0 = no cap
+# 28 Oct 2026: fast Pass-1 (accessibility). It used to check cameras in database order, ~21 per DVR in a row, so any
+# parallelism hit ONE DVR at a time: 16 network / 6 capture limits, ~1 camera/s, 2,100 cameras = 30-60 min.
+# Now the cameras are interleaved across DVRs and capped per DVR and per Camview server, so the limits can be high.
+# Every camera is still checked on every run (a captured frame is the proof); cameras that FAIL get a second look at
+# lower pressure, so overload cannot turn a reachable camera into "Not Accessible". All values are env-tunable:
+#   VISION_PASS1_INTERLEAVE=0 and VISION_PASS1_RTSP_NETWORK=16 VISION_PASS1_CAPTURE=6 VISION_MAX_PER_DEVICE=0
+#   VISION_MAX_PER_CAMVIEW_HOST=0 VISION_PASS1_RETRY=0   restore the old behaviour.
+PASS1_INTERLEAVE:      bool = os.getenv("VISION_PASS1_INTERLEAVE", "1").strip().lower() in ("1", "true", "yes")
+PASS1_RTSP_NETWORK:    int = int(os.getenv("VISION_PASS1_RTSP_NETWORK", "192"))     # RTSP cameras in flight (HLS keeps MAX_WORKERS_NETWORK)
+PASS1_CAPTURE:         int = int(os.getenv("VISION_PASS1_CAPTURE", "128"))          # simultaneous StartVideo + FFmpeg grabs (Pass-1 only)
+MAX_PER_DEVICE:        int = int(os.getenv("VISION_MAX_PER_DEVICE", "4"))           # simultaneous checks per DVR (device_id); 0 = no cap
+MAX_PER_CAMVIEW_HOST:  int = int(os.getenv("VISION_MAX_PER_CAMVIEW_HOST", "48"))    # per Camview server (cctv_url host); 0 = no cap
+PASS1_RETRY:           bool = os.getenv("VISION_PASS1_RETRY", "1").strip().lower() in ("1", "true", "yes")
+PASS1_RETRY_NETWORK:   int = int(os.getenv("VISION_PASS1_RETRY_NETWORK", "48"))     # second look: fewer at once ...
+PASS1_RETRY_PER_DEVICE: int = int(os.getenv("VISION_PASS1_RETRY_PER_DEVICE", "2"))  # ... and gentler on each DVR
+PASS1_RETRY_PER_HOST:  int = int(os.getenv("VISION_PASS1_RETRY_PER_HOST", "16"))
 _PASS1_SEMS: Dict[tuple, "asyncio.Semaphore"] = {}
+_P1_CAP_SEM: Optional["asyncio.Semaphore"] = None
 
 
 def _pass1_sem(kind: str, key: str, limit: int) -> Optional["asyncio.Semaphore"]:
@@ -1484,6 +1494,7 @@ async def _check_rtsp_camera(
     camera: dict,
     sem: asyncio.Semaphore,
     frames_dir: str = "",
+    limits: Optional[dict] = None,
 ) -> dict:
     """
     RTSP Pass-1: capture a frame from each camera and save it to frames_dir.
@@ -1523,11 +1534,16 @@ async def _check_rtsp_camera(
     # Camview camera: capture frame atomically (StartVideo + FFmpeg inside RTSP semaphore)
     # The per-DVR / per-Camview-host caps (off unless VISION_MAX_PER_DEVICE / VISION_MAX_PER_CAMVIEW_HOST are set)
     # are taken FIRST, so a camera waiting for its DVR does not hold one of the global slots.
-    _dev_sem  = _pass1_sem("dev", device_id, MAX_PER_DEVICE)
-    _host_sem = _pass1_sem("host", raw_url.lower(), MAX_PER_CAMVIEW_HOST)
+    # `limits` (second look) = {"tag", "cap": Semaphore, "dev": int, "host": int}; default = the main Pass-1 limits.
+    global _P1_CAP_SEM
+    if limits is None and _P1_CAP_SEM is None and PASS1_CAPTURE > 0:
+        _P1_CAP_SEM = asyncio.Semaphore(PASS1_CAPTURE)
+    _tag = (limits or {}).get("tag", "")
+    _dev_sem  = _pass1_sem("dev" + _tag, device_id, (limits or {}).get("dev", MAX_PER_DEVICE))
+    _host_sem = _pass1_sem("host" + _tag, raw_url.lower(), (limits or {}).get("host", MAX_PER_CAMVIEW_HOST))
     async with (_dev_sem or contextlib.nullcontext()), (_host_sem or contextlib.nullcontext()):
         async with sem:
-            _cap_ctx = _RTSP_CAP_SEM if _RTSP_CAP_SEM is not None else contextlib.nullcontext()
+            _cap_ctx = (limits or {}).get("cap") or _P1_CAP_SEM or _RTSP_CAP_SEM or contextlib.nullcontext()
             async with _cap_ctx:
                 jpeg, frame_path = await _camview_rtsp_capture_and_save(
                     camera, cam_id, frames_dir or FRAMES_FOLDER
@@ -1539,6 +1555,26 @@ async def _check_rtsp_camera(
     return {"camera_id": cam_id, "cam": camera,
             "accessible": True, "resolved_url": None,
             "rtsp_urls": None, "frame_path": frame_path, "reason": "ok"}
+
+
+async def _pass1_second_look(failed: List[dict], frames_dir: str) -> List[dict]:
+    """Second look at the RTSP cameras that failed Pass-1 for a reason that can be transient (capture failed, DVR busy):
+    fewer at once, fewer per DVR / Camview server. Returns the Pass-1 results of those that now succeed."""
+    again = [f["cam"] for f in failed
+             if f.get("reason") in ("frame_capture_failed", "dvr_service_unavailable") and f.get("cam")]
+    if not (PASS1_RETRY and again):
+        return []
+    limits = {"tag": "-retry", "cap": asyncio.Semaphore(max(1, PASS1_RETRY_NETWORK)),
+              "dev": PASS1_RETRY_PER_DEVICE, "host": PASS1_RETRY_PER_HOST}
+    sem = asyncio.Semaphore(max(1, PASS1_RETRY_NETWORK))
+    logger.info(f"Pass-1 second look | {len(again)} cameras that failed | {PASS1_RETRY_NETWORK} at once, "
+                f"{PASS1_RETRY_PER_DEVICE}/DVR, {PASS1_RETRY_PER_HOST}/Camview server")
+    t = time.time()
+    results = await asyncio.gather(*[_check_rtsp_camera(c, sem, frames_dir, limits)
+                                     for c in _interleave_by_device(again)])
+    ok = [r for r in results if r["accessible"]]
+    logger.info(f"Pass-1 second look done {time.time() - t:.1f}s | recovered {len(ok)} of {len(again)}")
+    return ok
 
 
 # ===========================================================================
@@ -1889,13 +1925,16 @@ async def run_assignment_mode() -> dict:
 
         # ── Pass-1 ────────────────────────────────────────────────────────
         frames_dir = _frames_dir_for_assignment(runtime.get("assignment_id")) if is_rtsp else ""
+        _p1_net = PASS1_RTSP_NETWORK if is_rtsp else MAX_WORKERS_NETWORK
         logger.info(
-            f"Pass-1 | {len(cameras)} cameras | {MAX_WORKERS_NETWORK} concurrent"
+            f"Pass-1 | {len(cameras)} cameras | {_p1_net} concurrent"
+            + (f" | {PASS1_CAPTURE} captures, {MAX_PER_DEVICE}/DVR, {MAX_PER_CAMVIEW_HOST}/Camview server, interleaved={PASS1_INTERLEAVE}" if is_rtsp else "")
             + (f" | frames → {frames_dir}" if frames_dir else "")
         )
         p1_cameras = _interleave_by_device(cameras) if (is_rtsp and PASS1_INTERLEAVE) else cameras
+        sem_p1 = asyncio.Semaphore(_p1_net) if is_rtsp else sem_net
         p1_coros = (
-            [_check_rtsp_camera(c, sem_net, frames_dir) for c in p1_cameras]
+            [_check_rtsp_camera(c, sem_p1, frames_dir) for c in p1_cameras]
             if is_rtsp else
             [_check_hls_camera(c, session, sem_net) for c in cameras]
         )
@@ -1911,6 +1950,13 @@ async def run_assignment_mode() -> dict:
                 accessible.append(res)
             else:
                 failed.append({"camera_id": res["camera_id"], "cam": res.get("cam", {}), "reason": res["reason"]})
+
+        if is_rtsp and failed:
+            _recovered = await _pass1_second_look(failed, frames_dir)
+            if _recovered:
+                _ok_ids = {r["camera_id"] for r in _recovered}
+                accessible.extend(_recovered)
+                failed = [f for f in failed if f["camera_id"] not in _ok_ids]
 
         logger.info(
             f"Pass-1 done {time.time()-p1_start:.1f}s | "
@@ -2066,8 +2112,9 @@ async def _default_pipeline(cameras: List[dict], runtime: dict) -> None:
             + (f" | frames → {frames_dir}" if frames_dir else "")
         )
         p1_cameras = _interleave_by_device(cameras) if (is_rtsp and PASS1_INTERLEAVE) else cameras
+        sem_p1 = asyncio.Semaphore(PASS1_RTSP_NETWORK) if is_rtsp else sem_net
         p1_coros = (
-            [_check_rtsp_camera(c, sem_net, frames_dir) for c in p1_cameras]
+            [_check_rtsp_camera(c, sem_p1, frames_dir) for c in p1_cameras]
             if is_rtsp else
             [_check_hls_camera(c, session, sem_net) for c in cameras]
         )

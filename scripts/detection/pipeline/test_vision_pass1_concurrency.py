@@ -37,7 +37,7 @@ check("interleave: empty list", V._interleave_by_device([]) == [])
 async def run(n_net, n_cap, per_dev, per_host, interleave, delay=0.5):
     V.PASS1_INTERLEAVE, V.MAX_PER_DEVICE, V.MAX_PER_CAMVIEW_HOST = interleave, per_dev, per_host
     V._PASS1_SEMS.clear()
-    V._RTSP_CAP_SEM = asyncio.Semaphore(n_cap)
+    V._P1_CAP_SEM = asyncio.Semaphore(n_cap)
     cur = collections.Counter(); peak = collections.Counter(); glob = {"cur": 0, "peak": 0}
 
     async def fake(camera, cam_id, frames_dir):
@@ -71,5 +71,37 @@ t2, g2, d2, h2, a2 = asyncio.run(run(128, 64, 0, 0, False))
 check("same big numbers WITHOUT the new caps overload a DVR (what the old comment warned about)", d2 > 2, f"{d2} at once on one DVR")
 t3, g3, d3, h3, a3 = asyncio.run(run(128, 64, 1, 8, True))
 check("strict caps (1 per DVR, 8 per host): still all checked, caps respected", a3 == 600 and d3 <= 1 and h3 <= 8, f"{t3:.1f}s, per DVR {d3}, per host {h3}")
+# ---- second look: cameras that fail the first time (overload) are re-checked gently and recovered
+async def second_look():
+    V._PASS1_SEMS.clear()
+    calls = collections.Counter(); cur = collections.Counter(); peak = collections.Counter()
+    dead = {c["camera_id"] for c in cameras()[:40]}                 # really unreachable: fail every time
+    flaky = {c["camera_id"] for c in cameras()[100:160]}            # fail only the first time (DVR overloaded)
+
+    async def fake(camera, cam_id, frames_dir):
+        calls[cam_id] += 1
+        d = camera["device_id"]; cur[d] += 1; peak[d] = max(peak[d], cur[d])
+        await asyncio.sleep(0.05); cur[d] -= 1
+        if cam_id in dead or (cam_id in flaky and calls[cam_id] == 1):
+            return None, None
+        return b"jpeg", "/x.jpg"
+
+    V._camview_rtsp_capture_and_save = fake
+    V.PASS1_RETRY, V.PASS1_RETRY_NETWORK, V.PASS1_RETRY_PER_DEVICE, V.PASS1_RETRY_PER_HOST = True, 48, 2, 16
+    sem = asyncio.Semaphore(64)
+    first = await asyncio.gather(*[V._check_rtsp_camera(c, sem, "") for c in cameras()])
+    failed = [{"camera_id": r["camera_id"], "cam": r["cam"], "reason": r["reason"]} for r in first if not r["accessible"]]
+    peak.clear()
+    rec = await V._pass1_second_look(failed, "")
+    return len(failed), len(rec), {r["camera_id"] for r in rec} == flaky, all(calls[i] == 2 for i in dead | flaky), max(peak.values())
+
+
+nf, nr, same, twice, dpeak = asyncio.run(second_look())
+check("second look: 100 failed first time", nf == 100, str(nf))
+check("second look: recovers exactly the flaky 60, not the 40 really dead", nr == 60 and same, f"recovered {nr}")
+check("second look: each failed camera is retried exactly once", twice)
+check("second look: gentler (at most 2 per DVR)", dpeak <= 2, f"{dpeak}")
+V.PASS1_RETRY = False
+check("second look can be switched off", asyncio.run(V._pass1_second_look([{"camera_id": "x", "cam": {"device_id": "1"}, "reason": "frame_capture_failed"}], "")) == [])
 print("\n%d FAILED" % fails if fails else "\nall passed")
 sys.exit(1 if fails else 0)
