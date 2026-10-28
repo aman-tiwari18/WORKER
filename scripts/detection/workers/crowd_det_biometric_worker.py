@@ -8,6 +8,11 @@ import queue
 import time
 import os
 _DET_GPU_ID = int(os.environ["WORKER_INDEX"]) if os.environ.get("WORKER_INDEX", "").strip().isdigit() else int("".join(c for c in os.environ.get("WORKER_ID", "main").split("-")[-1] if c.isdigit()) or "0")
+try:                                         # Fleet servers: their server number (same rule as db_client, 28 Oct 2026)
+    from utils.db_client import _get_gpu_id as _fleet_gpu_id
+    _DET_GPU_ID = _fleet_gpu_id()
+except Exception:
+    pass
 import logging
 import threading
 import signal

@@ -401,6 +401,31 @@ class Poller:
                 # A grouped detection job's key ("grp-…") is not a real backend
                 # execution — check its member executions instead.
                 member_ids = self.group_members.get(execution_id, [execution_id])
+                # A shift session runs many analytics; one stopped analytic must not stop the others (28 Oct 2026:
+                # Stop on one script stopped all 18). _session_prune drops a cancelled analytic's window; the session
+                # job itself stops only when every member that is not finished is cancelled.
+                rec = self.sessions.get(execution_id) if execution_id in getattr(self, "sessions", {}) else None
+                if rec is not None:
+                    done = rec.get("status") or {}
+                    live = [m for m in member_ids if done.get(str(m)) != "COMPLETED"]
+                    states = []
+                    for mid in live:
+                        r = await client.get(f"{self.backend_url}/executions/{mid}", headers={"X-API-Key": self.api_key})
+                        if r.status_code == 200:
+                            states.append(str(((r.json() or {}).get("data") or {}).get("status", "")).upper())
+                        elif r.status_code == 404:
+                            states.append("CANCELLED")
+                        else:
+                            states.append("?")
+                    if not (states and all(x in ("CANCELLED", "CANCELED", "STOPPED") for x in states)):
+                        continue
+                    status = "CANCELLED"
+                    logger.info(f"⏹ Session {execution_id}: every analytic stopped in the backend — stopping it")
+                    await script_runner.cancel(execution_id)
+                    self.running_scripts.discard(execution_id)
+                    self.scheduled_scripts.pop(execution_id, None)
+                    self.group_members.pop(execution_id, None)
+                    continue
                 cancelled = False
                 for mid in member_ids:
                     r = await client.get(
