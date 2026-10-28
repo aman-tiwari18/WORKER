@@ -221,13 +221,34 @@ _save_lock = threading.Lock()
 _made_dirs = set()
 
 
+def _write_jpeg(path, frame, fname):
+    """ONE write: encode the JPEG with the EXIF gpu_id stamp in memory and write the bytes (before: imwrite, then the
+    gateway re-opened the file and saved it again to add the stamp - three round trips on the NFS share per alert).
+    The stamp is the one db_client._embed_gpu_id_in_image writes (UserComment "gpu_id=N", PIL default quality), so the
+    Detections page reads it as before. Falls back to the plain write if anything in the encode fails."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        exif = img.getexif()
+        exif[0x9286] = f"gpu_id={_DET_GPU_ID}"
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", exif=exif.tobytes())
+        with open(path, "wb") as f:
+            f.write(buf.getvalue())
+        from utils import db_client
+        db_client.mark_stamped(fname)
+    except Exception:
+        cv2.imwrite(path, frame)
+
+
 def _do_save(frame, path, save_folder, folder, script_name, device_id, camera_no, exam_id, shift_id, source_type,
              violation_count, violation_chain, issue, fname):
     try:
         if save_folder not in _made_dirs:                  # one makedirs per folder, not one per alert
             os.makedirs(save_folder, exist_ok=True)
             _made_dirs.add(save_folder)
-        cv2.imwrite(path, frame)
+        _write_jpeg(path, frame, fname)
         try:
             if str(source_type).upper() == "HLS":
                 from utils.db_client import report_to_db_hls

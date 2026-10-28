@@ -423,8 +423,22 @@ def _canonicalize_frame_path(p: Optional[str]) -> Optional[str]:
     return f"{_NFS_FRAMES_ROOT}/{suffix}"
 
 
+# Names of images whose EXIF gpu_id was already stamped while the JPEG was encoded (unified_detector writes
+# alerts with the stamp in the same single write, 28 Oct 2026): re-opening and rewriting the file just to add it
+# cost two more round trips on the NFS share per alert.
+_ALREADY_STAMPED = set()
+
+
+def mark_stamped(name: str) -> None:
+    _ALREADY_STAMPED.add(os.path.basename(str(name)))
+
+
 def _embed_gpu_id_in_image(image_path: str, gpu_id: int) -> None:
     """Embed gpu_id into JPEG EXIF UserComment field."""
+    _name = os.path.basename(str(image_path))
+    if _name in _ALREADY_STAMPED:
+        _ALREADY_STAMPED.discard(_name)
+        return
     try:
         from PIL import Image
         img = Image.open(image_path)
