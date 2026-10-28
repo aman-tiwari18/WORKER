@@ -369,6 +369,12 @@ logger = logging.getLogger(__name__)
 # distributor uses. Fall back to the regex for single-GPU workers that don't
 # set WORKER_INDEX.
 def _get_gpu_id() -> int:
+    # Fleet servers are named worker-<N>-gpu<G>: tag them with their server number N (G > 0: N*10+G). The trailing
+    # digit used to be the GPU's, so every single-GPU Fleet server without WORKER_INDEX (lease mode) was tagged 0 like
+    # the main server (28 Oct 2026: worker-5's detections were shown as worker-0's); WORKER_INDEX is a hash slot.
+    fm = re.match(r"^worker-(\d+)-gpu(\d+)$", os.environ.get("WORKER_ID", "").strip())
+    if fm:
+        return int(fm.group(1)) if int(fm.group(2)) == 0 else int(fm.group(1)) * 10 + int(fm.group(2))
     idx = os.environ.get("WORKER_INDEX")
     if idx is not None and idx.strip() != "":
         try:

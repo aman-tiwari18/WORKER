@@ -33,6 +33,11 @@ INTEGRATION (not wired yet — flip after evaluators exist for all needed script
 
 import os
 _DET_GPU_ID = int(os.environ["WORKER_INDEX"]) if os.environ.get("WORKER_INDEX", "").strip().isdigit() else int("".join(c for c in os.environ.get("WORKER_ID", "main").split("-")[-1] if c.isdigit()) or "0")
+try:                                         # Fleet servers: their server number (same rule as db_client)
+    from utils.db_client import _get_gpu_id as _fleet_gpu_id
+    _DET_GPU_ID = _fleet_gpu_id()
+except Exception:
+    pass
 import sys
 import time
 import uuid
@@ -221,6 +226,31 @@ _save_lock = threading.Lock()
 _made_dirs = set()
 
 
+ALERT_UPLOAD_HTTP = os.environ.get("ALERT_UPLOAD_HTTP", "0").strip().lower() in ("1", "true", "yes")
+_upload_local = threading.local()
+
+
+def _upload_jpeg(path, data):
+    """Fleet servers (ALERT_UPLOAD_HTTP=1): send the image to the main server in ONE request (POST /fleet/frames, the
+    route remote servers already use) instead of writing it on the NFS share - 28 Oct 2026: under load each NFS save
+    took tens of seconds and remote detections reached the page 6-8 minutes late. True when the backend stored it."""
+    try:
+        import requests
+        rel = os.path.relpath(path, RESULTS_ROOT)
+        if rel.startswith(".."):
+            return False
+        s = getattr(_upload_local, "s", None)
+        if s is None:
+            s = _upload_local.s = requests.Session()
+        base = os.environ.get("MAIN_BACKEND_URL", "").rstrip("/")
+        r = s.post(f"{base}/fleet/frames", params={"path": rel}, data=data, timeout=15,
+                   headers={"X-API-Key": os.environ.get("API_KEY", ""), "Content-Type": "application/octet-stream"})
+        return r.status_code == 200
+    except Exception as e:
+        logger.warning(f"[Unified] image upload failed ({e}); writing it on the share instead")
+        return False
+
+
 def _write_jpeg(path, frame, fname):
     """ONE write: encode the JPEG with the EXIF gpu_id stamp in memory and write the bytes (before: imwrite, then the
     gateway re-opened the file and saved it again to add the stamp - three round trips on the NFS share per alert).
@@ -234,21 +264,27 @@ def _write_jpeg(path, frame, fname):
         exif[0x9286] = f"gpu_id={_DET_GPU_ID}"
         buf = io.BytesIO()
         img.save(buf, format="JPEG", exif=exif.tobytes())
-        with open(path, "wb") as f:
-            f.write(buf.getvalue())
+        if not (ALERT_UPLOAD_HTTP and _upload_jpeg(path, buf.getvalue())):
+            _ensure_dir(os.path.dirname(path))
+            with open(path, "wb") as f:
+                f.write(buf.getvalue())
         from utils import db_client
         db_client.mark_stamped(fname)
     except Exception:
+        _ensure_dir(os.path.dirname(path))
         cv2.imwrite(path, frame)
+
+
+def _ensure_dir(d):
+    if d not in _made_dirs:                    # one makedirs per folder, not one per alert
+        os.makedirs(d, exist_ok=True)
+        _made_dirs.add(d)
 
 
 def _do_save(frame, path, save_folder, folder, script_name, device_id, camera_no, exam_id, shift_id, source_type,
              violation_count, violation_chain, issue, fname):
     try:
-        if save_folder not in _made_dirs:                  # one makedirs per folder, not one per alert
-            os.makedirs(save_folder, exist_ok=True)
-            _made_dirs.add(save_folder)
-        _write_jpeg(path, frame, fname)
+        _write_jpeg(path, frame, fname)            # creates the folder only when it writes on the share
         try:
             if str(source_type).upper() == "HLS":
                 from utils.db_client import report_to_db_hls
