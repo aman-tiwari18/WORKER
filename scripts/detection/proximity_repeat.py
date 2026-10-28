@@ -31,7 +31,7 @@ import uuid
 logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPEAT_DIR = os.path.join(BASE_DIR, "results", "proximity_repeat")
+REPEAT_DIR = os.path.join(os.environ.get("LOCAL_STATE_ROOT", "").strip() or os.path.join(BASE_DIR, "results"), "proximity_repeat")   # LOCAL_STATE_ROOT: see invigilator_tracking.py
 
 # A person counts as "at the same spot" when the centre of their box moved by at
 # most this fraction of the box height (seated students barely move; YOLO jitter

@@ -38,8 +38,9 @@ COUNT_WINDOW_LEN = 5             # Median of the last N seated counts per camera
 
 # Own state dir so this analytic's timers never collide with the invigilator analytic's.
 # CROWD_FIVE_INVIGILATOR_STATE_DIR="" keeps the state in memory only.
+_STATE_ROOT = os.environ.get("LOCAL_STATE_ROOT", "").strip() or os.path.join(BASE_DIR, "results")   # see invigilator_tracking.py
 STATE_DIR = os.environ.get("CROWD_FIVE_INVIGILATOR_STATE_DIR",
-                           os.path.join(BASE_DIR, "results/crowd_five_invigilator_state"))
+                           os.path.join(_STATE_ROOT, "crowd_five_invigilator_state"))
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 if STATE_DIR:

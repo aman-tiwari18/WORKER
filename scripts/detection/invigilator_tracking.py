@@ -142,7 +142,13 @@ GALLERY_SIZE          = 3     # Anchor signature + the next confirmed matches, c
 # restart mid-shift keeps the 7-min timers. Each anchor also keeps its recent checkpoint results
 # (position, px moved from the anchor, colour distance, hit/miss) for review.
 # INVIGILATOR_STATE_DIR="" turns it off (state stays in memory only).
-STATE_DIR         = os.environ.get("INVIGILATOR_STATE_DIR", os.path.join(BASE_DIR, "results/invigilator_state"))
+# LOCAL_STATE_ROOT (28 Oct 2026): per-camera state files (read and rewritten for every camera, often) default to
+# results/<name>, which on a Fleet server is the NFS share of the main host. With 800 cameras on each of several
+# servers the person detectors waited on that share (stack dump: json.load in invigilator_tracking._load, Path.exists
+# in monitor_tamper.home_map) and did ~3 passes in 170 s. Set LOCAL_STATE_ROOT to a folder on the server's own disk
+# (e.g. /app/scripts/logs/state, a bind mount that survives a recreate) and these folders live there instead.
+_STATE_ROOT       = os.environ.get("LOCAL_STATE_ROOT", "").strip() or os.path.join(BASE_DIR, "results")
+STATE_DIR         = os.environ.get("INVIGILATOR_STATE_DIR", os.path.join(_STATE_ROOT, "invigilator_state"))
 STATE_HISTORY_LEN = 20        # Checkpoint results kept per anchor
 # Saved anchors that started before this epoch time are ignored when a tracker is created (0 = keep all).
 # 13 Oct 2026: set at deploy time to drop the anchors the old soft rule put on seated candidates.

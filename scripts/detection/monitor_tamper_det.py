@@ -59,7 +59,7 @@ THRESHOLDS_RFDETR = {"person": 0.475, "monitor": 0.50}   # monitor 0.45 -> 0.50 
 # Fine-tuned YOLO26m (models/monitor_person_yolo26m.pt, same classes), selected with
 # UNIFIED_MONITOR_MODEL=yolo26m. Best-F1 thresholds from the model's test split.
 THRESHOLDS = {"person": 0.425, "monitor": 0.35}
-HOMES_DIR = os.path.join(BASE_DIR, "results", "monitor_tamper_homes")
+HOMES_DIR = os.path.join(os.environ.get("LOCAL_STATE_ROOT", "").strip() or os.path.join(BASE_DIR, "results"), "monitor_tamper_homes")   # LOCAL_STATE_ROOT: see invigilator_tracking.py
 ALERTS_DIR = os.path.join(BASE_DIR, "results", "monitor_tamper_alerts")
 # Debug: every frame this analytic checks, annotated with what it saw, whether or not it
 # alerted. OFF by default (6 Oct 2026: ~360k frames / ~65 GB per exam day filled /data, and
