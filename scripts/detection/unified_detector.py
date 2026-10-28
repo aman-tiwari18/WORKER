@@ -207,13 +207,67 @@ def class_from_result(result, class_ids, conf=CONF_THRESHOLD):
 # ============================================================
 # Reporting helper (shared by all evaluators)
 # ============================================================
+# Saving an alert = create the folder, write the JPEG, stamp the GPU id into its EXIF (re-opens and rewrites the file),
+# report it to the database. On a Fleet server the results folder is the NFS share of the main host, and a batch of
+# frames can hold dozens of alerts, so doing this inside the detector loop made the person detectors of the remote
+# servers wait on NFS (28 Oct 2026 stack dumps: _save_and_report -> makedirs / imwrite / _embed -> PIL open+save;
+# 3 passes in 170 s, GPU 0 %, 96 frames dropped as stale). The loop now only queues the job; a small thread pool
+# does the I/O. UNIFIED_SAVE_THREADS=0 restores the old inline behaviour.
+SAVE_THREADS = int(os.environ.get("UNIFIED_SAVE_THREADS", "8"))
+SAVE_MAX_PENDING = int(os.environ.get("UNIFIED_SAVE_MAX_PENDING", "500"))   # more waiting than this: save inline (backpressure)
+_save_pool = None
+_save_pending = {"n": 0}
+_save_lock = threading.Lock()
+_made_dirs = set()
+
+
+def _do_save(frame, path, save_folder, folder, script_name, device_id, camera_no, exam_id, shift_id, source_type,
+             violation_count, violation_chain, issue, fname):
+    try:
+        if save_folder not in _made_dirs:                  # one makedirs per folder, not one per alert
+            os.makedirs(save_folder, exist_ok=True)
+            _made_dirs.add(save_folder)
+        cv2.imwrite(path, frame)
+        try:
+            if str(source_type).upper() == "HLS":
+                from utils.db_client import report_to_db_hls
+                report_to_db_hls(ch_code=str(camera_no), image_name=fname, folder=folder,
+                                 violation_count=violation_count, violation_chain=violation_chain)
+            else:
+                from utils.db_client import report_to_db_rtsp
+                report_to_db_rtsp(device_id=str(device_id), camera_no=str(camera_no),
+                                  image_name=fname, folder=folder,
+                                  violation_count=violation_count, violation_chain=violation_chain)
+        except Exception as e:
+            logger.error(f"[Unified] DB report error ({script_name}): {e}")
+        logger.warning(f"[Unified] 🚨 {script_name} saved → {path}")
+    except Exception as e:
+        logger.error(f"[Unified] could not save {script_name} alert {path}: {e}")
+
+
+def _wait_saves(timeout_s):
+    """Wait (at most timeout_s) until every queued alert has been written."""
+    end = time.time() + timeout_s
+    while _save_pending["n"] > 0 and time.time() < end:
+        time.sleep(0.1)
+    if _save_pending["n"] > 0:
+        logger.warning(f"[Unified] {_save_pending['n']} alert(s) were still being written when the worker stopped")
+
+
+def _done(_fut):
+    with _save_lock:
+        _save_pending["n"] -= 1
+
+
 def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
                      exam_id, shift_id, source_type="RTSP", violation_count=None,
                      violation_chain=None, issue=""):
     """Save the annotated detection and report it, using the schema-correct identifier:
        - RTSP: device_id + camera_no  (filename `{dev}_{camera_no}`, report_to_db_rtsp)
        - HLS : ch_code (= camera_no)  (filename `ch{ch_code}`,        report_to_db_hls)
-    Matches the convention used by the per-script workers."""
+    Matches the convention used by the per-script workers. The file and the report are written by a writer
+    pool (see SAVE_THREADS), not by the caller."""
+    global _save_pool
     ts = time.strftime("%Y%m%d_%H%M%S")
     uid = str(uuid.uuid4())
     # Event of the alert (invigilator: static_person / no_targets) sits in the name, after the gpu token,
@@ -226,23 +280,22 @@ def _save_and_report(frame, *, folder, script_name, device_id, camera_no,
     else:
         save_folder = os.path.join(RESULTS_ROOT, folder)
         fname = f"{script_name}_{device_id}_{camera_no}_exam{exam_id}_shift{shift_id}_gpu{_DET_GPU_ID}{issue_tok}_{ts}_{uid}.jpg"
-
-    os.makedirs(save_folder, exist_ok=True)
     path = os.path.join(save_folder, fname)
-    cv2.imwrite(path, frame)
-    try:
-        if str(source_type).upper() == "HLS":
-            from utils.db_client import report_to_db_hls
-            report_to_db_hls(ch_code=str(camera_no), image_name=fname, folder=folder,
-                             violation_count=violation_count, violation_chain=violation_chain)
-        else:
-            from utils.db_client import report_to_db_rtsp
-            report_to_db_rtsp(device_id=str(device_id), camera_no=str(camera_no),
-                              image_name=fname, folder=folder,
-                              violation_count=violation_count, violation_chain=violation_chain)
-    except Exception as e:
-        logger.error(f"[Unified] DB report error ({script_name}): {e}")
-    logger.warning(f"[Unified] 🚨 {script_name} saved → {path}")
+    args = (path, save_folder, folder, script_name, device_id, camera_no, exam_id, shift_id, source_type,
+            violation_count, violation_chain, issue, fname)
+
+    if SAVE_THREADS <= 0 or _save_pending["n"] >= SAVE_MAX_PENDING:
+        _do_save(frame, *args)
+        return
+    if _save_pool is None:
+        with _save_lock:
+            if _save_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                _save_pool = ThreadPoolExecutor(max_workers=SAVE_THREADS, thread_name_prefix="alert-save")
+    with _save_lock:
+        _save_pending["n"] += 1
+    # the detector reuses/annotates frames after this call returns: the writer gets its own copy
+    _save_pool.submit(_do_save, frame.copy(), *args).add_done_callback(_done)
 
 
 # ============================================================
@@ -757,5 +810,6 @@ def unified_worker(frame_queue, scripts=None, session=None):
             break
 
     _flush_stateful(states, None)
+    _wait_saves(10.0)                       # alerts still being written (see _save_and_report)
     pool.shutdown(wait=False)
     logger.info(f"🔴 {tag} worker stopped")
