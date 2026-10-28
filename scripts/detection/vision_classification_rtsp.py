@@ -103,9 +103,9 @@ PASS1_CAPTURE:         int = int(os.getenv("VISION_PASS1_CAPTURE", "128"))      
 MAX_PER_DEVICE:        int = int(os.getenv("VISION_MAX_PER_DEVICE", "4"))           # simultaneous checks per DVR (device_id); 0 = no cap
 MAX_PER_CAMVIEW_HOST:  int = int(os.getenv("VISION_MAX_PER_CAMVIEW_HOST", "48"))    # per Camview server (cctv_url host); 0 = no cap
 PASS1_RETRY:           bool = os.getenv("VISION_PASS1_RETRY", "1").strip().lower() in ("1", "true", "yes")
-PASS1_RETRY_NETWORK:   int = int(os.getenv("VISION_PASS1_RETRY_NETWORK", "48"))     # second look: fewer at once ...
-PASS1_RETRY_PER_DEVICE: int = int(os.getenv("VISION_PASS1_RETRY_PER_DEVICE", "2"))  # ... and gentler on each DVR
-PASS1_RETRY_PER_HOST:  int = int(os.getenv("VISION_PASS1_RETRY_PER_HOST", "16"))
+PASS1_RETRY_NETWORK:   int = int(os.getenv("VISION_PASS1_RETRY_NETWORK", "128"))    # second look: only the failed cameras (mostly really offline) ...
+PASS1_RETRY_PER_DEVICE: int = int(os.getenv("VISION_PASS1_RETRY_PER_DEVICE", "2"))  # ... still gentle on each DVR (2)
+PASS1_RETRY_PER_HOST:  int = int(os.getenv("VISION_PASS1_RETRY_PER_HOST", "48"))
 _PASS1_SEMS: Dict[tuple, "asyncio.Semaphore"] = {}
 _P1_CAP_SEM: Optional["asyncio.Semaphore"] = None
 
