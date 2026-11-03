@@ -74,9 +74,9 @@ workers. It needs no GPU.
 - **Camera split:** `UPTIME_SHARD_COUNT=0` (auto). Each checker heartbeats into `camera_uptime_instances` and
   takes its place among the live ones, so adding, stopping or removing a server rebalances the DVRs within
   about a minute. A DVR is always checked by exactly one server, so the per-DVR pacing holds fleet-wide.
-- **Database:** tables come from backend migration `051_camera_uptime.sql`. Servers log in as the
-  least-privilege user from the backend `.env` (`UPTIME_DB_USER` / `UPTIME_DB_PASSWORD`, optional
-  `UPTIME_DB_HOST` / `UPTIME_DB_PORT`). Without `UPTIME_DB_USER` the backend hands out no checker.
+- **Database:** tables come from backend migration `051_camera_uptime.sql`, in the same database as everything
+  else. Servers log in with the backend's own `DB_USER` / `DB_PASSWORD`. Override them with `UPTIME_DB_USER` /
+  `UPTIME_DB_PASSWORD`, and set `UPTIME_DB_HOST` / `UPTIME_DB_PORT` (default 192.168.19.30:3308) if needed.
 - **Pacing:** Fleet settings `UPTIME_RTSP_STREAM_TYPE` (2), `UPTIME_MAX_INFLIGHT_PER_SERVER` (6),
   `UPTIME_DVR_MIN_GAP_S` (15), `UPTIME_MAX_NEW_STREAMS_PER_MIN` (100) override the defaults in brackets.
 - **Frames:** written to the shared frames folder under `uptime_frames/`. The backend reads them there
