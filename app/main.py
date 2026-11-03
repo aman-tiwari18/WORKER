@@ -2555,6 +2555,12 @@ async def copy_client_detections(payload: ClientDetectionCopyRequest):
                         "pushed_at": _feed_iso(pushed_at_dt),
                         "created_at": _feed_iso(row.get("created_at")),
                     })
+                    # Region (RTSP only) so the client page's live region filter can keep this push.
+                    if item.source == "rtsp" and row.get("tc_code"):
+                        _get_region_map()
+                        reg = _region_cache["centres"].get(f"{row.get('exam_id')}|{str(row.get('tc_code')).strip()}")
+                        if reg:
+                            copied_item["region"] = reg
                     copied.append(copied_item)
                     
             shift_name_map = _shift_names_for_ids(item.get("shift_id") for item in copied)

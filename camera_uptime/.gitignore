@@ -1,0 +1,7 @@
+.env
+venv/
+spool/
+PAUSE
+.camera-uptime.lock
+__pycache__/
+.pytest_cache/

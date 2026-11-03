@@ -1,0 +1,9 @@
+# Camera uptime checker — deliberately small: no OpenCV, torch or vLLM (no classification here).
+# Frames are grabbed with the system ffmpeg (>= 6.1 on the main VM).
+PyMySQL==1.1.1
+# needed by PyMySQL for MySQL 8 caching_sha2_password logins
+cryptography>=42
+requests==2.32.5
+python-dotenv==1.0.1
+Pillow>=10.4,<12
+pytest>=8,<9

@@ -68,6 +68,43 @@ services:
               device_ids: ['0']
               capabilities: [gpu]
 
+  # Camera uptime checker (camera_uptime/ in this image): during live shifts it captures one frame per scheduled
+  # camera and records UP / DOWN per shift. CPU only, no GPU. Every Fleet server runs one; they split the DVRs
+  # among themselves (auto sharding). Switched on/off with the Fleet setting UPTIME_ENABLED (default off).
+  camera-uptime:
+    image: ${IMAGE:-cctv-worker}:${IMAGE_TAG:-uat}
+    container_name: cctv_uat_camera_uptime
+    restart: unless-stopped
+    env_file: .env                  # DB_* (direct, cctvv2_mysql), CAMVIEW_TOKEN_SERVER, Fleet settings block
+    working_dir: /app/camera_uptime
+    entrypoint: ["python", "run.py", "run"]
+    command: []
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+      UPTIME_ENABLED: ${UPTIME_ENABLED:-0}
+      UPTIME_WORKER_ID: worker-uat
+      UPTIME_SHARD_COUNT: "0"       # auto: share the DVRs with the other servers' checkers
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "8096"             # 8095 is the old setup's checker on this host
+      FRAMES_ROOT: /app/scripts/detection/results/uptime_frames
+      SPOOL_DIR: /app/scripts/logs/uptime-spool
+      LOCK_FILE: /tmp/camera-uptime.lock
+      PAUSE_FILE: /app/scripts/logs/UPTIME_PAUSE
+    ports:
+      - "127.0.0.1:8096:8096"       # the backend's Camera Uptime page reads /status here
+    volumes:
+      - ./scripts/logs:/app/scripts/logs
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ${FRAMES_HOST_PATH:-./results}:/app/scripts/detection/results
+    healthcheck:                    # the image's own check is nvidia-smi; this container has no GPU
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8096/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks: [cctvv2_net]
+
 networks:
   # the new-stack network created by backend/infra/docker-compose.yml (MySQL/Redis)
   cctvv2_net:
