@@ -77,6 +77,9 @@ class Settings:
     dvr_capacity_backoff_s: float = 60.0
     token_backoff_s: float = 400.0
     tcs_block_pause_s: float = 1800.0
+    # A lane whose pass ran this long may start the next one while only refusing DVRs still have cameras
+    # left; those carry over (unchecked first) instead of holding back every other DVR of the lane.
+    carry_over_after_s: float = 600.0
 
     # Sharding: one instance per worker, each checks only the DVRs whose hash falls on its index
     # (a DVR is always handled by exactly one instance, so the per-DVR pacing stays valid fleet-wide).
@@ -155,6 +158,7 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         dvr_capacity_backoff_s=_float("DVR_CAPACITY_BACKOFF_S", 60.0),
         token_backoff_s=_float("TOKEN_BACKOFF_S", 400.0),
         tcs_block_pause_s=_float("TCS_BLOCK_PAUSE_S", 1800.0),
+        carry_over_after_s=max(60.0, _float("CARRY_OVER_AFTER_S", 600.0)),
         start_hold_min=_int("START_HOLD_MIN", 5),
         max_window_hours=_int("MAX_WINDOW_HOURS", 16),
         schedule_refresh_s=max(10, _int("SCHEDULE_REFRESH_S", 60)),

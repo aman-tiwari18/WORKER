@@ -8,7 +8,8 @@ Rules (all must hold for a camera to start):
   * neither the lane nor the DVR is paused / backing off, and the whole checker is not paused
 Order: round-robin across DVRs inside a lane; inside a DVR, the camera checked longest ago first
 (across shifts too, so cameras missed in one shift go first in the next). A pass ends when every
-camera of the lane was checked once.
+camera of the lane was checked once, or, after CARRY_OVER_AFTER_S, when only lagging DVRs (refusing
+sessions / unreachable in this pass) still have cameras left: those carry over into the next pass.
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ class DvrState:
     backoff_until: float = 0.0
     backoff_reason: str = ""
     last_up: float = -1e18
+    lag_pass: int = 0  # lane pass in which the DVR last refused a session / was unreachable
 
 
 @dataclass
@@ -53,6 +55,7 @@ class LaneState:
     counts: collections.Counter = field(default_factory=collections.Counter)
     avg_check_s: float = 0.0
     last_pass_s: float | None = None
+    carried: int = 0  # cameras carried into this pass from lagging DVRs
 
 
 class Scheduler:
@@ -79,7 +82,7 @@ class Scheduler:
     @staticmethod
     def _copy_lane(prev: LaneState, lane: LaneState) -> None:
         for f in ("paused_until", "pause_reason", "pass_no", "pass_started", "pass_checks",
-                  "counts", "avg_check_s", "last_pass_s"):
+                  "counts", "avg_check_s", "last_pass_s", "carried"):
             setattr(lane, f, getattr(prev, f))
 
     def set_cameras(self, cams: dict[str, Camera], last_checked: dict[str, float] | None = None) -> None:
@@ -109,6 +112,7 @@ class Scheduler:
                     if prev is not None:
                         dvr.last_start, dvr.last_up = prev.last_start, prev.last_up
                         dvr.backoff_until, dvr.backoff_reason = prev.backoff_until, prev.backoff_reason
+                        dvr.lag_pass = prev.lag_pass
                     lane.dvrs[cam.dvr_key] = dvr
                 dvr.cams.append(key)
             for name, lane in lanes.items():
@@ -157,7 +161,7 @@ class Scheduler:
                     continue
                 if lane.kind == "rtsp" and len(self._starts) >= self.s.max_new_streams_per_min:
                     continue
-                if not lane.pending:
+                if not lane.pending or self._only_laggards_left(lane, now):
                     self._next_pass(lane, now)
                     if not lane.pending:
                         continue
@@ -192,19 +196,39 @@ class Scheduler:
                     return cam
         return None
 
+    def _lagging(self, lane: LaneState, d: DvrState, now: float) -> bool:
+        return now < d.backoff_until or d.lag_pass == lane.pass_no
+
+    def _only_laggards_left(self, lane: LaneState, now: float) -> bool:
+        """The pass ran CARRY_OVER_AFTER_S and only lagging DVRs still have cameras pending / in flight,
+        while at least one other DVR is done and waiting for the next pass."""
+        if not lane.pending or now - lane.pass_started < self.s.carry_over_after_s:
+            return False
+        waiting = False
+        for d in lane.dvrs.values():
+            busy = d.inflight or any(k in lane.pending for k in d.cams)
+            if not self._lagging(lane, d, now):
+                if busy:
+                    return False
+                waiting = True
+        return waiting
+
     def _next_pass(self, lane: LaneState, now: float) -> None:
-        if lane.inflight:
+        carry = len(lane.pending)
+        if lane.inflight and not carry:
             return  # let the last checks of this pass finish first
         lane.last_pass_s = now - lane.pass_started
-        log.info("Lane %s pass %d done: %d checks in %.0f s (%s)", lane.name, lane.pass_no, lane.pass_checks,
-                 lane.last_pass_s, dict(lane.counts))
+        log.info("Lane %s pass %d done: %d checks in %.0f s (%s)%s", lane.name, lane.pass_no, lane.pass_checks,
+                 lane.last_pass_s, dict(lane.counts),
+                 f", {carry} cameras of lagging DVRs carried over" if carry else "")
+        lane.carried = carry
         lane.pass_no += 1
         lane.pass_started = now
         lane.pass_checks = 0
         lane.counts = collections.Counter()
         lane.requeued = set()
         self._order(lane)
-        lane.pending = {k for d in lane.dvrs.values() for k in d.cams}
+        lane.pending = {k for d in lane.dvrs.values() for k in d.cams if k not in self.inflight}
 
     # ------------------------------------------------------------------ results
     def release(self, key: str) -> None:
@@ -241,6 +265,7 @@ class Scheduler:
             if dvr is not None and reason in ("dvr_unavailable", "dvr_capacity"):
                 secs = self.s.dvr_unavailable_backoff_s if reason == "dvr_unavailable" else self.s.dvr_capacity_backoff_s
                 dvr.backoff_until, dvr.backoff_reason = now + secs, reason
+                dvr.lag_pass = lane.pass_no
                 events.append(("dvr", dvr.key, "backoff", reason, {"seconds": secs}))
             elif reason == "token_unavailable":
                 events += self._pause_lane(lane, now, self.s.token_backoff_s, reason)
@@ -356,6 +381,7 @@ class Scheduler:
                     "avg_check_s": round(ln.avg_check_s, 2),
                     "eta_pass_s": round(eta) if eta is not None else None,
                     "counts": dict(ln.counts),
+                    "carried": ln.carried,
                 })
             paused_s = self.paused_seconds + (now - self._pause_since if self._pause_since is not None else 0.0)
             return {

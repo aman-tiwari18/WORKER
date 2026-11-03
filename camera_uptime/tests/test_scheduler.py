@@ -143,3 +143,49 @@ def test_only_servers_and_hls_lane():
     assert sorted(s.lanes) == ["d11", "hls"] and s.lanes["hls"].max_inflight == 1
     lanes = {s.next_job()[0], s.next_job()[0]}
     assert lanes == {"d11", "hls"}
+
+
+def test_lagging_dvr_carries_over_instead_of_holding_the_lane():
+    clock = Clock()
+    good = [cam("d14", "A", "1"), cam("d14", "A", "2")]
+    bad = [cam("d14", "B", str(i)) for i in range(1, 13)]
+    s = make(good + bad, clock, dvr_min_gap_s=15.0, dvr_capacity_backoff_s=60.0, carry_over_after_s=600.0)
+    checked, carried = {}, 0
+    for _ in range(160):  # 40 min of a DVR that refuses every session
+        clock.t += 15
+        job = s.next_job()
+        if job is None:
+            continue
+        _, c = job
+        checked[c.key] = checked.get(c.key, 0) + 1
+        if c.dvr_key.endswith("|B"):
+            s.done(c.key, "UNKNOWN", "dvr_capacity", 1.0, clock.t)
+        else:
+            s.done(c.key, "UP", "ok", 1.0, clock.t)
+        carried = max(carried, s.status()["lanes"][0]["carried"])
+    assert s.status()["lanes"][0]["pass"] >= 2 and carried > 0
+    assert all(checked[c.key] >= 2 for c in good)  # the healthy DVR got its next pass
+    assert all(c.key in checked for c in bad)  # every camera of the refusing DVR still reached
+
+
+def test_no_carry_over_before_the_minimum_pass_time_or_without_a_waiting_dvr():
+    clock = Clock()
+    s = make([cam("d14", "A", "1"), cam("d14", "B", "1"), cam("d14", "B", "2")], clock,
+             dvr_capacity_backoff_s=300.0, carry_over_after_s=600.0, max_inflight_per_server=2)
+    jobs = [s.next_job(), s.next_job()]
+    for _, c in jobs:
+        s.done(c.key, "UNKNOWN" if c.dvr_key.endswith("|B") else "UP",
+               "dvr_capacity" if c.dvr_key.endswith("|B") else "ok", 1.0, clock.t)
+    clock.t += 120
+    assert s.next_job() is None and s.status()["lanes"][0]["pass"] == 1  # 2 min: B still owes a camera
+    clock.t += 500
+    s.next_job()
+    assert s.status()["lanes"][0]["pass"] == 2  # 10 min: A goes again, B's camera carried
+
+    only_bad = make([cam("d15", "B", "1"), cam("d15", "B", "2")], Clock(), dvr_capacity_backoff_s=300.0,
+                    carry_over_after_s=600.0)
+    _, c = only_bad.next_job()
+    only_bad.done(c.key, "UNKNOWN", "dvr_capacity", 1.0, 1.0)
+    only_bad._clock.t += 700
+    only_bad.next_job()
+    assert only_bad.status()["lanes"][0]["pass"] == 1  # nobody waiting: no empty pass churn
