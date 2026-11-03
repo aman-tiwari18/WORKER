@@ -86,6 +86,11 @@ services:
       UPTIME_SHARD_COUNT: "0"       # auto: share the DVRs with the other servers' checkers
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: "8096"             # 8095 is the old setup's checker on this host
+      # same pacing as the Fleet servers' block (backend/src/services/fleetUptime.js); Fleet settings override
+      RTSP_STREAM_TYPE: ${UPTIME_RTSP_STREAM_TYPE:-2}
+      MAX_INFLIGHT_PER_SERVER: ${UPTIME_MAX_INFLIGHT_PER_SERVER:-6}
+      DVR_MIN_GAP_S: ${UPTIME_DVR_MIN_GAP_S:-15}
+      MAX_NEW_STREAMS_PER_MIN: ${UPTIME_MAX_NEW_STREAMS_PER_MIN:-100}
       FRAMES_ROOT: /app/scripts/detection/results/uptime_frames
       SPOOL_DIR: /app/scripts/logs/uptime-spool
       LOCK_FILE: /tmp/camera-uptime.lock
