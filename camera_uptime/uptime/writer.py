@@ -14,6 +14,8 @@ import time
 from datetime import date, datetime
 from pathlib import Path
 
+from . import promote
+
 log = logging.getLogger("uptime.writer")
 
 CHECK_SQL = """
@@ -158,6 +160,7 @@ class Writer(threading.Thread):
     def _write(self, batch: list) -> None:
         conn = self.db.conn()
         conn.begin()
+        promotes = [rec for kind, rec in batch if kind == "promote"]
         try:
             with conn.cursor() as cur:
                 for kind, rec in batch:
@@ -179,6 +182,25 @@ class Writer(threading.Thread):
             except Exception:
                 pass
             raise
+        if promotes:
+            self._promote(conn, promotes)
+
+    def _promote(self, conn, recs: list) -> None:
+        """Cameras-tab updates, in their own transaction: a failure here never costs an uptime check."""
+        try:
+            conn.begin()
+            with conn.cursor() as cur:
+                for rec in recs:
+                    promote.apply(cur, rec)
+            conn.commit()
+            self.stats["promoted"] += len(recs)
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self.stats["promote_errors"] += len(recs)
+            log.error("Cameras-tab update failed for %d camera(s): %s", len(recs), e)
 
     def _flush(self, batch: list) -> None:
         try:

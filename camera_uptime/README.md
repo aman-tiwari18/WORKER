@@ -19,7 +19,8 @@ writes `camera_links_*` or `camera_classification_*`. It imports nothing from `s
 
 **Pacing**
 - One camera at a time per Camview server (`MAX_INFLIGHT_PER_SERVER`), plus one HLS lane.
-- At most one check per DVR, with at least `DVR_MIN_GAP_S` between checks on the same DVR.
+- At most `MAX_INFLIGHT_PER_DVR` checks at a time per DVR, with at least `DVR_MIN_GAP_S` between check
+  starts on the same DVR.
 - At most `MAX_NEW_STREAMS_PER_MIN` new RTSP streams per minute overall.
 - At most `HLS_REQ_PER_S` HTTP requests per second to TCS.
 
@@ -77,10 +78,13 @@ workers. It needs no GPU.
 - **Database:** tables come from backend migration `051_camera_uptime.sql`, in the same database as everything
   else. Servers log in with the backend's own `DB_USER` / `DB_PASSWORD`. Override them with `UPTIME_DB_USER` /
   `UPTIME_DB_PASSWORD`, and set `UPTIME_DB_HOST` / `UPTIME_DB_PORT` (default 192.168.19.30:3308) if needed.
-- **Pacing:** Fleet settings `UPTIME_RTSP_STREAM_TYPE` (2), `UPTIME_MAX_INFLIGHT_PER_SERVER` (6),
-  `UPTIME_DVR_MIN_GAP_S` (15), `UPTIME_MAX_NEW_STREAMS_PER_MIN` (100) override the defaults in brackets.
+- **Pacing:** Fleet settings `UPTIME_RTSP_STREAM_TYPE` (2), `UPTIME_MAX_INFLIGHT_PER_SERVER` (8),
+  `UPTIME_MAX_INFLIGHT_PER_DVR` (2), `UPTIME_DVR_MIN_GAP_S` (0), `UPTIME_MAX_NEW_STREAMS_PER_MIN` (250),
+  `UPTIME_CARRY_OVER_AFTER_S` (300) and `UPTIME_FRAME_SAVE_THREADS` (8) override the defaults in brackets.
 - **Frames:** written to the shared frames folder under `uptime_frames/`. The backend reads them there
   (`FRAMES_DIR/uptime_frames`).
+- **Cameras tab:** a labelled RTSP camera found UP is marked Accessible with its new frame
+  (`uptime/promote.py`), saved under `classification_frames/uptime/`. `PROMOTE_TO_CAMERAS=0` turns this off.
 
 Local run, outside Docker: `pip install -r requirements.txt`, then `python run.py run` with `DB_*` (or
 `UPTIME_DB_*`) and `CAMVIEW_TOKEN_SERVER` set.

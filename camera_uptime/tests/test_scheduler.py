@@ -189,3 +189,14 @@ def test_no_carry_over_before_the_minimum_pass_time_or_without_a_waiting_dvr():
     only_bad._clock.t += 700
     only_bad.next_job()
     assert only_bad.status()["lanes"][0]["pass"] == 1  # nobody waiting: no empty pass churn
+
+
+def test_max_inflight_per_dvr():
+    clock = Clock()
+    s = make([cam("d14", "A", str(i)) for i in range(1, 5)], clock, dvr_min_gap_s=0.0,
+             max_inflight_per_server=6, max_inflight_per_dvr=2)
+    a, b = s.next_job(), s.next_job()
+    assert a and b and a[1].key != b[1].key
+    assert s.next_job() is None  # DVR A already has 2 in flight
+    s.done(a[1].key, "UP", "ok", 1.0, clock.t)
+    assert s.next_job() is not None

@@ -88,10 +88,15 @@ services:
       HTTP_PORT: "8096"             # 8095 is the old setup's checker on this host
       # same pacing as the Fleet servers' block (backend/src/services/fleetUptime.js); Fleet settings override
       RTSP_STREAM_TYPE: ${UPTIME_RTSP_STREAM_TYPE:-2}
-      MAX_INFLIGHT_PER_SERVER: ${UPTIME_MAX_INFLIGHT_PER_SERVER:-6}
-      DVR_MIN_GAP_S: ${UPTIME_DVR_MIN_GAP_S:-15}
-      MAX_NEW_STREAMS_PER_MIN: ${UPTIME_MAX_NEW_STREAMS_PER_MIN:-100}
+      MAX_INFLIGHT_PER_SERVER: ${UPTIME_MAX_INFLIGHT_PER_SERVER:-8}
+      MAX_INFLIGHT_PER_DVR: ${UPTIME_MAX_INFLIGHT_PER_DVR:-2}
+      DVR_MIN_GAP_S: ${UPTIME_DVR_MIN_GAP_S:-0}
+      MAX_NEW_STREAMS_PER_MIN: ${UPTIME_MAX_NEW_STREAMS_PER_MIN:-250}
+      CARRY_OVER_AFTER_S: ${UPTIME_CARRY_OVER_AFTER_S:-300}
+      FRAME_SAVE_THREADS: ${UPTIME_FRAME_SAVE_THREADS:-8}
       FRAMES_ROOT: /app/scripts/detection/results/uptime_frames
+      # UP + labelled RTSP camera -> Cameras tab (Accessible + frame); the backend resolves the part after /classification_frames/
+      CLASSIFICATION_FRAMES_ROOT: /app/scripts/detection/results/classification_frames
       SPOOL_DIR: /app/scripts/logs/uptime-spool
       LOCK_FILE: /tmp/camera-uptime.lock
       PAUSE_FILE: /app/scripts/logs/UPTIME_PAUSE

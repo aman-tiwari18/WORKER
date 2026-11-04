@@ -10,10 +10,11 @@ import socket
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from . import runs
+from . import promote, runs
 from .api import start_api
 from .camview import Camview, TokenClient
 from .capture import Ffmpeg, frame_rel_path, save_frame
@@ -71,6 +72,10 @@ class Service:
         self._runs_lock = threading.Lock()
         self.stop = threading.Event()
         self.workers: list[threading.Thread] = []
+        # Frame save + result record run here, so a slow NFS write never holds a check thread.
+        self.recorder = ThreadPoolExecutor(max_workers=s.frame_save_threads, thread_name_prefix="uptime-record")
+        self._record_backlog = 0
+        self._backlog_lock = threading.Lock()
         self.started_at = now_ist()
         self.recent: collections.deque = collections.deque(maxlen=30)
         self._last_checked_seed: dict[str, float] = {}
@@ -130,6 +135,7 @@ class Service:
         deadline = time.monotonic() + 15
         for t in self.workers:
             t.join(max(0.1, deadline - time.monotonic()))
+        self.recorder.shutdown(wait=True)  # finish saving and recording the checks already done
         killed = self.ffmpeg.kill_all()
         if killed:
             log.info("Killed %d ffmpeg process(es)", killed)
@@ -313,7 +319,7 @@ class Service:
     # ------------------------------------------------------------------ workers
     def _ensure_workers(self) -> None:
         lanes = self.sched.status()["lanes"]
-        want = min(32, sum(ln["max_inflight"] for ln in lanes))
+        want = min(64, sum(ln["max_inflight"] for ln in lanes))
         while len(self.workers) < want:
             t = threading.Thread(target=self._worker, name=f"uptime-worker-{len(self.workers) + 1}", daemon=True)
             self.workers.append(t)
@@ -349,7 +355,26 @@ class Service:
             self.sched.done(cam.key, res.result, res.reason, res.total_ms / 1000.0, started.timestamp())
             if res.reason == "stopped":
                 continue
+            with self._backlog_lock:
+                self._record_backlog += 1
+            self.recorder.submit(self._record_safe, cam, targets, started, res)
+
+    def _record_safe(self, cam: Camera, targets: list[RunState], started: datetime, res: CheckResult) -> None:
+        try:
             self._record(cam, targets, started, res)
+        except Exception:
+            log.exception("recording the check of %s failed", cam.key)
+        finally:
+            with self._backlog_lock:
+                self._record_backlog -= 1
+
+    def _promote(self, rs: RunState, camera_row_id: int, cam: Camera, jpeg: bytes) -> None:
+        rel = promote.frame_name(rs.w.exam_id, rs.w.exam_date, rs.w.shift_id, cam.key)
+        if not save_frame(self.s.classification_frames_root, rel, jpeg):
+            return
+        self.writer.submit("promote", {"camera_row_id": camera_row_id, "shift_id": rs.w.shift_id,
+                                       "exam_date": rs.w.exam_date,
+                                       "frame_path": f"{self.s.classification_frames_root.rstrip('/')}/{rel}"})
 
     def _record(self, cam: Camera, targets: list[RunState], started: datetime, res: CheckResult) -> None:
         for rs in targets:
@@ -359,6 +384,9 @@ class Service:
                 rel = frame_rel_path(rs.w.exam_id, rs.w.exam_date, rs.w.shift_id, cam.key)
                 if save_frame(self.s.frames_root, rel, res.jpeg):
                     frame_path = rel
+            if (res.result == UP and res.jpeg and self.s.promote_to_cameras and cam.link_type == "RTSP"
+                    and m.camera_row_id):
+                self._promote(rs, m.camera_row_id, cam, res.jpeg)
             self.writer.submit("check", {
                 "check_uuid": str(uuid.uuid4()), "run_id": rs.run_id, "exam_id": rs.w.exam_id,
                 "shift_id": rs.w.shift_id, "exam_date": rs.w.exam_date, "link_type": cam.link_type,
@@ -398,5 +426,6 @@ class Service:
                 "shard": {"index": self.shard.shard_index, "count": self.shard.shard_count, "auto": self.s.shard_auto},
                 "runs": live, "scheduler": self.sched.status(),
                 "stream_ports": self.camview.ports(), "writer": dict(self.writer.stats),
-                "writer_queue": self.writer.q.qsize(), "db_last_error": self.writer.last_error,
+                "writer_queue": self.writer.q.qsize(), "record_backlog": self._record_backlog,
+                "db_last_error": self.writer.last_error,
                 "token_server_ok": self._token_ok, "recent": list(self.recent)[:20]}

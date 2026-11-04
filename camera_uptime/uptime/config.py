@@ -68,6 +68,8 @@ class Settings:
     # Pacing and backoffs
     max_inflight_per_server: int = 1
     dvr_min_gap_s: float = 60.0
+    max_inflight_per_dvr: int = 1
+    frame_save_threads: int = 8  # frames are saved off the check threads (NFS can be slow)
     max_new_streams_per_min: int = 20
     hls_req_per_s: float = 0.5  # THIS instance's rate (the fleet-wide HLS_REQ_PER_S divided by shard_count)
     hls_req_per_s_fleet: float = 0.5  # the fleet-wide rate; auto sharding divides it by the live instance count
@@ -107,6 +109,9 @@ class Settings:
     blank_check: bool = True
     save_frames: bool = True
     frames_root: str = "/data/nfs/cctv_images/uptime_frames"
+    # UP + already labelled RTSP camera -> Accessible + newest frame in the Cameras tab (uptime/promote.py)
+    promote_to_cameras: bool = True
+    classification_frames_root: str = "/data/nfs/cctv_images/classification_frames"
 
     # Ops
     http_host: str = "127.0.0.1"
@@ -147,6 +152,8 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         stop_video=_bool("STOP_VIDEO", False),
         max_inflight_per_server=max(1, _int("MAX_INFLIGHT_PER_SERVER", 1)),
         dvr_min_gap_s=_float("DVR_MIN_GAP_S", 60.0),
+        max_inflight_per_dvr=max(1, _int("MAX_INFLIGHT_PER_DVR", 1)),
+        frame_save_threads=max(1, _int("FRAME_SAVE_THREADS", 8)),
         max_new_streams_per_min=max(1, _int("MAX_NEW_STREAMS_PER_MIN", 20)),
         # HLS_REQ_PER_S is the fleet-wide rate (TCS: never more than 1/s from the shared egress IP);
         # every shard takes its equal part.
@@ -171,6 +178,8 @@ def load(env_file: str | os.PathLike | None = None) -> Settings:
         blank_check=_bool("BLANK_CHECK", True),
         save_frames=_bool("SAVE_FRAMES", True),
         frames_root=_str("FRAMES_ROOT", "/data/nfs/cctv_images/uptime_frames"),
+        promote_to_cameras=_bool("PROMOTE_TO_CAMERAS", True),
+        classification_frames_root=_str("CLASSIFICATION_FRAMES_ROOT", "/data/nfs/cctv_images/classification_frames"),
         shard_index=shard_index,
         shard_count=shard_count,
         worker_id=_first("UPTIME_WORKER_ID", "WORKER_NAME", "WORKER_ID"),

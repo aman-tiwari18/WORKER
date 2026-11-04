@@ -3,7 +3,8 @@
 Rules (all must hold for a camera to start):
   * its lane (one per Camview server, plus one "hls" lane) has fewer than MAX_INFLIGHT_PER_SERVER
     checks in flight (the HLS lane always 1)
-  * its DVR (host + device) has nothing in flight and nothing started in the last DVR_MIN_GAP_S
+  * its DVR (host + device) has fewer than MAX_INFLIGHT_PER_DVR in flight and nothing started in the
+    last DVR_MIN_GAP_S
   * fewer than MAX_NEW_STREAMS_PER_MIN RTSP streams were started in the last minute
   * neither the lane nor the DVR is paused / backing off, and the whole checker is not paused
 Order: round-robin across DVRs inside a lane; inside a DVR, the camera checked longest ago first
@@ -179,7 +180,7 @@ class Scheduler:
         for _ in range(len(lane.rr)):
             d = lane.dvrs[lane.rr[0]]
             lane.rr.rotate(-1)
-            if d.inflight or now < d.backoff_until or now - d.last_start < gap:
+            if d.inflight >= self.s.max_inflight_per_dvr or now < d.backoff_until or now - d.last_start < gap:
                 continue
             for key in d.cams:
                 if key in lane.pending and key not in self.inflight:
