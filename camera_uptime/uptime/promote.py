@@ -1,6 +1,7 @@
 """Uptime UP -> Cameras tab (RTSP only, the live run's own shift and date; earlier shifts are never touched).
 
-A camera found UP that already has a label (anything but empty / plain "Uncertain"):
+A camera found UP (one with no label yet is labelled 'Uncertain' — classification then labels it on its next
+run, it re-labels every 'uncertain*' camera; an existing label is never changed):
   * camera_links_rtsp: status = 'Accessible', frame_path = this check's frame. Never the other way:
     a DOWN check changes nothing here.
   * camera_classification_rtsp (what the Cameras tab counts for the shift's classification run):
@@ -12,28 +13,28 @@ A camera found UP that already has a label (anything but empty / plain "Uncertai
 """
 from __future__ import annotations
 
-_LABELLED = ("cl.classification IS NOT NULL AND TRIM(cl.classification) <> '' "
-             "AND LOWER(TRIM(cl.classification)) <> 'uncertain'")
+UNLABELLED = "Uncertain"
 
 LINK_SQL = f"""
-UPDATE camera_links_rtsp cl SET cl.status = 'Accessible', cl.frame_path = %s
-WHERE cl.id = %s AND {_LABELLED}
+UPDATE camera_links_rtsp cl SET cl.status = 'Accessible', cl.frame_path = %s,
+    cl.classification = IF(cl.classification IS NULL OR TRIM(cl.classification) = '', '{UNLABELLED}', cl.classification)
+WHERE cl.id = %s
 """
 
-FILL_FAILED_SQL = f"""
+FILL_FAILED_SQL = """
 UPDATE camera_classification_rtsp h JOIN camera_links_rtsp cl ON cl.id = h.camera_id
 SET h.classification = cl.classification, h.frame_path = %s
 WHERE h.camera_id = %s AND h.shift_id = %s AND h.exam_date = %s
-  AND h.classification = 'Uncertain' AND (h.frame_path IS NULL OR h.frame_path = '') AND {_LABELLED}
+  AND h.classification = 'Uncertain' AND (h.frame_path IS NULL OR h.frame_path = '')
 """
 
-ADD_HISTORY_SQL = f"""
+ADD_HISTORY_SQL = """
 INSERT INTO camera_classification_rtsp (camera_id, shift_id, exam_date, frame_path, classification, created_at)
 SELECT cl.id, %s, %s, %s, cl.classification, r.newest
 FROM camera_links_rtsp cl
 JOIN (SELECT MAX(created_at) AS newest FROM camera_classification_rtsp
       WHERE shift_id = %s AND exam_date = %s) r ON r.newest IS NOT NULL
-WHERE cl.id = %s AND {_LABELLED}
+WHERE cl.id = %s
   AND NOT EXISTS (SELECT 1 FROM camera_classification_rtsp h
                   WHERE h.camera_id = cl.id AND h.shift_id = %s AND h.exam_date = %s)
 """

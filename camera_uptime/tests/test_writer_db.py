@@ -85,9 +85,10 @@ def test_down_periods():
 
 
 def test_service_user_cannot_write_existing_tables():
-    """Only camera_links_rtsp.status / frame_path and camera_classification_rtsp (uptime/promote.py) are writable."""
+    """Only camera_links_rtsp.status / frame_path / classification and camera_classification_rtsp (uptime/promote.py)
+    are writable."""
     db = Database(config.load())
-    for sql in ("UPDATE camera_links_rtsp SET classification = classification WHERE 1 = 0",
+    for sql in ("UPDATE camera_links_rtsp SET exam_id = exam_id WHERE 1 = 0",
                 "UPDATE camera_links_hls SET status = status WHERE 1 = 0",
                 "UPDATE exams SET id = id WHERE 1 = 0"):
         with pytest.raises(Exception) as e:
@@ -97,8 +98,8 @@ def test_service_user_cannot_write_existing_tables():
 
 
 def test_promote_up_camera_to_cameras_tab():
-    """UP + labelled camera -> Accessible + frame; its failed-capture row of the shift is filled; a camera with
-    no row gets one timed at the run's newest row; unlabelled cameras and other shifts are untouched."""
+    """UP camera -> Accessible + frame (no label -> 'Uncertain', a label is kept); its failed-capture row of the
+    shift is filled; a camera with no row gets one timed at the run's newest row; other shifts are untouched."""
     from uptime import promote
     db = Database(config.load())
     conn = db.conn()
@@ -106,14 +107,15 @@ def test_promote_up_camera_to_cameras_tab():
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id, classification FROM camera_links_rtsp WHERE classification IS NOT NULL "
-                        "AND TRIM(classification) <> '' AND LOWER(classification) <> 'uncertain' LIMIT 3")
-            (a, label_a), (b, label_b), (c, _) = [(r["id"], r["classification"]) for r in cur.fetchall()]
+                        "AND TRIM(classification) <> '' AND LOWER(classification) <> 'uncertain' LIMIT 4")
+            (a, label_a), (b, label_b), (c, _), (u, _) = [(r["id"], r["classification"]) for r in cur.fetchall()]
+            cur.execute("UPDATE camera_links_rtsp SET classification = NULL WHERE id = %s", (u,))
             sid, day, other = -7, date(2000, 1, 2), -8
             run_ts = datetime(2000, 1, 2, 9, 30)
             cur.execute("INSERT INTO camera_classification_rtsp (camera_id, shift_id, exam_date, frame_path, "
                         "classification, created_at) VALUES (%s,%s,%s,NULL,'Uncertain',%s), (%s,%s,%s,'x.jpg',%s,%s)",
                         (a, sid, day, run_ts, c, sid, day, "Computer Lab", run_ts))
-            for cam in (a, b):
+            for cam in (a, b, u):
                 promote.apply(cur, {"camera_row_id": cam, "shift_id": sid, "exam_date": day, "frame_path": f"/f/{cam}.jpg"})
             promote.apply(cur, {"camera_row_id": b, "shift_id": other, "exam_date": day, "frame_path": "/f/o.jpg"})
             cur.execute("SELECT camera_id, classification, frame_path, created_at FROM camera_classification_rtsp "
@@ -122,7 +124,10 @@ def test_promote_up_camera_to_cameras_tab():
             assert rows[a]["classification"] == label_a and rows[a]["frame_path"] == f"/f/{a}.jpg"
             assert rows[b]["classification"] == label_b and rows[b]["created_at"] == run_ts
             assert rows[c]["frame_path"] == "x.jpg"  # untouched
-            assert len(rows) == 3  # shift `other` has no classification run: nothing added
+            assert rows[u]["classification"] == "Uncertain" and rows[u]["frame_path"] == f"/f/{u}.jpg"
+            assert len(rows) == 4  # shift `other` has no classification run: nothing added
+            cur.execute("SELECT classification, status FROM camera_links_rtsp WHERE id = %s", (u,))
+            assert cur.fetchone() == {"classification": "Uncertain", "status": "Accessible"}
             cur.execute("SELECT status, frame_path FROM camera_links_rtsp WHERE id = %s", (b,))
             got = cur.fetchone()
             assert got["status"] == "Accessible" and got["frame_path"] == "/f/o.jpg"

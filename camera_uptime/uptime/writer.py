@@ -18,6 +18,26 @@ from . import promote
 
 log = logging.getLogger("uptime.writer")
 
+# Every instance (one per worker) writes the same tables over a slow link (~20 ms per round trip from the
+# workers). A whole batch in one transaction held its InnoDB locks (insert-intention / gap locks of
+# INSERT ... ON DUPLICATE KEY UPDATE at the index end) for seconds and deadlocked with the other hosts'
+# batches. So each record is its own short READ COMMITTED transaction, and a deadlock / lock-wait error
+# is retried for that record only. A global lock was tried and dropped: it serialised the slow hosts.
+RETRY_ERRNOS = (1213, 1205)  # deadlock, lock wait timeout
+RETRIES = 5
+
+
+class BatchError(Exception):
+    """A record failed for good; `remaining` is that record and everything after it (to be spooled)."""
+    def __init__(self, cause: Exception, remaining: list):
+        super().__init__(str(cause))
+        self.cause, self.remaining = cause, remaining
+
+
+def _errno(e) -> int | None:
+    args = getattr(e, "args", None)
+    return args[0] if args and isinstance(args[0], int) else None
+
 CHECK_SQL = """
 INSERT INTO camera_uptime_checks
   (check_uuid, run_id, exam_id, shift_id, exam_date, link_type, camera_row_id, camera_key, dvr_key,
@@ -158,47 +178,56 @@ class Writer(threading.Thread):
         return batch
 
     def _write(self, batch: list) -> None:
+        """Each record in its own short transaction; deadlocks retried. Raises BatchError with the rest."""
         conn = self.db.conn()
-        conn.begin()
-        promotes = [rec for kind, rec in batch if kind == "promote"]
-        try:
-            with conn.cursor() as cur:
-                for kind, rec in batch:
-                    if kind == "check":
-                        if cur.execute(CHECK_SQL, check_params(rec)) == 1:  # 0 = replayed duplicate
-                            cur.execute(SUMMARY_SQL, summary_params(rec))
-                            self.stats["checks"] += 1
-                        else:
-                            self.stats["duplicates"] += 1
-                    elif kind == "event":
-                        cur.execute(EVENT_SQL, (rec["at"], rec["scope"], rec.get("scope_key"), rec["event"],
-                                                rec.get("reason"), json.dumps(rec["detail"], default=_json_default)
-                                                if rec.get("detail") is not None else None, rec.get("run_id")))
-                        self.stats["events"] += 1
-            conn.commit()
-        except Exception:
+        with conn.cursor() as cur:
+            cur.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        for i, (kind, rec) in enumerate(batch):
+            if kind == "promote":
+                self._promote(conn, [rec])
+                continue
             try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
-        if promotes:
-            self._promote(conn, promotes)
+                self._retrying(conn, lambda cur: self._apply(cur, kind, rec))
+            except Exception as e:
+                raise BatchError(e, batch[i:]) from e
+
+    def _retrying(self, conn, fn) -> None:
+        for attempt in range(RETRIES + 1):
+            try:
+                conn.begin()
+                with conn.cursor() as cur:
+                    fn(cur)
+                conn.commit()
+                return
+            except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                if _errno(e) not in RETRY_ERRNOS or attempt == RETRIES:
+                    raise
+                self.stats["retries"] += 1
+                time.sleep(0.05 * (attempt + 1))
+
+    def _apply(self, cur, kind: str, rec: dict) -> None:
+        if kind == "check":
+            if cur.execute(CHECK_SQL, check_params(rec)) == 1:  # 0 = replayed duplicate
+                cur.execute(SUMMARY_SQL, summary_params(rec))
+                self.stats["checks"] += 1
+            else:
+                self.stats["duplicates"] += 1
+        elif kind == "event":
+            cur.execute(EVENT_SQL, (rec["at"], rec["scope"], rec.get("scope_key"), rec["event"],
+                                    rec.get("reason"), json.dumps(rec["detail"], default=_json_default)
+                                    if rec.get("detail") is not None else None, rec.get("run_id")))
+            self.stats["events"] += 1
 
     def _promote(self, conn, recs: list) -> None:
-        """Cameras-tab updates, in their own transaction: a failure here never costs an uptime check."""
+        """Cameras-tab update, its own transaction: a failure here never costs an uptime check."""
         try:
-            conn.begin()
-            with conn.cursor() as cur:
-                for rec in recs:
-                    promote.apply(cur, rec)
-            conn.commit()
+            self._retrying(conn, lambda cur: [promote.apply(cur, rec) for rec in recs])
             self.stats["promoted"] += len(recs)
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             self.stats["promote_errors"] += len(recs)
             log.error("Cameras-tab update failed for %d camera(s): %s", len(recs), e)
 
@@ -207,9 +236,11 @@ class Writer(threading.Thread):
             self._write(batch)
             self.last_error = None
         except Exception as e:
-            self.last_error = f"{type(e).__name__}: {e}"
-            log.error("DB write failed (%s) — spooling %d records", self.last_error, len(batch))
-            self._spool(batch)
+            rest = getattr(e, "remaining", batch)
+            cause = getattr(e, "cause", e)
+            self.last_error = f"{type(cause).__name__}: {cause}"
+            log.error("DB write failed (%s) — spooling %d records", self.last_error, len(rest))
+            self._spool(rest)
 
     def _spool(self, batch: list) -> None:
         try:
